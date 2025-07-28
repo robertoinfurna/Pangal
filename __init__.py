@@ -1,0 +1,2 @@
+# Pangal package initializer
+
