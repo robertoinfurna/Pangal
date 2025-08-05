@@ -29,7 +29,7 @@ from bisect import bisect_left
 
 from copy import deepcopy
 
-from .base_classes import Image, Cube, Region, Point, Contours
+from ..base import Image, Cube, Region, Point, Contours
 
 def area_pixel(wcs,arcsec=False):
     if hasattr(wcs.wcs, 'cd') and wcs.wcs.cd is not None:
@@ -289,10 +289,6 @@ def mosaic(self, image_list):
 
 
 
-
-
-
-
 # FIX THIS FUNCTION!!!
 def MW_extinction(self,lam,plot=False):
     # Return Milky Way extinction curve A(lam)/E(B-V) via interpolation.
@@ -322,68 +318,4 @@ def MW_extinction(self,lam,plot=False):
 
 
 
-# Dust attenuation curve based on Calzetti et al. (2000) law
-# Takes in imput an array of wavelengths and returns the attenuation function
 
-def dust_attenuation_curve(wl, leitatt, uv_bump):
-    
-    k_cal = np.zeros(len(wl), dtype=float)  # cal for Calzetti
-
-    #compute attenuation assuming Calzetti+ 2000 law
-    #single component 
-
-    R = 4.05
-    div = wl.searchsorted(6300., side='left')
-    
-    #Longer than 6300
-    k_cal[div:] = 2.659*( -1.857 + 1.04*(1e4/wl[div:])) + R
-    #Shorter than 6300
-    k_cal[:div] = 2.659*(-2.156 + 1.509*(1e4/wl[:div]) - 0.198*(1e4/wl[:div])**2 + 0.011*(1e4/wl[:div])**3) + R
-    
-
-    #IF REQUESTED Use leiterer 2002 formula below 1500A
-    if leitatt:
-        div = wl.searchsorted(1500., side='left')
-        #Shorter than 1500
-        k_cal[:div] = (5.472 + 0.671e4 / wl[:div] - 9.218e5 / wl[:div] ** 2 + 2.620e9 / wl[:div] ** 3)
-
-    #Prevents negative attenuation, which can arise from extrapolation or math artifacts
-    zero = bisect_left(-k_cal, 0.)
-    k_cal[zero:] = 0.
-
-    #2175A bump
-    if uv_bump:
-        eb = 1.0
-        k_bump = np.zeros(len(wl), dtype=float)
-        k_bump[:] = eb*(wl*350)**2 / ((wl**2 - 2175.**2)**2 + (wl*350)**2)
-        k_cal += k_bump
-
-            
-    return 0.4 * k_cal / R
-
-
-
-
-
-
-def vactoair(wl):
-    """Convert vacuum wavelengths to air wavelengths using the conversion
-    given by Morton (1991, ApJS, 77, 119).
-
-    """
-    wave2 = np.asarray(wl, dtype=float)**2
-    fact = 1. + 2.735182e-4 + 131.4182/wave2 + 2.76249e8/(wave2*wave2)
-    return wl/fact
-
-
-def airtovac(wl):
-    """Convert air wavelengths to vacuum wavelengths using the conversion
-    given by Morton (1991, ApJS, 77, 119).
-
-    """
-    sigma2 = np.asarray(1E4/wl, dtype=float)**2
-    
-    fact = 1. + 6.4328e-5 + 2.949281e-2/(146.-sigma2) + 2.5540e-4/(41.-sigma2)
-    fact[wl < 2000] = 1.0
-    
-    return wl*fact

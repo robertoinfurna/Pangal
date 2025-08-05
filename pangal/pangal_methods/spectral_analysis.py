@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 
 from ..data.spectral_lines import spectral_lines, atmospheric_lines, UBGVRI_filters
 
-from .base_classes import Image, Spectrum, Cube, Region, Point, Contours
+from ..base import Image, Spectrum, Cube, Region, Point, Contours
 
 
 

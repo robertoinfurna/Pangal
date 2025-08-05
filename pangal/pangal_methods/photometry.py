@@ -26,121 +26,10 @@ from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, Angle
 from astropy import units as u
 
-from .base_classes import Image, Cube, Region, Point, Contours
-from .filters import map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps, default_filter_colors
+from ..base import Image, Cube, PhotometryTable, Region, Point, Contours
+from ..filters import map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps, default_filter_colors
 from .plot import add_ra_dec_ticks
 
-
-
-
-@dataclass
-class PhotometryTable:
-    data: dict = field(default_factory=dict)                      # Dictionary of {band: flux}
-    region: object = None                                         # Region of sky (define externally or with shapely/sregions)
-    header: fits.Header = field(default_factory=fits.Header)      # FITS header (for WCS/area info)
-
-    @property
-    def to_ABmag(self):
-        if 'mJy' in self.header['units']:
-            for band in self.data.keys(): 
-                self.data[band] = self.mJy_to_ABmag(self.data[band])
-
-
-    def mJy_to_ABmag(self, flux_mJy):
-        flux_Jy = flux_mJy * 1e-3
-        with np.errstate(divide='ignore'):
-            mag = -2.5 * np.log10(flux_Jy) + 8.90
-        return mag
-
-    """
-    def mJy_to_erg_s_cm2_A(self, flux_mJy, wavelength):
-        flux_Jy = flux_mJy * 1e-3  # Jy
-        fnu = flux_Jy * u.Jy
-        wav = wavelength * u.AA
-        flam = fnu.to(u.erg / u.s / u.cm**2 / u.AA, equivalencies=u.spectral_density(wav))
-        return flam.value
-
-    def MJy_sr_to_erg_s_cm2_A_arcsec2(self, flux_MJy_sr, wavelength):
-        flux = flux_MJy_sr * u.MJy / u.sr
-        wav = wavelength * u.AA
-        flam = flux.to(u.erg / u.s / u.cm**2 / u.AA / u.arcsec**2, equivalencies=u.spectral_density(wav))
-        return flam.value
-    """
-
-    
-
-
-######################################################################################################################################################
-
-from astropy.table import Table
-from collections.abc import Iterable
-
-def PhotometryTable_to_fits(filename, tables):
-
-    if not isinstance(tables, Iterable) or isinstance(tables, dict):
-        tables = [tables] 
-
-    hdul = fits.HDUList()
-    hdul.append(fits.PrimaryHDU())  # Empty primary HDU
-
-    for i, table in enumerate(tables):
-        # Convert photometry data to an astropy Table
-        data_dict = table.data
-        t = Table()
-        for band, value in data_dict.items():
-            t[band] = [value]  # Store as single-row table
-
-        # Create a BinTableHDU from the Table
-        hdu = fits.BinTableHDU(t)
-        
-        # Attach header from PhotometryTable (if any)
-        if table.header:
-            for key in table.header:
-                try:
-                    hdu.header[key] = table.header[key]
-                except Exception:
-                    pass  # Ignore any conflicts or FITS-invalid keywords
-
-        # Give the extension a name
-        hdu.name = f"PHOT_{i}" if len(tables) > 1 else "PHOTOMETRY"
-
-        hdul.append(hdu)
-
-    # Write to disk
-    hdul.writeto(filename, overwrite=True)
-    print(f"Written {len(tables)} photometry table(s) to {filename}")
-
-
-
-def fits_to_PhotometryTable(filename):
-
-    hdul = fits.open(filename)
-
-    phot_tables = []
-    for hdu in hdul[1:]:  # Skip primary HDU
-        if not isinstance(hdu, fits.BinTableHDU):
-            continue
-
-        tbl = Table(hdu.data)
-        if len(tbl) != 1:
-            raise ValueError("Each photometry table should contain exactly one row.")
-
-        # Extract data from the single row
-        data_dict = {col: tbl[col][0] for col in tbl.colnames}
-        phot_table = PhotometryTable(
-            data=data_dict,
-            header=hdu.header
-        )
-        phot_tables.append(phot_table)
-
-    hdul.close()
-
-    if len(phot_tables) == 1:
-        return phot_tables[0]
-    return phot_tables
-
-
-######################################################################################################################################################à
 
 
 
@@ -185,7 +74,7 @@ def photometry(self,
         bands = self.images.keys()  # Use all available bands
 
     # Initialize output container
-    photometric_list = [PhotometryTable for _ in range(len(regions))]
+    photometric_list = [PhotometryTable() for _ in range(len(regions))]
 
     # Check units
     if units not in ['mJy', 'mJy_arcsec2', 'mag', 'mag_arcsec2', 'erg_s_cm2_A', 'erg_s_cm2_A_arcsec2']: #, 'erg_s_cm2', 'erg_s_cm2_arcsec2']:
@@ -254,7 +143,6 @@ def photometry(self,
             if outer_area > 10 * source_area:
                 # Use random region shifting for large fields
                 back_flux_arr = []
-                image_nonzero_mask = image != 0
                 threshold = np.nanquantile(np.abs(image), threshold_quantile)
 
                 mask_indices = np.argwhere(mask > 0)
@@ -266,13 +154,16 @@ def photometry(self,
                     dx = random.randint(0, image.shape[1] - 1)
                     shifted = (mask_indices + [dy, dx]) % image.shape
 
-                    # Check for valid shift (nonzero, not overlapping source mask)
-                    valid_mask = image_nonzero_mask[shifted[:, 0], shifted[:, 1]]
-                    if not np.all(valid_mask): continue
-                    if np.any(source_mask[shifted[:, 0], shifted[:, 1]]): continue
-
                     shifted_vals = image[shifted[:, 0], shifted[:, 1]]
                     if np.isnan(shifted_vals).sum() / shifted_vals.size > 0.1:
+                        continue
+
+                    # background region must not overlap with the source region
+                    if np.any(source_mask[shifted[:, 0], shifted[:, 1]]):
+                        continue
+
+                    # If more than 10% of the pixels in background region are Nan, skip it
+                    if np.isnan(shifted_vals).sum() / n > 0.1: 
                         continue
                     
                     # Reject bright outliers using threshold
@@ -377,6 +268,9 @@ def photometry(self,
 
     return photometric_list
     
+
+
+
 
 
     
