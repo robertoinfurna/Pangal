@@ -26,8 +26,8 @@ from scipy.ndimage import gaussian_filter
 from scipy.interpolate import interp1d
 
 
-from .base_classes import Image, Cube, Region, Point, Contours
-from .filters import map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
+from ..base import Image, Cube, Region, Point, Contours
+from ..filters import map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
 # INTERACTIVE SKY COORDS NOT WORKING!!
 # BBOX STILL BELOW COLORBAR!
@@ -57,6 +57,7 @@ def plot(self,
         ticks_fontsize=10,                        # Font size for tick labels
         
         auto_titles=True,                        # Enables authomatic titles 
+        auto_titles_style=0,                     # Autotitles style
         titles_dict=[],                          # List of manual titles
 
         legend = True,
@@ -94,7 +95,8 @@ def plot(self,
         ax = ax.flatten()
         
         
-        
+    # SHARED COLORBAR
+
     cmaps = {**default_cmaps,**(set_cmaps or {})}
     plot_units = {**default_plot_units,**(set_units or {})}
     plot_scale_lims = set_scale_lims or {}
@@ -118,6 +120,9 @@ def plot(self,
         if units == 'mag_arcsec2':
             image = self.images[image_id].mag_arcsec2
             label = 'mag/arcsec$^2$'
+        elif units == 'Jy':
+            image = self.images[image_id].Jy
+            label = 'Jy/pixel'
         elif units == 'MJy_sr':
             image = self.images[image_id].MJy_sr
             label = 'MJy/sr'
@@ -218,7 +223,7 @@ def plot(self,
         target_bands = P.target_bands if P.target_bands else bands
         for band in target_bands:
             j = bands.index(band)
-            wcs = self.images[image_id].wcs
+            wcs = self.images[band].wcs
             x, y = wcs.all_world2pix([[coords[0], coords[1]]], 0)[0]
 
             ax[j].scatter(x, y, c=P.color, marker=P.m, s=P.s)
@@ -234,12 +239,14 @@ def plot(self,
  
     # ---- Optional authomatic titles ----
     for i, band in enumerate(bands):
-        if auto_titles:
-            if not titles_dict: # authomatic titles
-                                
+        if auto_titles and not titles_dict: # authomatic titles        
+            if auto_titles_style == 0:     
                 ax[i].text(0.03, 0.97, nice_filter_names[band], color='black', fontsize=15, ha='left', va='top', 
                            transform=ax[i].transAxes,bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
-    
+            if auto_titles_style == 1:     
+                ax[i].text(0.03, 0.97, nice_filter_names[band], color='white', fontsize=15, ha='left', va='top', 
+                           transform=ax[i].transAxes)
+
     # ---- Manual titles
     for title_dict in titles_dict: # manual titles
         band = next(b for b in title_dict if b in bands)

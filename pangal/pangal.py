@@ -65,18 +65,29 @@ from .pangal_methods.utils import area_pixel, dtheta_pixel, cut_and_rotate, corr
 
 
 
+class DotDict(dict):                      # Dictionary that supports attribute-style access.
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(f"'DotDict' object has no attribute '{key}'")
+    def __dir__(self):
+        # Include dict keys in autocomplete
+        return list(self.keys()) + list(super().__dir__())
+
                  
 class PanGal:
 
-    def __init__(self, fits_files, target_coords, fov, EBmV=0,): #rotate_hst=True, correct_muse_MW_ext=True
+    def __init__(self, fits_files=None, target_coords=None, fov=0, EBmV=0,EBmV_err=0): 
 
-        self.images = {}
-        self.cubes = {}
-        self.spectra = {}
+        self.images = DotDict()
+        self.cubes = DotDict()
+        self.spectra = DotDict()
         
         self.target_coords = target_coords
         self.fov = fov
         self.EBmV = EBmV
+        self.EBmV_err = EBmV_err
               
 
         # Upload the data
@@ -84,6 +95,13 @@ class PanGal:
             self.add_image(file)
             self.add_cube(file)
             #self.add_spectrum(file)
+
+    @property
+    def list(self):
+        print('Images: \n')  
+        print(list(self.images.keys()))
+        print('\nCubes: \n')  
+        print(list(self.cubes.keys()))
               
     # methods
     plot = plot
@@ -121,10 +139,10 @@ class PanGal:
                                   
             if 'galex' in file.lower():
 
-                print('Processing GALEX file: ',file)
+                #print('Processing GALEX file: ',file)
             
                 header = hdul[0].header
-                bunit = 'counts_s' 
+                #bunit = 'counts_s' 
                     
                 band = 'galex_nuv' if float(header['BAND']) == 1.0 else 'galex_fuv'
 
@@ -139,53 +157,11 @@ class PanGal:
         
                 image = hdul[0].data   # native units in counts/s
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov)
+
+                exptime = float(header['EXPTIME'])
         
-                AG = self.EBmV * self.MW_extinction(pivot_wavelength)
-                print(f'Milky Way dust extinction: {AG:.2f}, {10**(AG / 2.5)}')
-                
-                flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + AG / 2.5 + 8.9 / 2.5)
 
 
-            elif 'uvit' in file.lower():
-
-                print('Processing UVIT file: ',file)
-            
-                header = hdul[0].header
-                bunit = 'counts_s' 
-                header['EXPTIME'] = header['EXP_TIME']
-                    
-                if header['DETECTOR'] == 'FUV' and header['FILTER'] == 'F2': 
-                    band = 'uvit_fuv_f154w' 
-                    ZP = 17.778
-                    ZP_err = 0.01
-                    pivot_wavelength = 1541    
-                elif header['DETECTOR'] == 'NUV' and header['FILTER'] == 'F3':
-                    band = 'uvit_nuv_n245m' 
-                    ZP = 18.50
-                    ZP_err = 0.07
-                    pivot_wavelength = 2447   
-                elif header['DETECTOR'] == 'NUV' and header['FILTER'] == 'F5':
-                        band = 'uvit_nuv_n263m' 
-                        ZP = 18.18
-                        ZP_err = 0.01
-                        pivot_wavelength = 2632 
-                else:
-                    return None
-
-                wcs = WCS(header)
-                dtheta_pix_deg = dtheta_pixel(wcs) 
-                area_pix_deg2 = area_pixel(wcs)
-                area_pix_arcsec2 = area_pix_deg2 * 3600**2
-
-
-                image = hdul[0].data / header['EXP_TIME']   # native units in counts
-                image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov)
-        
-                AG = self.EBmV * self.MW_extinction(pivot_wavelength)
-                print(f'Milky Way dust extinction: {AG:.2f}, {10**(AG / 2.5)}')
-                
-                flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + AG / 2.5 + 8.9 / 2.5)
-                
 
             elif 'sdss' in file.lower():
             
@@ -196,33 +172,31 @@ class PanGal:
                 band = 'sdss_'+header['FILTER']
                 sdss_wavelengths = {'u': 3561, 'g': 4718, 'r': 6185, 'i': 7499, 'z': 8961}
                 pivot_wavelength = sdss_wavelengths[header['FILTER']]
-                conversion_factor = header['NMGY']            # counts/s to nanomaggy
+
+                # native image are given in nanomaggy
+                # header['NMGY'] gives counts/s to nanomaggy
+                # m_AB = 22.5 - 2.5 log (F_nMgy) = 22.5 - 2.5 log (counts/s * header['NMGY'])
         
+                # convert from nanomaggy to counts/s
+                image = hdul[0].data / header['NMGY'] 
+                ZP = 22.5 - 2.5 * np.log10(header['NMGY'])
+                ZP_err = 0#0.01 * ZP
+                #bunit = 'counts_s'
+
+                exptime = float(header['EXPTIME']) # 57 s
+
                 wcs = WCS(header)
                 dtheta_pix_deg = dtheta_pixel(wcs)
                 area_pix_deg2 = area_pixel(wcs)
                 area_pix_arcsec2 = area_pix_deg2 * 3600**2
                 position_angle = -header['SPA']
         
-                image_nanomaggy = hdul[0].data
-                image_nanomaggy, wcs = cut_and_rotate(image_nanomaggy, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
-                
-                # convert from nanomaggy to counts/s
-                image = image_nanomaggy / conversion_factor
-                bunit = 'counts_s'
-
-                AG = self.EBmV * self.MW_extinction(pivot_wavelength)
-                print(f'Milky Way dust extinction: {AG:.2f}, {10**(AG / 2.5)}')
-                flux_conv_counts_s_to_mJy = 3.631e-6 * 1e3 * conversion_factor * 10**(AG / 2.5)
-                
-                ZP = None
-                ZP_err = None
-                
+                image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
                 
                 
             elif 'hst' in file.lower():
             
-                print('HST: ',file)
+                #print('HST: ',file)
         
                 header = fits.Header()
                 header.update(hdul[0].header)
@@ -248,32 +222,28 @@ class PanGal:
                 band += f.lower()
                 
         
-                conv_factor_flambda = header['PHOTFLAM']
+                conv_factor_flambda = header['PHOTFLAM']   # Inverse sensitivity, ergs/cm2/A/e- 
                 pivot_wavelength = header['PHOTPLAM']
-                ZP = header['PHOTZPT']
                 
-                if 'PHOTFNU' not in header:
-                    header['PHOTFNU'] = conv_factor_flambda * (pivot_wavelength**2 / 2.99e18) / 1e-23  # Jy/e-
-        
-                AG = self.EBmV * self.MW_extinction(pivot_wavelength)
-                flux_conv_counts_s_to_mJy = 1e3 * header['PHOTFNU'] * 10**(AG / 2.5)
-        
+                ZP = - 2.5 * np.log10(pivot_wavelength**2/2.998e18) -2.5*np.log10(conv_factor_flambda) - 48.60
+                ZP_err = 0.011                              # CONSERVATIVE 1% error on the flux conversion (Calamida et al, 2022) 
+                
+                exptime = float(header['EXPTIME'])
+                               
                 wcs = WCS(header)
                 dtheta_pix_deg = dtheta_pixel(wcs)
                 area_pix_deg2 = area_pixel(wcs)
                 area_pix_arcsec2 = area_pix_deg2 * 3600**2
                 
                 position_angle = -header['ORIENTAT'] if 'ORIENTAT' in header else (-header['PA_APER'] if 'PA_APER' in header else None)
-                
-                bunit = 'counts_s'
+
                 image = hdul[1].data
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
                 image = np.nan_to_num(image, nan=0.0)
 
-                ZP = None
-                ZP_err = None
         
-        
+
+            # 2MASS
             elif any(x in file.lower() for x in ['2mass', '2masx']):
             
                 print('2MASS: ',file)
@@ -290,12 +260,14 @@ class PanGal:
         
                 Vega_to_AB_correction = {'j': 0.91, 'h': 1.39, 'ks': 1.85}
                 ZP = header['MAGZP'] + Vega_to_AB_correction[bb]
-                ZP_err = None
+                ZP_err = 0.011        # conservative 1% error
         
                 two_mass_wavelengths = {'j': 1.2408, 'h': 1.6513, 'ks': 2.1655}
                 pivot_wavelength = two_mass_wavelengths[bb] * 1e4
+
+                exptime = float(header['EXPTIME'])
         
-                flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + 8.9 / 2.5)
+                #flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + 8.9 / 2.5)
         
                 wcs = WCS(header)
                 dtheta_pix_deg = dtheta_pixel(wcs)
@@ -303,13 +275,13 @@ class PanGal:
                 area_pix_arcsec2 = area_pix_deg2 * 3600**2
                 position_angle = - header['CROTA2']
         
-                bunit = 'counts_s'
                 image = hdul[0].data
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
                 image = np.nan_to_num(image, nan=0.0)
         
                 image = image - sky_val
                 
+            # WISE
             elif 'wise' in file.lower(): #https://wise2.ipac.caltech.edu/docs/release/allsky/expsup/index.html
             
                 print('WISE: ',file)
@@ -330,43 +302,47 @@ class PanGal:
                 ZP = header['MAGZP'] + Vega_to_AB_correction[bb]
                 ZP_err = header['MAGZPUNC']
                 
-                header['EXPTIME'] = header['NUMFRMS'] * 7.7
-                
-                flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + 8.9 / 2.5)     
-                
-                bunit = 'counts_s'
+                exptime = header['NUMFRMS'] * 7.7
+
                 image = hdul[0].data     
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)            
         
+            # Spitzer IRAC
             elif 'irac' in file.lower():
             
                 print('IRAC: ',file)
         
                 header = hdul[0].header
         
-                channel = header['CHNLNUM']
-                band = 'spitzer_irac_'+str(channel)
-                pivot_wavelength = [3.6e4, 4.5e4, 5.8e4, 8.0e4][channel - 1]
-                conversion_factor = header['FLUXCONV'] / header['GAIN']
-        
                 wcs = WCS(header)
                 dtheta_pix_deg = dtheta_pixel(wcs)
                 area_pix_deg2 = area_pixel(wcs)
                 area_pix_arcsec2 = area_pix_deg2 * 3600**2
                 position_angle = -header['PA']
+
+                channel = header['CHNLNUM']
+                band = 'spitzer_irac_'+str(channel)
+                pivot_wavelength = [3.6e4, 4.5e4, 5.8e4, 8.0e4][channel - 1]
                 
-                bunit = 'counts_s'
-                image_MJy_sr = hdul[0].data
-                image = image_MJy_sr / conversion_factor
+                # native image in MJy/sr
+                conversion_factor = header['FLUXCONV'] / header['GAIN']  # brings MJy/sr in counts/s
+                image = hdul[0].data / conversion_factor
+
+                flux_conv_counts_s_to_Jy = conversion_factor * 1e6 * area_pix_deg2 * 3.04617e-4
+                # recall that m_AB = ZP - 2.5 log (counts/s) = - 2.5 log f + 8.90
+                # Jy = counts/s * flux_conv_counts_s_to_Jy
+
+                ZP = -2.5*np.log10(flux_conv_counts_s_to_Jy) + 8.90
+                ZP_err = 0 #0.011        # conservative 1% error
+
+                exptime = float(header['EXPTIME'])
         
+  
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
                 image = np.nan_to_num(image, nan=0.0)
 
-                flux_conv_counts_s_to_mJy = conversion_factor * 1e9 * area_pix_deg2 * 3.04617e-4
-                
-                ZP = None
-                ZP_err = None
-
+            
+            # Herschel PACS
             elif 'hpacs' in file.lower():
             
                 print('Herschel PACS: ',file)
@@ -385,17 +361,26 @@ class PanGal:
                 area_pix_arcsec2 = area_pix_deg2 * 3600**2
                 position_angle = 0
         
-                bunit = 'mJy'
-                image = hdul[1].data * 1e3 # mJy
+                exptime = None
+             
+                image = hdul[1].data  # NATIVE UNITS ARE GIVEN IN Jy/pixel
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
 
-                flux_conv_counts_s_to_mJy = None
-                ZP = None
-                ZP_err = None
+                # Recall that m_ab = - 2.5 log f + 8.90 = ZP - 2.5 log counts/s by definition, with f in Jy
+                ZP = 8.90      # smart
+                ZP_err = 0     # VERY IMPORTANT! THIS SAYS THAT PACS IS NOT A PHOTON COUNTING DEVICE. NO POISSON ERROR
 
             else:
-                #print(f'File {file} image not recognized. Skipping')
                 return None
+            
+
+            
+            # Correct for Milky way foreground dust extinction
+            if pivot_wavelength < 22200:
+                AG = self.EBmV * self.MW_extinction(pivot_wavelength)           # Milky way foreground dust extinction
+                AG_err = self.EBmV_err * self.MW_extinction(pivot_wavelength)
+                ZP -= AG                                                        # corrects for foreground extinction
+                ZP_err = np.sqrt(ZP_err**2 + AG_err**2)                         # error in extinction estimation
 
             # manages multiple images from same band (mosaics)
             # first band 
@@ -408,17 +393,19 @@ class PanGal:
         
             self.images[image_name] = Image(
                 image=image,
-                bunit=bunit,
+                #bunit=bunit,
                 wcs=wcs,
                 dtheta_pix_deg=dtheta_pix_deg,
                 area_pix_arcsec2=area_pix_arcsec2,
                 pivot_wavelength=pivot_wavelength,
-                flux_conv_counts_s_to_mJy=flux_conv_counts_s_to_mJy,
+                #flux_conv_counts_s_to_mJy=flux_conv_counts_s_to_mJy,
                 ZP=ZP,
                 ZP_err=ZP_err,
+                exptime=exptime,
                 header=header,
                 filter=Filter(band)
             )
+
 
 
 
@@ -452,10 +439,13 @@ class PanGal:
                     wl = crval3 + channels * dw
                     
                     # Compute dust attenuation
-                    AG = self.EBmV * self.MW_extinction(wl)
-                    MW_dust_extinction = 10**(AG/2.5)
                     if self.EBmV != 0:
-                        cube *= MW_dust_extinction[:, np.newaxis, np.newaxis]
+                        # 1D extinction curve
+                        ext = self.MW_extinction(wl) * self.EBmV
+                        AG = 10 ** (ext / 2.5)
+
+                        # In-place multiply without creating a giant broadcasted array
+                        np.multiply(cube, AG[:, None, None], out=cube)
                     
                         
                     module_dir = os.path.dirname(os.path.abspath(__file__))
@@ -471,31 +461,45 @@ class PanGal:
         
                     wcs = WCS(header).celestial
 
+
                     cube_name = 'muse'
                     ii = 1
                     while cube_name in self.cubes:
                         cube_name = f"muse({ii})"
                         ii += 1
                     
-                    self.cubes[cube_name] = Cube(cube=cube,var=var,units=units,wl=wl,dw=dw,resolution=resolution,wcs=wcs,dtheta_pix_deg=dtheta_pix_deg,area_pix_arcsec2=area_pix_arcsec2)
+                    self.cubes[cube_name] = Cube(
+                        cube=cube,
+                        var=var,
+                        units=units,
+                        wl=wl,
+                        dw=dw,
+                        resolution=resolution,
+                        wcs=wcs,
+                        dtheta_pix_deg=dtheta_pix_deg,
+                        area_pix_arcsec2=area_pix_arcsec2,
+                        header=header)
 
                 
                     for band in [key for key in map_filter_names if key.startswith('muse')]:
 
                         filter = Filter(band)
-                        bunit = 'erg_s_cm2_A'
                 
                         w_inf = max(wl[0],filter.wavelength_range[0])
                         w_sup = filter.wavelength_range[1]
                         channel_inf = np.digitize(w_inf, wl) - 1
                         channel_sup = np.digitize(w_sup, wl) - 1
                         bandwidth = w_sup - w_inf
-                        w_pivot = filter.effective_wavelength
+                        pivot_wavelength = filter.effective_wavelength
 
                         integrated_band = np.nansum(cube[channel_inf:channel_sup, :, :], axis=0)
                         
                 
-                        image = integrated_band * dw / bandwidth * units #* 10**(AG / 2.5)
+                        image = integrated_band * dw / bandwidth * units     # in erg/s/cm2/A 
+
+                        ZP =  - 2.5 * np.log10(pivot_wavelength**2/2.998e18) - 48.60
+                        ZP_err = 0
+                        exptime = None
 
                         image_name = f"{band}"  # e.g., muse_red
                         ii = 1
@@ -505,11 +509,13 @@ class PanGal:
 
                         self.images[image_name] = Image(
                             image=image,
-                            bunit=bunit,
                             wcs=wcs,
                             dtheta_pix_deg=dtheta_pix_deg,
                             area_pix_arcsec2=area_pix_arcsec2,
-                            pivot_wavelength=w_pivot,
+                            pivot_wavelength=pivot_wavelength,
+                            ZP=ZP,
+                            ZP_err=ZP_err,
+                            exptime=exptime,
                             header=header,
                             filter=filter
                             )
@@ -520,7 +526,53 @@ class PanGal:
                     
                     
                     
-                    
+"""
+
+elif 'uvit' in file.lower():
+
+    print('Processing UVIT file: ',file)
+
+    header = hdul[0].header
+    bunit = 'counts_s' 
+    header['EXPTIME'] = header['EXP_TIME']
+        
+    if header['DETECTOR'] == 'FUV' and header['FILTER'] == 'F2': 
+        band = 'uvit_fuv_f154w' 
+        ZP = 17.778
+        ZP_err = 0.01
+        pivot_wavelength = 1541    
+    elif header['DETECTOR'] == 'NUV' and header['FILTER'] == 'F3':
+        band = 'uvit_nuv_n245m' 
+        ZP = 18.50
+        ZP_err = 0.07
+        pivot_wavelength = 2447   
+    elif header['DETECTOR'] == 'NUV' and header['FILTER'] == 'F5':
+            band = 'uvit_nuv_n263m' 
+            ZP = 18.18
+            ZP_err = 0.01
+            pivot_wavelength = 2632 
+    else:
+        return None
+
+    wcs = WCS(header)
+    dtheta_pix_deg = dtheta_pixel(wcs) 
+    area_pix_deg2 = area_pixel(wcs)
+    area_pix_arcsec2 = area_pix_deg2 * 3600**2
+
+
+    position_angle = -header['ROTATN']
+
+
+    image = hdul[0].data / header['EXP_TIME']   # native units in counts
+    image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov,position_angle=position_angle)
+
+    AG = self.EBmV * self.MW_extinction(pivot_wavelength)
+    print(f'Milky Way dust extinction: {AG:.2f}, {10**(AG / 2.5)}')
+    
+    flux_conv_counts_s_to_mJy = 1e3 * 10**(-ZP / 2.5 + AG / 2.5 + 8.9 / 2.5)
+                
+
+"""
                     
                     
                     

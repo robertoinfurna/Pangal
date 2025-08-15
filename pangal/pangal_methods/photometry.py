@@ -96,15 +96,7 @@ def photometry(self,
             exposure_id = band[idx+1:-1]
             band = band[:idx]
 
-        # Select appropriate image data based on band unit
-        if self.images[band].bunit == 'counts_s':
-            image = self.images[band].counts_s
-        elif self.images[band].bunit == 'mJy':
-            image = self.images[band].mJy
-        elif self.images[band].bunit == 'erg_s_cm2_A':
-            image = self.images[band].erg_s_cm2_A
-        else:
-            continue  # Skip unknown formats
+        image = self.images[band].image        # native. MOST OF THE TIMES COUNTS/S
 
         if print_output:
             print(nice_filter_names[band])
@@ -201,11 +193,11 @@ def photometry(self,
 
             # --- UNCERTAINTY ESTIMATION ---
 
-            if self.images[band].bunit == 'counts_s':
+            exptime = self.images[band].exptime
+            if exptime:          # Herschel PACS has no exptime
                 # Convert counts/s to total counts for Poisson error
-                dt = float(self.images[band].header['EXPTIME'])
-                total_counts = flux_sky_subtracted * dt
-                poisson_err = np.sqrt(total_counts) / dt
+                total_counts = flux_sky_subtracted * exptime
+                poisson_err = np.sqrt(total_counts) / exptime
             else:
                 poisson_err = 0
 
@@ -227,31 +219,28 @@ def photometry(self,
                 flux_sky_subtracted /= area_arcsec2
                 total_flux_err /= area_arcsec2
 
+
             # --- UNIT CONVERSION ---
+            # So far we worked on counts/s, apart for Herschel
+            ZP = self.images[band].ZP
+            ZP_err = self.images[band].ZP_err
 
-            if self.images[band].bunit == 'counts_s':
-                flux_conv = self.images[band].flux_conv_counts_s_to_mJy
-            elif self.images[band].bunit == 'mJy':
-                flux_conv = 1
-            elif self.images[band].bunit == 'erg_s_cm2_A':
-                wavelength = self.images[band].pivot_wavelength
-                flux_conv = wavelength**2 / 3.99e18 / 1e-26
-
-            flux_sky_subtracted *= flux_conv
-            total_flux_err *= flux_conv
-
-            # If final desired unit is 'erg_s_cm2_A'
-            if 'erg_s_cm2_A' in units:
-                wavelength = self.images[band].pivot_wavelength
-                erg_conv = wavelength**2 / 3.99e18 / 1e-26
-                flux_sky_subtracted *= erg_conv
-                total_flux_err *= erg_conv
-
-            # Convert to AB magnitude
+            #convert all to mag
+            mag = ZP - 2.5*np.log10(flux_sky_subtracted)
+            mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)   #  Here I add calibration error!
+   
             if 'mag' in units:
-                flux_mJy = flux_sky_subtracted
-                flux_sky_subtracted = -2.5 * np.log10(flux_mJy / 1000 / 3631)
-                total_flux_err = 2.5 / np.log(10) / (flux_mJy / 1000 / 3631) * total_flux_err
+                flux_sky_subtracted = mag
+                total_flux_err = mag_err
+                
+            if 'mJy' in units:
+                flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
+                total_flux_err = 1e3 * 0.4*np.log(10)*10**(0.4*(-mag+8.90)) * mag_err
+
+            if 'erg_s_cm2_A' in units:
+                flux_sky_subtracted = 2.998e18 / self.images[band].pivot_wavelength**2 * 10**(0.4*(-mag-48.60))
+                total_flux_err = 2.998e18 / self.images[band].pivot_wavelength**2  * 0.4*np.log(10)*10**(0.4*(-mag-48.60)) * mag_err
+
 
             if print_output:
                 fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
@@ -418,17 +407,8 @@ def inspect_photometry(self,
     
     print("Units of output: ",units)
 
-    if self.images[band].bunit == 'counts_s':
-        image = self.images[band].counts_s
-    elif self.images[band].bunit == 'mJy':
-        image = self.images[band].mJy                  
-    elif self.images[band].bunit == 'erg_s_cm2_A':
-        image = self.images[band].erg_s_cm2_A
-    else:
-        raise ValueError('Unrecognized image bunit')
+    image = self.images[band].image
 
-    print("Native image bunit: ",self.images[band].bunit)
-    
     wcs = self.images[band].wcs
 
     # Replace zeros with NaNs for safety
@@ -436,14 +416,13 @@ def inspect_photometry(self,
 
     # ---- Plotting ----
     fig, ax = plt.subplots(2,1,figsize=(14, 20),constrained_layout=True)
-    #fig.suptitle(f"Photometry — {nice_filter_names[band]}, bunit = {self.images[band].bunit}", fontsize=16)
             
     cmap = cm.get_cmap('viridis').copy() #'nipy_spectral'
     cmap.set_bad(color='pink')         
     cmap_norm = LogNorm(vmin=np.nanquantile(image[image > 0], 0.05),vmax=np.nanquantile(image, 0.9999))
     im0 = ax[0].imshow(image, origin='lower', cmap=cmap, norm=cmap_norm)
     cbar = fig.colorbar(im0, ax=ax[0], orientation='horizontal', 
-                        pad=0.05, shrink=0.5, label='counts/s/pixel' if self.images[band].bunit == 'counts_s' else 'mJy')
+                        pad=0.05, shrink=0.5, label='counts/s/pixel' if self.images[band].ZP_err != 0 else 'mJy')
     cbar.ax.tick_params(labelsize=10)
 
     ax_reg = ax[0].inset_axes([1.1, 0.05, 0.45, 0.45])
@@ -491,11 +470,12 @@ def inspect_photometry(self,
     cmap.set_bad(color='white')   
     cmap_norm = LogNorm(vmin=np.nanquantile(image[image > 0], 0.05),vmax=np.nanquantile(image, 0.95))
     im1 = ax[1].imshow(image, origin='lower', cmap=cmap, norm=cmap_norm, alpha=1) #0.6
-    cbar = fig.colorbar(im1, ax=ax[1], orientation='horizontal', pad=0.02, shrink=0.5, label=self.images[band].bunit)
+    label = 'counts/s' if self.images[band].ZP_err != 0 else 'mJy'
+    cbar = fig.colorbar(im1, ax=ax[1], orientation='horizontal', pad=0.02, shrink=0.5, label=label)
     cbar.ax.tick_params(labelsize=10)
 
     ax_hist = ax[1].inset_axes([1.1, 0.05, 0.65, 0.65])
-    ax_hist.set_xlabel(self.images[band].bunit, fontsize=10)
+    ax_hist.set_xlabel(label, fontsize=10)
     ax_hist.tick_params(axis='both', which='major', labelsize=8)
 
     # Create initial mask for sources to exclude from background estimation
@@ -531,11 +511,17 @@ def inspect_photometry(self,
     
     # weighted number of pixels
     n = np.nansum(mask)
+
+    # number of pixels where the mask is non zero 
+    nonzero_pixels = np.sum((mask != 0) & ~np.isnan(mask))
+
+    print("Mask number of pixels: ",nonzero_pixels)
     print("Mask weighted number of pixels: ",n)
 
 
     # If the field of view is very big compared to the source background can be estimated moving around the regions
     if outer_area > 10 * source_area:
+
 
         back_flux_arr = []
         
@@ -561,7 +547,11 @@ def inspect_photometry(self,
                 continue
 
             # If more than 10% of the pixels in background region are Nan, skip it
-            if np.isnan(shifted_vals).sum() / n > 0.1: 
+            if np.isnan(shifted_vals).sum() / nonzero_pixels > 0.1: 
+                continue
+
+            # If more than 50% of the pixels in background region are zeros, skip it
+            if (shifted_vals == 0).sum() / nonzero_pixels > 0.5: 
                 continue
             
             back_flux = np.nansum(shifted_vals * mask_values)
@@ -693,30 +683,31 @@ def inspect_photometry(self,
     # photometry
 
     flux = np.nansum(image * mask)
-    print(f"Detected flux: {flux} {self.images[band].bunit}")
-    print(f"Background: {mean_background_flux} {self.images[band].bunit}")
-    print(f"Background std: {background_standard_dev} {self.images[band].bunit}")
+    print(f"Detected flux: {flux} {label}")
+    print(f"Background: {mean_background_flux} {label}")
+    print(f"Background std: {background_standard_dev} {label}")
     
     flux_sky_subtracted = flux - mean_background_flux
 
-    print(f"Sky subtracted flux: {flux_sky_subtracted} {self.images[band].bunit}")
+    print(f"Sky subtracted flux: {flux_sky_subtracted} {label}")
 
     if flux_sky_subtracted < 0:
         print(f"Negative flux: setting flux to 0") 
         flux_sky_subtracted = 0
 
-    if self.images[band].bunit == 'counts_s' and flux_sky_subtracted > 0:
-        dt = float(self.images[band].header['EXPTIME'])
-        total_region_sky_subtracted_counts = flux_sky_subtracted * dt
-        poisson_err = np.sqrt(total_region_sky_subtracted_counts) / dt
+    exptime = self.images[band].exptime
+    if exptime and flux_sky_subtracted > 0:
+        exptime = float(self.images[band].header['EXPTIME'])
+        total_region_sky_subtracted_counts = flux_sky_subtracted * exptime
+        poisson_err = np.sqrt(total_region_sky_subtracted_counts) / exptime
     else:
         poisson_err = 0
 
-    print(f"Poissonian Error {poisson_err} {self.images[band].bunit}")
+    print(f"Poissonian Error {poisson_err} {label}")
     
     total_flux_err = np.sqrt(background_standard_dev**2 + poisson_err**2)
 
-    print(f"Total Error {total_flux_err} {self.images[band].bunit}")
+    print(f"Total Error {total_flux_err} {label}")
                 
     if total_flux_err / flux_sky_subtracted < 0.01:
         total_flux_err = 0.01 * flux_sky_subtracted
@@ -725,26 +716,29 @@ def inspect_photometry(self,
         flux_sky_subtracted = flux_sky_subtracted / (n * self.images[band].area_pix_arcsec2)
         total_flux_err = total_flux_err / (n * self.images[band].area_pix_arcsec2)
 
-    if self.images[band].bunit == 'counts_s':
-        flux_conv = self.images[band].flux_conv_counts_s_to_mJy 
-    elif self.images[band].bunit == 'mJy':
-        flux_conv = 1
-    elif self.images[band].bunit == 'erg_s_cm2_A':
-        flux_conv = self.images[band].pivot_wavelength**2 / 3.99e18 / 1e-26 
-    print('To physical units: ',flux_conv)
-    
-    flux_sky_subtracted = flux_sky_subtracted * flux_conv
-    total_flux_err = total_flux_err * flux_conv  
 
-    if units == 'erg_s_cm2_A':
-        flux_conv = self.images[band].pivot_wavelength**2 / 3.99e18 / 1e-26  
-        flux_sky_subtracted = flux_sky_subtracted * flux_conv
-        total_flux_err = total_flux_err * flux_conv 
-            
-    if units == 'mag':        
-        flux_sky_subtracted_mJy = flux_sky_subtracted        
-        flux_sky_subtracted = -2.5 * np.log10(flux_sky_subtracted_mJy / 1000 / 3631)
-        total_flux_err = 2.5 / np.log(10) / flux_sky_subtracted_mJy / 1000 / 3631 * total_flux_err
+    # --- UNIT CONVERSION ---
+    # So far we worked on counts/s, apart for Herschel
+    ZP = self.images[band].ZP
+    ZP_err = self.images[band].ZP_err
+
+    #convert all to mag
+    mag = ZP - 2.5*np.log10(flux_sky_subtracted)
+    mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)   #  Here I add calibration error!
+
+
+    if 'mag' in units:
+        flux_sky_subtracted = mag
+        total_flux_err = mag_err
+        
+    if 'mJy' in units:
+        flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
+        total_flux_err = 1e3 * 0.4*np.log(10)*10**(0.4*(-mag+8.90)) * mag_err
+
+    if 'erg_s_cm2_A' in units:
+        flux_sky_subtracted = 2.998e18 / self.images[band].pivot_wavelength**2 * 10**(0.4*(-mag-48.60))
+        total_flux_err = 2.998e18 / self.images[band].pivot_wavelength**2  * 0.4*np.log(10)*10**(0.4*(-mag-48.60)) * mag_err
+
 
     fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
     print(f"### Final value ### \n Flux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} {units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
