@@ -103,8 +103,6 @@ def photometry(self,
 
         wcs = self.images[band].wcs  # World Coordinate System
 
-        # Replace zeros with NaNs for safety NO!
-        #image[image == 0] = np.nan
 
         # Create initial mask for sources to exclude from background estimation
         source_mask = np.zeros_like(image, dtype=bool)
@@ -129,35 +127,40 @@ def photometry(self,
         # Loop over regions for photometry
         for r, Reg in enumerate(regions):
             mask = Reg.project(image, wcs)  # Binary mask of region
-            n = np.nansum(mask)  # Number of pixels in region
+            n = np.nansum(mask)             # Number of pixels in region
 
             # --- BACKGROUND ESTIMATION ---
             if outer_area > 10 * source_area:
                 # Use random region shifting for large fields
                 back_flux_arr = []
-                threshold = np.nanquantile(np.abs(image), threshold_quantile)
+                threshold = np.nanquantile(image[image>-999], threshold_quantile)
 
                 mask_indices = np.argwhere(mask > 0)
                 mask_values = mask[mask > 0]
 
-                for _ in range(n_background_regions):
+                while len(back_flux_arr)<n_background_regions:
                     # Shift region randomly within the image
-                    dy = random.randint(0, image.shape[0] - 1)
-                    dx = random.randint(0, image.shape[1] - 1)
-                    shifted = (mask_indices + [dy, dx]) % image.shape
-
+                    dy = random.randint(- (image.shape[0] - 5), image.shape[0] - 5)
+                    dx = random.randint(- (image.shape[1] - 5), image.shape[1] - 5)
+                    shifted = mask_indices + [dy, dx]
+                    
+                    # check if all shifted pixels are inside the image
+                    if (shifted[:,0].min() < 0 or shifted[:,0].max() >= image.shape[0] or
+                        shifted[:,1].min() < 0 or shifted[:,1].max() >= image.shape[1]):
+                        continue  # reject this shift
                     shifted_vals = image[shifted[:, 0], shifted[:, 1]]
-                    if np.isnan(shifted_vals).sum() / shifted_vals.size > 0.1:
-                        continue
 
+
+                    # extra checks
                     # background region must not overlap with the source region
                     if np.any(source_mask[shifted[:, 0], shifted[:, 1]]):
                         continue
 
-                    # If more than 10% of the pixels in background region are Nan, skip it
-                    if np.isnan(shifted_vals).sum() / n > 0.1: 
+                    # All pixels outside the original image that appear after rotation will be set to -999
+                    # Exclude regions that follow even partially outside original image
+                    if np.any(np.isclose(shifted_vals, -999, atol=1e-6)):
                         continue
-                    
+
                     # Reject bright outliers using threshold
                     back_flux = np.nansum(shifted_vals * mask_values)
                     if back_flux < threshold * n:
@@ -169,7 +172,9 @@ def photometry(self,
             else:
                 # Use histogram fitting for small fields or masked background
                 masked_image = np.where(source_mask, image, np.nan)
-                flattened_data = masked_image[~np.isnan(masked_image)].flatten()
+                flattened_data = masked_image[
+                    (~np.isnan(masked_image)) & (masked_image != -999)
+                ].flatten()
 
                 bins = np.linspace(np.nanquantile(flattened_data, 0.005),
                                    np.nanquantile(flattened_data, 0.9))
@@ -244,9 +249,10 @@ def photometry(self,
 
             if print_output:
                 fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
-                print(f"Flux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} "
+                print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} "
                       f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
 
+        
             # Save photometry result
             
             # manages multiple images of the same band (mosaics)
@@ -254,6 +260,8 @@ def photometry(self,
                 band = band + f"({exposure_id})"
             
             photometric_list[r].data[band] = (flux_sky_subtracted, total_flux_err)
+
+        if print_output: print('\n')
 
     return photometric_list
     
@@ -415,7 +423,7 @@ def inspect_photometry(self,
     #image[image == 0] = np.nan
 
     # ---- Plotting ----
-    fig, ax = plt.subplots(2,1,figsize=(14, 20),constrained_layout=True)
+    fig, ax = plt.subplots(2,1,figsize=(14, 14),constrained_layout=True)
             
     cmap = cm.get_cmap('viridis').copy() #'nipy_spectral'
     cmap.set_bad(color='pink')         

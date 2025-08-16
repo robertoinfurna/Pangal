@@ -108,7 +108,6 @@ def line_map(self, line, width, continuum_offset_1, continuum_offset_2, z=0, EBm
         continuum = (cont_cube_1 + cont_cube_2) / 2
     
         # Optional extinction correction
-        # AG = EBmV * MW_extinction(obs_wavelength)
         image_erg_s_cm2 = (line_cube - continuum) * selected_cube.dw * selected_cube.units  
     
         # Safe naming: avoid overwriting
@@ -122,7 +121,6 @@ def line_map(self, line, width, continuum_offset_1, continuum_offset_2, z=0, EBm
         # Save
         self.images[image_name] = Image(
             image=image_erg_s_cm2,
-            bunit='erg_s_cm2',
             wcs=selected_cube.wcs,
             dtheta_pix_deg=selected_cube.dtheta_pix_deg,
             area_pix_arcsec2=selected_cube.area_pix_arcsec2,
@@ -184,8 +182,6 @@ def extract_spectra(self, regions, cube=None):
 
 
 
-
-
 def plot_spectra(
     self,
     spectra,
@@ -200,7 +196,7 @@ def plot_spectra(
     show_filters=False,
     show_spectral_lines=False,
     show_atmospheric_lines=False
-):
+    ):
     """
     Plot spectra extracted from regions, with optional annotations and features.
 
@@ -235,126 +231,84 @@ def plot_spectra(
     show_atmospheric_lines : bool, optional
         If True, annotate atmospheric absorption lines using `atmospheric_lines`.
     """
-    # If input is a single Spectrum object, convert to list
+
     if not isinstance(spectra, (list, tuple)):
         spectra = [spectra]
-    n_regions = len(spectra)
 
-    fig, axes = plt.subplots(n_regions, 1, figsize=(7, 3 * n_regions), squeeze=False)
-    axes = axes.flatten()
+    if zoom_on_line is None: zoom_on_line = []
+    if isinstance(zoom_on_line, str): zoom_on_line = [zoom_on_line]
+
+    n_cols = max(1, len(zoom_on_line))
+    fig, axes = plt.subplots(len(spectra), n_cols, figsize=(4*n_cols, 3*len(spectra)), squeeze=False)
 
     for i, spec in enumerate(spectra):
+        wl, flux, flux_err = spec.wl, spec.flux, spec.flux_err
 
-        wl = spec.wl 
-        flux = spec.flux 
-        flux_err = spec.flux_err 
- 
-        ax = axes[i]
+        # Decide columns to iterate: zoom lines or single full spectrum
+        cols = zoom_on_line if zoom_on_line else [None]
+        for j, line in enumerate(cols):
+            ax = axes[i, j] if n_cols > 1 else axes[i, 0]
 
+            # Determine x-limits
+            if line:
+                if line not in spectral_lines: raise ValueError("Line not recognized")
+                center = spectral_lines[line] * (1 + z)
+                x0, x1 = center-70, center+70
+            else:
+                x0, x1 = (winf if winf is not None else wl[0], wsup if wsup is not None else wl[-1])
 
-        if flux_err is not None:
-            
-            ax.errorbar(
-                wl, flux, yerr=flux_err,
-                fmt='o', color=color, ecolor=ecolor,
-                elinewidth=1.5, capsize=3, capthick=1.5,
-                linestyle='-', lw=0.4
-            )
-            
-        else: # If error is zero the spectrum is a model
+            # Plot flux
+            if flux_err is not None:
+                ax.errorbar(wl, flux, yerr=flux_err, fmt='o', markersize=2,
+                            color=color, ecolor=ecolor, elinewidth=1.5,
+                            capsize=3, capthick=1.5, linestyle='-', lw=0.5)
+            else:
+                ax.plot(wl, flux, color=color, lw=1)
 
-            ax.plot(
-                wl, flux, color=color, linestyle='-', lw=1)
+            if log: ax.set_xscale('log'); ax.set_yscale('log')
+            ax.set_xlim(x0, x1)
 
-        
-        # Center around specified line if requested
-        if zoom_on_line and zoom_on_line in spectral_lines:
-            central_wavelength = spectral_lines[zoom_on_line] * (1 + z)
-            winf = central_wavelength - 150
-            wsup = central_wavelength + 150
+            mask = (wl >= x0) & (wl <= x1)
+            fmin, fmax = np.nanmin(flux[mask]), np.nanmax(flux[mask])
+            ax.set_ylim(0.95*fmin, 1.5*fmax)
+            ax.set_xlabel("Wavelength (Å)")
+            if j==0:
+                ax.set_ylabel(r"Flux (erg/s/cm$^2$/Å/arcsec$^2$)")
+                
+                if 'id' in spec.header or 'ID' in spec.header:
+                    ax.text(0.02, 0.96, f"{spec.header.get('id', spec.header.get('ID'))}",
+                            ha='left', va='top', fontsize=10, transform=ax.transAxes, color='black')
 
-        if log:
-            ax.set_xscale('log')
-            ax.set_yscale('log')
+                # Optional annotations
+                if show_snr and flux_err is not None:
+                    snr = flux / flux_err
+                    ax.text(0.95, 0.95, f"SNR Median:{np.nanmedian(snr):.2f}\nMin:{np.nanmin(snr[snr>0]):.2f}\nMax:{np.nanmax(snr):.2f}",
+                            ha='right', va='top', transform=ax.transAxes,
+                            fontsize=10, bbox=dict(boxstyle='round,pad=0.3', edgecolor='gray', facecolor='white', alpha=0.7))
 
+            if show_filters:
+                for name, props in UBGVRI_filters.items():
+                    wmin = props["pivot_wavelength"]-props["bandwidth"]/2
+                    wmax = props["pivot_wavelength"]+props["bandwidth"]/2
+                    ax.fill_betweenx([0.95*fmin,1.5*fmax], wmin,wmax, alpha=0.2, color=props["color"], label=f"{name} filter")
 
-        if not winf or not wsup:
-            winf,wsup = wl[0],wl[-1]
-        ax.set_xlim(winf, wsup)
+            if show_spectral_lines:
+                for name, wavelength in spectral_lines.items():
+                    wl_shift = wavelength*(1+z)
+                    ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.7)
+                    name_map = {'Ha':'$H\\alpha$', 'Hb':'$H\\beta$', 'Hg':'$H\\gamma$', 'Hd':'$H\\delta$', 'Lya':'Ly$\\alpha$'}
+                    ax.text(wl_shift, 1.1*fmax, name_map.get(name,name), rotation=90,
+                            va="bottom", fontsize=10, ha='center', clip_on=True,
+                            bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
-        # Dynamic y-axis scaling
-        mask_plot = (wl >= winf) & (wl <= wsup)
-        flux_min = np.nanmin(flux[mask_plot])
-        flux_max = np.nanmax(flux[mask_plot])
-        ax.set_ylim(0.95 * flux_min, 1.5 * flux_max)
-
-        ax.set_xlabel("Wavelength (Å)")
-        ax.set_ylabel(r"Flux (erg/s/cm$^2$/Å/arcsec$^2$)")
-
-        if 'id' in spec.header or 'ID' in spec.header:
-            ax.text(
-                0.02, 0.96,
-                f"{spec.header.get('id', spec.header.get('ID'))}",
-                ha='left', va='top', fontsize=12,
-                transform=ax.transAxes, color='black'
-            )
-
-        # --- SNR Calculation ---
-        if show_snr and flux_err is not None:
-            snr = flux / flux_err
-            snr_median = np.nanmedian(snr)
-            snr_min = np.nanmin(snr)
-            snr_max = np.nanmax(snr)
-
-            ax.text(
-                0.95, 0.95,
-                f"SNR (Median): {snr_median:.2f}\nMin: {snr_min:.2f}\nMax: {snr_max:.2f}",
-                ha='right', va='top',
-                transform=ax.transAxes,
-                fontsize=10,
-                bbox=dict(boxstyle='round,pad=0.3', edgecolor='gray', facecolor='white', alpha=0.7)
-            )
-
-        # --- Filter Bands ---
-        if show_filters:
-            for name, props in UBGVRI_filters.items():
-                wmin = props["pivot_wavelength"] - props["bandwidth"] / 2
-                wmax = props["pivot_wavelength"] + props["bandwidth"] / 2
-                ax.fill_betweenx(
-                    [0.95 * flux_min, 1.5 * flux_max],
-                    wmin, wmax,
-                    alpha=0.2,
-                    color=props["color"],
-                    label=f"{name} filter"
-                )
-
-        # --- Spectral Lines ---
-        if show_spectral_lines:
-            for name, wavelength in spectral_lines.items():
-                wavelength_shifted = wavelength * (1 + z)
-                ax.axvline(wavelength_shifted, color="black", linestyle="dashed", alpha=0.7)
-                ax.text(
-                    wavelength_shifted + 2, 1.1 * flux_max, name,
-                    rotation=90, verticalalignment="bottom",
-                    fontsize=7, zorder=1, clip_on=True,
-                    color='black', weight='bold', ha='center',
-                    backgroundcolor='white'
-                )
-
-        # --- Atmospheric Lines ---
-        if show_atmospheric_lines:
-            for name, wavelength in atmospheric_lines.items():
-                ax.axvline(wavelength, color="cyan", linestyle="dashed", alpha=0.7)
-                ax.text(
-                    wavelength + 2, flux_max * 0.8, name,
-                    rotation=90, verticalalignment="bottom",
-                    fontsize=8, zorder=1, clip_on=True,
-                    color='cyan'
-                )
+            if show_atmospheric_lines:
+                for name, wavelength in atmospheric_lines.items():
+                    ax.axvline(wavelength, color="cyan", linestyle="dashed", alpha=0.7)
+                    ax.text(wavelength+2, fmax*0.8, name, rotation=90, va="bottom",
+                            fontsize=8, clip_on=True, color='cyan')
 
     plt.tight_layout()
     plt.show()
-        
         
 
 

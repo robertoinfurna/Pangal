@@ -146,9 +146,10 @@ class PanGal:
                     
                 band = 'galex_nuv' if float(header['BAND']) == 1.0 else 'galex_fuv'
 
+                # https://galex.stsci.edu/gr6/?page=faq&utm_source=chatgpt.com
                 ZP = 20.08 if band == 'galex_nuv' else 18.82
                 ZP_err = 0.05
-                pivot_wavelength = 2315 if band == 'galex_nuv' else 1538    
+                pivot_wavelength = 2297 if band == 'galex_nuv' else 1524    
 
                 wcs = WCS(header)
                 dtheta_pix_deg = dtheta_pixel(wcs) 
@@ -180,9 +181,8 @@ class PanGal:
                 # convert from nanomaggy to counts/s
                 image = hdul[0].data / header['NMGY'] 
                 ZP = 22.5 - 2.5 * np.log10(header['NMGY'])
-                ZP_err = 0#0.01 * ZP
-                #bunit = 'counts_s'
-
+                ZP_err = {'u': 0.04, 'g': 0.01, 'r': 0.01, 'i': 0.01, 'z': 0.02}.get(band[5], 0.01)
+ 
                 exptime = float(header['EXPTIME']) # 57 s
 
                 wcs = WCS(header)
@@ -239,10 +239,9 @@ class PanGal:
 
                 image = hdul[1].data
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
-                image = np.nan_to_num(image, nan=0.0)
-
+                
+                image[np.isnan(image)] = -999
         
-
             # 2MASS
             elif any(x in file.lower() for x in ['2mass', '2masx']):
             
@@ -307,6 +306,7 @@ class PanGal:
                 image = hdul[0].data     
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)            
         
+        
             # Spitzer IRAC
             elif 'irac' in file.lower():
             
@@ -324,7 +324,8 @@ class PanGal:
                 band = 'spitzer_irac_'+str(channel)
                 pivot_wavelength = [3.6e4, 4.5e4, 5.8e4, 8.0e4][channel - 1]
                 
-                # native image in MJy/sr
+
+                # native image in MJy/sr. CONVERT TO counts/s
                 conversion_factor = header['FLUXCONV'] / header['GAIN']  # brings MJy/sr in counts/s
                 image = hdul[0].data / conversion_factor
 
@@ -333,13 +334,14 @@ class PanGal:
                 # Jy = counts/s * flux_conv_counts_s_to_Jy
 
                 ZP = -2.5*np.log10(flux_conv_counts_s_to_Jy) + 8.90
-                ZP_err = 0 #0.011        # conservative 1% error
+                ZP_err = 0.011        # conservative 1% error
 
                 exptime = float(header['EXPTIME'])
         
-  
+
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
-                image = np.nan_to_num(image, nan=0.0)
+                
+                image[np.isnan(image)] = -999
 
             
             # Herschel PACS
@@ -393,12 +395,10 @@ class PanGal:
         
             self.images[image_name] = Image(
                 image=image,
-                #bunit=bunit,
                 wcs=wcs,
                 dtheta_pix_deg=dtheta_pix_deg,
                 area_pix_arcsec2=area_pix_arcsec2,
                 pivot_wavelength=pivot_wavelength,
-                #flux_conv_counts_s_to_mJy=flux_conv_counts_s_to_mJy,
                 ZP=ZP,
                 ZP_err=ZP_err,
                 exptime=exptime,
@@ -490,7 +490,7 @@ class PanGal:
                         channel_inf = np.digitize(w_inf, wl) - 1
                         channel_sup = np.digitize(w_sup, wl) - 1
                         bandwidth = w_sup - w_inf
-                        pivot_wavelength = filter.effective_wavelength
+                        pivot_wavelength = filter.pivot_wavelength
 
                         integrated_band = np.nansum(cube[channel_inf:channel_sup, :, :], axis=0)
                         

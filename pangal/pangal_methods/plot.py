@@ -29,35 +29,102 @@ from scipy.interpolate import interp1d
 from ..base import Image, Cube, Region, Point, Contours
 from ..filters import map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
+
+
 # INTERACTIVE SKY COORDS NOT WORKING!!
 # BBOX STILL BELOW COLORBAR!
+
+
+default_cmaps = {
+    'galex_fuv': 'gnuplot', 'galex_nuv': 'gnuplot2', 
+    'muse_blue': 'bone', 'muse_green': 'viridis','muse_red': 'hot', 'muse_nir': 'copper', 'muse_white_aoe': 'gray',
+    'muse_Ha': 'plasma', 'muse_Hb': 'inferno', 'muse_SII': 'viridis', 
+    **{band: 'gray' for band in map_filter_names if band.startswith('hst')},
+    'sdss_u': 'Blues_r','sdss_g': 'Greens_r', 'sdss_r': 'Reds_r', 'sdss_i': 'YlOrBr_r', 'sdss_z': 'Greys_r',
+    '2mass_j': 'PuRd_r', '2mass_h': 'BuPu_r', '2mass_ks': 'Oranges_r', 
+    **{f'wise_w{band}': 'viridis' for band in ['1','2','3','4']},
+    **{band: 'nipy_spectral' for band in map_filter_names if band.startswith('spitzer_irac')},
+    'herschel_pacs_70um': 'Blues_r', 'herschel_pacs_100um': 'Greens_r', 'herschel_pacs_160um': 'Reds_r'
+    }
+    
+default_filter_colors = { 
+    'galex_fuv': 'violet', 'galex_nuv': 'darkblue', 
+    'muse_blue': 'blue', 'muse_green': 'green', 'muse_red': 'red', 'muse_nir': 'gold', 'muse_white_aoe':'gray',
+    'muse_Ha': 'orange', 'muse_Hb': 'purple', 'muse_sii': 'lime',
+    **{band: 'purple' for band in map_filter_names if band.startswith('hst')},
+    'sdss_u': 'midnightblue', 'sdss_g': 'cyan', 'sdss_r': 'orangered', 
+    'sdss_i': 'red', 'sdss_z': 'darkred',
+    '2mass_j': 'pink', '2mass_h': 'purple', '2mass_ks': 'darkviolet',
+    **{f'wise_w{band}': 'brown' for band in ['1','2','3','4']},
+    'spitzer_irac_1': 'teal', 'spitzer_irac_2': 'lightgreen', 
+    'spitzer_irac_3': 'orange', 'spitzer_irac_4': 'darkred',
+    'herschel_pacs_70um': 'lime', 'herschel_pacs_100um': 'lime', 'herschel_pacs_160um': 'lime'
+}    
+
+        
+default_plot_units = {
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('galex')},
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('uvit')},
+    'muse_blue': 'mag_arcsec2','muse_green': 'mag_arcsec2', 'muse_red': 'mag_arcsec2', 'muse_nir': 'mag_arcsec2', 'muse_white_aoe': 'mag_arcsec2',
+    'muse_Ha': 'erg_s_cm2_arcsec2', 'muse_Hb': 'erg_s_cm2_arcsec2',
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('hst')},
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('sdss')},
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('2mass')},
+    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('wise')},
+    **{band: 'MJy_sr' for band in map_filter_names if band.startswith('spitzer')},
+    **{band: 'MJy_sr' for band in map_filter_names if band.startswith('herschel')},
+}
+
+default_plot_scale_lims = {
+    'FUV': (22, 27), 'NUV': (22, 27), 
+    'galex_fuv': (22, 27), 'galex_nuv': (22, 27), 
+    'muse_blue': (20, 27),'muse_green': (20, 27), 'muse_red': (20, 27), 'muse_nir': (20, 27), 'muse_white_aoe': (20,27),
+    'muse_Ha': (1e-19, 1e-14), 'muse_Hb': (1e-19, 1e-14),
+    **{band: (19, 27) for band in map_filter_names if band.startswith('hst')},
+    **{f'sdss_{band}': (20, 27) for band in ['u', 'g', 'r', 'i', 'z']},
+    '2mass_j': (15, 22), '2mass_h': (15, 22), '2mass_ks': (15, 21), 
+    **{f'wise_w{band}': (15, 22) for band in ['1','2','3','4']},
+    'spitzer_irac_1': (6e-2, 10), 'spitzer_irac_2': (1e-1, 10), 'spitzer_irac_3': (1, 10), 'spitzer_irac_4': (5, 100),
+    'herschel_pacs_70um': (10, 100), 'herschel_pacs_100um': (10, 100), 'herschel_pacs_160um': (10, 100)
+}
+         
+
 
 def plot(self,
         bands = None,                            # List of bands to be plotted. If None, all bands are plotted
 
-        regions=[],                              # List of Region overlays (masks or astropy regions)
-        contours=[],                             # List of contours objects
-        points=[],                               # List of points objects
+        regions=[],                              # List of Region objects
+        contours=[],                             # List of Contour objects
+        points=[],                               # List of Point objects
                  
-        set_cmaps: dict | None               = None,
+        set_cmaps: dict | None          = None,
         set_units: dict | None          = None,
         set_scale_lims: dict | None     = None,
                  
         # --- Coordinate cuts (world coordinates)
-        ra_min_cut=None, ra_max_cut=None,         # RA limits (sexagesimal string, e.g., '12:59:00.6')
-        dec_min_cut=None, dec_max_cut=None,       # Dec limits (sexagesimal string, e.g., '28:07:35.0')
+        ra_min=None, ra_max=None,             # RA limits (deg or sexagesimal string, e.g., '12:59:00.6')
+        dec_min=None, dec_max=None,           # Dec limits (deg or sexagesimal string, e.g., '28:07:35.0')
     
         # --- Display options
         plots_per_row=3,                       # Number of plots per row
-        figsize=None,                         # Overall figure size (width, height) in inches
+        figsize=None,                          # Overall figure size (width, height) in inches
     
         # --- Axis ticks
-        n_xticks=5, n_yticks=5,                   # Number of ticks along x and y axes
-        label_fontsize=12,                        # Font size for axis labels
-        ticks_fontsize=10,                        # Font size for tick labels
+        n_xticks=5, n_yticks=5,                 # Number of ticks along x and y axes
+        axis_label_fontsize=12,                      # Font size for axis labels
+        axis_ticks_fontsize=10,                      # Font size for tick labels
+
+        # ---cbar ticks
+        show_cbar = True,
+        cbar_label_fontsize=12,
+        cbar_ticks_fontsize=11,
         
         auto_titles=True,                        # Enables authomatic titles 
+        auto_title_fontsize=12,
+        auto_title_color='black',
         auto_titles_style=0,                     # Autotitles style
+        autotitle_loc = [0.03, 0.97],
+        
         titles_dict=[],                          # List of manual titles
 
         legend = True,
@@ -65,25 +132,13 @@ def plot(self,
         legend_fontsize = 14,
         show_region_captions = True, 
         
-        interactive_pix_coords = False,
-        interactive_sky_coords = False,
-             
     ):
 
-        
-    if bands is None: bands = list(self.images.keys())
-                 
+    # Bands 
+    if bands is None: bands = list(self.images.keys())             
     n_images = len(bands)
-    if interactive_pix_coords or interactive_sky_coords:
-        if n_images > 1:
-            print(f"[INFO] Interactive mode is only supported for a single image at a time: plotting band {bands[0]}")
-            n_images = 1
-            plots_per_row = 1
-            bands = [bands[0]]  # Restrict to one image
-        print("[NOTE] If you're using a Jupyter notebook, please enable interactive support with `%matplotlib widget`.")   
-        
-    # ---- Create the plot ----
-    
+
+    # ---- Create the plot ----    
     if figsize is None: figsize=(8*plots_per_row, 8*np.ceil(n_images/plots_per_row))
     
     if n_images == 1:
@@ -93,19 +148,20 @@ def plot(self,
         nrows = int(np.ceil(n_images / plots_per_row))
         fig, ax = plt.subplots(nrows, plots_per_row, figsize=figsize)
         ax = ax.flatten()
-        
-        
-    # SHARED COLORBAR
+
+
+    # ---- CMAPS, UNITS AND SCALE LIMS SETTINGS
 
     cmaps = {**default_cmaps,**(set_cmaps or {})}
     plot_units = {**default_plot_units,**(set_units or {})}
     plot_scale_lims = set_scale_lims or {}
     
- 
-    # ---- Loop through images ----
 
+    # ---- prepare a legend
     legend_handles = [[] for b in bands]
-        
+
+
+    # ---- Loop through images ----   
     for i, band in enumerate(bands):
     
         # manages multiple images of the same band (mosaics)
@@ -114,9 +170,8 @@ def plot(self,
             idx = image_id.find('(')
             band = image_id[:idx]
 
-        
         units = plot_units[band]
-        
+
         if units == 'mag_arcsec2':
             image = self.images[image_id].mag_arcsec2
             label = 'mag/arcsec$^2$'
@@ -144,33 +199,40 @@ def plot(self,
                 vmin, vmax = np.nanquantile(finite_vals[finite_vals>0], 0.01), np.nanquantile(finite_vals, 0.9999)
             else:
                 vmin, vmax = np.nanquantile(finite_vals, 0.0001), np.nanquantile(finite_vals, 0.9)
-            
-        norm = LogNorm(vmin, vmax) if units != 'mag_arcsec2' else Normalize(vmin, vmax)
         
+        ratio = vmax / vmin
+        
+        # Choose normalization
+        if ratio >= 100:  # large dynamic range
+            norm = LogNorm(vmin=vmin, vmax=vmax)
+        else:  # small range, linear works better
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            
         cmap = plt.get_cmap(cmaps[band])
         min_color = cmap(0.0)           # 0.0 corresponds to the minimum end of the colormap
         cmap.set_bad(color=min_color)   # set bad pixels to appear as minimum color
         if units == 'mag_arcsec2': cmap = cmap.reversed()
 
+        
         im = ax[i].imshow(image, origin='lower', cmap=cmap, norm=norm, interpolation='none')
-        cbar = fig.colorbar(im, ax=ax[i], location='right', shrink=0.6, pad=0.01)
-        cbar.ax.tick_params(labelsize=11)
-        cbar.set_label(label, fontsize=11)
-                
+        if show_cbar:
+            cbar = fig.colorbar(im, ax=ax[i], location='right', shrink=0.6, pad=0.01)
+            cbar.ax.tick_params(labelsize=cbar_label_fontsize)
+            cbar.set_label(label, fontsize=cbar_ticks_fontsize)
                 
         wcs = self.images[image_id].wcs
                 
         # ---- Ticks and Labels ----
-        add_ra_dec_ticks(ax[i], image, wcs, n_xticks, n_yticks,ticks_fontsize, label_fontsize,ra_min_cut, ra_max_cut, dec_min_cut, dec_max_cut)
+        add_ra_dec_ticks(ax[i], image, wcs, n_xticks, n_yticks,axis_ticks_fontsize, axis_label_fontsize,ra_min, ra_max, dec_min, dec_max)
         
         # ---- Regions ----
         # This works for masks 
         for Reg in regions:
             ny, nx = Reg.mask.shape
-            ra_max, dec_min = Reg.wcs.all_pix2world([[0, 0]], 0)[0]
-            ra_min, dec_max = Reg.wcs.all_pix2world([[nx, ny]], 0)[0]
-            x_min, y_min = wcs.all_world2pix([[ra_max, dec_min]], 0)[0]
-            x_max, y_max = wcs.all_world2pix([[ra_min, dec_max]], 0)[0]
+            ra_max_reg, dec_min_reg = Reg.wcs.all_pix2world([[0, 0]], 0)[0]
+            ra_min_reg, dec_max_reg = Reg.wcs.all_pix2world([[nx, ny]], 0)[0]
+            x_min, y_min = wcs.all_world2pix([[ra_max_reg, dec_min_reg]], 0)[0]
+            x_max, y_max = wcs.all_world2pix([[ra_min_reg, dec_max_reg]], 0)[0]
                 
             X_low = np.linspace(x_min, x_max, Reg.mask.shape[1])
             Y_low = np.linspace(y_min, y_max, Reg.mask.shape[0])
@@ -178,7 +240,7 @@ def plot(self,
             ax[i].contour(X_low,Y_low,Reg.mask,levels=[0.5],
                 colors=Reg.color,linestyles=Reg.linestyle,linewidths=Reg.linewidth,alpha=Reg.alpha) 
 
-            if Reg.caption_coords and show_region_captions:
+            if Reg.caption_coords and (Reg.id or 'id' in Reg.header.keys() or 'ID' in Reg.header.keys()) and show_region_captions:
                 x, y = wcs.all_world2pix([[Reg.caption_coords[0], Reg.caption_coords[1]]], 0)[0]
                 ax[i].text(x, y, Reg.id, color='white',fontsize=Reg.caption_fontsize, ha='center', va='center', fontweight='bold',
                            bbox=dict(facecolor='black', alpha=0.5, edgecolor='none'))
@@ -228,27 +290,34 @@ def plot(self,
 
             ax[j].scatter(x, y, c=P.color, marker=P.m, s=P.s)
             if P.caption:
-                ax[j].text(x + 3, y + 3, P.caption,color=P.color, fontsize=int(P.s / 5),ha='center', va='center', fontweight='bold')
-    
+                x_ax, y_ax = ax[j].transData.transform((x, y))  # pixels in figure
+                x_ax, y_ax = ax[j].transAxes.inverted().transform((x_ax, y_ax))  # 0-1 in axes
+                ax[j].text(x_ax+P.caption_offset[0], y_ax+P.caption_offset[1], P.caption,color=P.color, fontsize=P.caption_fontsize,
+                           ha='center', va='center', fontweight='bold',transform=ax[j].transAxes)
+
     # ---- Legend ----
     if legend:
         for i in range(len(bands)):
             if legend_handles[i]:
                 ax[i].legend(handles=legend_handles[i], loc=legend_loc, fontsize=legend_fontsize)
 
- 
-    # ---- Optional authomatic titles ----
+    # ---- Authomatic titles ----
     for i, band in enumerate(bands):
-        if auto_titles and not titles_dict: # authomatic titles        
+        if auto_titles and not titles_dict:       
             if auto_titles_style == 0:     
-                ax[i].text(0.03, 0.97, nice_filter_names[band], color='black', fontsize=15, ha='left', va='top', 
-                           transform=ax[i].transAxes,bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+                ax[i].text(autotitle_loc[0], autotitle_loc[1], nice_filter_names[band], 
+                           color=auto_title_color, fontsize=auto_title_fontsize, 
+                           ha='left', va='top', 
+                           transform=ax[i].transAxes,
+                           bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
             if auto_titles_style == 1:     
-                ax[i].text(0.03, 0.97, nice_filter_names[band], color='white', fontsize=15, ha='left', va='top', 
+                ax[i].text(autotitle_loc[0], autotitle_loc[1], nice_filter_names[band], 
+                           color=auto_title_color, fontsize=auto_title_fontsize, fontweight='bold',
+                           ha='left', va='top', 
                            transform=ax[i].transAxes)
 
     # ---- Manual titles
-    for title_dict in titles_dict: # manual titles
+    for title_dict in titles_dict: 
         band = next(b for b in title_dict if b in bands)
         title = title_dict[band]
         j = bands.index(band)
@@ -265,24 +334,9 @@ def plot(self,
         
     for i in range(n_images, len(ax)):
          ax[i].axis('off')
-         
-    #(Before Regions worked!)
-    # ---- Annotations ----
-    if interactive_sky_coords:
-        annot(fig,ax[i],image,sky_coords=True,wcs=wcs)
-    elif interactive_pix_coords:
-        annot(fig,ax[i],image)
 
     plt.tight_layout()
     plt.show()
-
-
-
-
-
-
-
-
 
 
 
@@ -294,8 +348,8 @@ def add_ra_dec_ticks(ax,           # matplotlib axis on which to add ticks
                      n_yticks,     # int; number of tick marks along the Dec (y) axis
                      ticks_fontsize,   # int or float; font size to use for tick labels
                      label_fontsize,   # int or float; font size to use for the axis labels (e.g., 'RA (deg)', 'Dec (deg)')
-                     ra_min_cut, ra_max_cut,  # optional; strings for RA limits (in hourangle format, e.g., '12:59:00.0'); if provided, used to crop the axis
-                     dec_min_cut, dec_max_cut # optional; strings for Dec limits (in sexagesimal or decimal format, e.g., '28:07:35.0'); if provided, used to crop the axis
+                     ra_min_cut=None, ra_max_cut=None,  # optional; strings for RA limits (in hourangle format, e.g., '12:59:00.0'); if provided, used to crop the axis
+                     dec_min_cut=None, dec_max_cut=None # optional; strings for Dec limits (in sexagesimal or decimal format, e.g., '28:07:35.0'); if provided, used to crop the axis
                      ):
     """
     Adds right ascension (RA) and declination (Dec) tick marks and labels to a WCS-aligned image.
@@ -381,34 +435,6 @@ def dynamic_precision(span_deg):
 
 
 
-def annot(fig,ax,image,sky_coords=False,wcs=None):
-
-    annot = ax.annotate("", xy=(0,0), xytext=(10,10), textcoords="offset points",bbox=dict(boxstyle="round", fc="w",zorder=10)) 
-    annot.set_visible(False)
-
-    # Update annotation function
-    def update_annot(event):
-        if event.inaxes == ax:
-            x, y = int(event.xdata), int(event.ydata)
-            if 0 <= x < image.shape[1] and 0 <= y < image.shape[0]:
-                annot.xy = (event.xdata, event.ydata)
-                if sky_coords and wcs is not None:
-                    # Convert pixel (x, y) to sky coordinates
-                    skycoord = pixel_to_skycoord(x, y, wcs)
-                    ra = skycoord.ra.to_string(unit='hour', precision=2)
-                    dec = skycoord.dec.to_string(unit='deg', precision=2, alwayssign=True)
-                    text = f"RA={ra}, Dec={dec}, val={image[y, x]:.2f}"
-                else:
-                    text = f"x={x}, y={y}, val={image[y, x]:.2f}"
-                annot.set_text(text)
-                annot.set_visible(True)
-                fig.canvas.draw_idle()
-            else:
-                annot.set_visible(False)
-                fig.canvas.draw_idle()
-
-    # Connect the motion event
-    fig.canvas.mpl_connect("motion_notify_event", update_annot)
 
 
 
