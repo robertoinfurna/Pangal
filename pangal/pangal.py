@@ -46,12 +46,15 @@ from matplotlib.colors import Normalize, LogNorm
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 
-from .base import Image, Cube, Region, Point, Contours
+from .image import Image
+from .cube import Cube
+from .region import Region, Point, Contours
 from .filters import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
 
 from .pangal_methods.plot import plot
 from .pangal_methods.photometry import photometry, surface_brightness_profile, inspect_photometry
-from .pangal_methods.spectral_analysis import line_map, extract_spectra, plot_spectra, fit_lines
+
+from .pangal_methods.spectral_analysis import fit_lines
 from .pangal_methods.utils import area_pixel, dtheta_pixel, cut_and_rotate, correct_coords_offset, mosaic, MW_extinction
 
 
@@ -78,7 +81,16 @@ class DotDict(dict):                      # Dictionary that supports attribute-s
                  
 class PanGal:
 
-    def __init__(self, fits_files=None, target_coords=None, fov=0, EBmV=0,EBmV_err=0): 
+    def __init__(self, 
+                 directory=None,
+                 fits_files=None, 
+                 target_coords=None, 
+                 fov=0, 
+                 EBmV=0,
+                 EBmV_err=0,
+                 spectral_range_muse=None,
+                 correct_dust_muse=True,
+                 ): 
 
         self.images = DotDict()
         self.cubes = DotDict()
@@ -90,11 +102,23 @@ class PanGal:
         self.EBmV_err = EBmV_err
               
 
-        # Upload the data
+        # --- resolve input files ---
+        if fits_files is None and directory is not None:
+            # find FITS files in directory
+            fits_files = sorted(glob.glob(os.path.join(directory, "*.fits")))
+            fits_files += sorted(glob.glob(os.path.join(directory, "*.fit")))
+            fits_files += sorted(glob.glob(os.path.join(directory, "*.fz")))  # ESO/MUSE compressed
+
+        # --- upload data ---
         for file in fits_files:        
             self.add_image(file)
-            self.add_cube(file)
-            #self.add_spectrum(file)
+            self.add_cube(file, spectral_range=spectral_range_muse, correct_for_dust=correct_dust_muse)
+            # self.add_spectrum(file)
+
+
+
+
+    # METHODS
 
     @property
     def list(self):
@@ -108,18 +132,12 @@ class PanGal:
     photometry = photometry
     inspect_photometry = inspect_photometry
     surface_brightness_profile = surface_brightness_profile
-    line_map = line_map                                               # Extracts and plots a emission line surface brightness map Image object
-    extract_spectra = extract_spectra                                 # Extracts a Spectrum object from a cube, for a given a Region object
-    plot_spectra = plot_spectra
     fit_lines = fit_lines
 
         
     list_filters = list_filters    # lists all available filters    
     plot_filters = plot_filters
 
-    @property 
-    def bands(self):
-        print(self.images.keys())
 
     # Utils
     MW_extinction = MW_extinction
@@ -139,7 +157,7 @@ class PanGal:
                                   
             if 'galex' in file.lower():
 
-                #print('Processing GALEX file: ',file)
+                print('Processing GALEX file: ',file)
             
                 header = hdul[0].header
                 #bunit = 'counts_s' 
@@ -196,7 +214,7 @@ class PanGal:
                 
             elif 'hst' in file.lower():
             
-                #print('HST: ',file)
+                print('Processing HST files: ',file)
         
                 header = fits.Header()
                 header.update(hdul[0].header)
@@ -245,7 +263,7 @@ class PanGal:
             # 2MASS
             elif any(x in file.lower() for x in ['2mass', '2masx']):
             
-                print('2MASS: ',file)
+                print('Processing 2MASS: ',file)
         
                 header = hdul[0].header
                 
@@ -283,7 +301,7 @@ class PanGal:
             # WISE
             elif 'wise' in file.lower(): #https://wise2.ipac.caltech.edu/docs/release/allsky/expsup/index.html
             
-                print('WISE: ',file)
+                print('Processing WISE: ',file)
                 
                 header = hdul[0].header
                 
@@ -310,7 +328,7 @@ class PanGal:
             # Spitzer IRAC
             elif 'irac' in file.lower():
             
-                print('IRAC: ',file)
+                print('Processing IRAC: ',file)
         
                 header = hdul[0].header
         
@@ -347,7 +365,7 @@ class PanGal:
             # Herschel PACS
             elif 'hpacs' in file.lower():
             
-                print('Herschel PACS: ',file)
+                print('Processing Herschel PACS: ',file)
         
                 header = fits.Header()
                 header.update(hdul[0].header)
@@ -408,12 +426,12 @@ class PanGal:
 
 
 
-
-
-    def add_cube(self,file):
+    def add_cube(self,file,spectral_range,correct_for_dust):
         """
         Adds Cube observations to the PangalObject given a fits file
         fits file must be named using a particular convention
+
+        spectral_range : saves RAM space cropping the spectra
         """
             
         with fits.open(file) as hdul:   
@@ -428,16 +446,42 @@ class PanGal:
                     header.update(hdul[0].header)
                     header.update(hdul[1].header)
                     
-                    units = 1e-20        # converts in erg/s/cm2/A
-                    
-                    cube = hdul[1].data
-                    var = hdul[2].data 
-        
                     crval3 = header['CRVAL3']
                     dw = header['CD3_3']
                     channels = np.arange(0, header['NAXIS3'])
                     wl = crval3 + channels * dw
+
+
+                    if spectral_range:
+                        wl_min, wl_max = spectral_range
                     
+                        # Clamp limits to cube range
+                        wl_min = max(wl_min, wl[0])
+                        wl_max = min(wl_max, wl[-1])
+                    
+                        # Find indices
+                        mask = (wl >= wl_min) & (wl <= wl_max)
+                        idx = np.where(mask)[0]
+                    
+                        if len(idx) == 0:
+                            raise ValueError(f"No overlap with cube spectral range "
+                                            f"({wl[0]:.1f}–{wl[-1]:.1f} Å)")
+                    
+                        i_min, i_max = idx[0], idx[-1] + 1
+                    else: 
+                        i_min, i_max = 0, len(channels)
+
+                    # Slice cube
+                    cube = hdul[1].data[i_min:i_max, :, :]
+                    var  = hdul[2].data[i_min:i_max, :, :]
+                    wl   = wl[i_min:i_max]
+
+                    # Update header if saving
+                    header['CRVAL3'] = wl[0]
+                    header['NAXIS3'] = len(wl)
+
+                    #shape = cube.shape
+                            
                     # Compute dust attenuation
                     if self.EBmV != 0:
                         # 1D extinction curve
@@ -458,6 +502,8 @@ class PanGal:
         
                     dtheta_pix_deg = abs(header['CD1_1'])  # degrees per pixel
                     area_pix_arcsec2 = (dtheta_pix_deg * 3600)**2
+
+                    units = 1e-20        # converts in erg/s/cm2/A
         
                     wcs = WCS(header).celestial
 
@@ -478,7 +524,8 @@ class PanGal:
                         wcs=wcs,
                         dtheta_pix_deg=dtheta_pix_deg,
                         area_pix_arcsec2=area_pix_arcsec2,
-                        header=header)
+                        header=header,
+                        id='muse')
 
                 
                     for band in [key for key in map_filter_names if key.startswith('muse')]:
@@ -519,6 +566,8 @@ class PanGal:
                             header=header,
                             filter=filter
                             )
+                        
+                        
 
                 
      
