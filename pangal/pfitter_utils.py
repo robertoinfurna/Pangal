@@ -14,7 +14,7 @@ sys.path.append(os.path.expanduser('~/Desktop/Pangal'))
 
 from .image import Image
 from .spectrum import Spectrum
-from .filters import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
+from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
 
 import numpy as np
