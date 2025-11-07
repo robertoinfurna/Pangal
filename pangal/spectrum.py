@@ -179,6 +179,9 @@ class Spectrum:
 
         for j, line in enumerate(cols):
             ax = axes[0, j]
+            global_fmax = -np.inf
+            global_fmin = np.inf
+
 
             for i, spec in enumerate(spectra):
 
@@ -223,13 +226,10 @@ class Spectrum:
 
                 # --- Color selection ---
                 if isinstance(color, (list, tuple)) and len(color) > 0:
-                    # User passed a list or tuple of colors
                     c = color[i % len(color)]
                 elif color is None:
-                    # Use Matplotlib's default color cycle
-                    c = f"C{i % 10}"  # ensures valid index (Matplotlib default has 10 colors)
+                    c = f"C{i % 10}" 
                 else:
-                    # Fixed single color for all spectra
                     c = color
 
 
@@ -239,6 +239,12 @@ class Spectrum:
                     if legend else None
                 ) or spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
 
+
+                mask = (wl >= x0) & (wl <= x1)
+                fmax = np.nanmax(flux[mask])
+                fmin = np.nanmin(flux[mask])
+                global_fmax = max(global_fmax, fmax)
+                global_fmin = min(global_fmin, fmin)
 
                 # --- Plot spectrum with errorbars if available ---
                 if flux_err is not None:
@@ -253,6 +259,8 @@ class Spectrum:
 
 
                 # --- Overlay real and synthetic photometric points ---
+                if zoom_on_line: phot_points = False
+
                 if phot_points or synth_phot_points:
                     markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
                     phot_units = phot_points.header.get('units', 'mJy') if phot_points else None
@@ -289,6 +297,8 @@ class Spectrum:
                             band_labels[band] = nice_filter_names.get(band, band)
 
                     # --- Synthetic photometric points ---
+                    if zoom_on_line: synth_phot_points = False
+
                     if synth_phot_points:
                         model_phot = spec.get_phot(bands=synth_phot_points, units=y_u)
 
@@ -322,7 +332,7 @@ class Spectrum:
                         labels = list(band_labels.values())
 
                         fig.subplots_adjust(right=0.78)
-                        fig.legend(
+                        ax.legend(
                             handles, labels,
                             title="Photometric bands",
                             loc="center left",
@@ -330,23 +340,23 @@ class Spectrum:
                             frameon=False
                         )
 
+
+
                 # --- Axis scaling and limits ---
+                if zoom_on_line: log = False
                 if log:
                     ax.set_xscale('log')
                     ax.set_yscale('log')
 
-                mask = (wl >= x0) & (wl <= x1)
-                fmax = np.nanmax(flux[mask])
-                fmin = np.nanmin(flux[mask])
-
                 if ymin is None and ymax is None:
-                    y1 = 2 * fmax
-                    y0 = 1e-4 * fmax if fmin < 1e-4 * fmax else 0.8 * fmin
+                    y1 = 2 * global_fmax
+                    y0 = 1e-4 * global_fmax if global_fmin < 1e-4 * global_fmax else 0.8 * global_fmin
                 else:
                     y0, y1 = ymin, ymax
 
                 ax.set_xlim(x0, x1)
                 ax.set_ylim(y0, y1)
+
 
             # --- Axis labels (with correct units) ---
             ax.set_xlabel(f"Wavelength ({x_u})")

@@ -4,6 +4,8 @@ from astropy.io import fits
 from bisect import bisect_left
 from scipy.special import erf
 from scipy.interpolate import RegularGridInterpolator, interp1d
+from scipy.ndimage import gaussian_filter1d #?
+from scipy.signal import fftconvolve
 import itertools
 import os
 
@@ -325,109 +327,303 @@ class PFitter(): # Parametric fitter
 
         return prior_transform
 
-
     def synthetic_spectrum(
-        self, fesc, ion_gas, age_gas, av, av_ext, alpha, m_star, redshift, dl,
-        multi_component=False, **kwargs
+        self,
+        fesc,
+        ion_gas,
+        age_gas,
+        av,
+        av_ext,
+        alpha,
+        m_star,
+        redshift,
+        dl,
+        vel_sys=0.0,       # systemic velocity [km/s]
+        sigma_v=0.0,       # LOS velocity dispersion [km/s]
+        multi_component=False,
+        **kwargs,
     ):
         """
-        Generate a physically motivated synthetic galaxy spectrum, combining stellar populations, nebular lines, 
-        dust attenuation, and re-emission, redshifted and scaled for observational comparison.
+        Generate a physically motivated synthetic galaxy spectrum including stellar,
+        nebular, dust, and kinematic effects (velocity shift and broadening).
+
+        Parameters
+        ----------
+        fesc : float
+            Escape fraction of ionizing photons (0 = fully absorbed by gas; 1 = no nebular emission).
+        ion_gas : float
+            Ionization parameter of the nebular gas.
+        age_gas : float
+            Age of the nebular region in Myr (affects emission line spectrum).
+        av : float
+            V-band attenuation for the old stellar population (in magnitudes).
+        av_ext : float
+            Extra V-band attenuation applied only to the young stellar population.
+        alpha : float
+            Parameter controlling the shape of the dust emission SED (Dale & Helou 2002 models).
+        m_star : float
+            Logarithmic stellar mass of the galaxy (log₁₀[M*/M☉]).
+        redshift : float
+            Cosmological redshift of the galaxy.
+        dl : float
+            Luminosity distance to the galaxy in parsecs (used for flux scaling).
+        vel_sys : float, optional
+            Systemic velocity offset [km/s], adds an extra Doppler shift to the spectrum.
+        sigma_v : float, optional
+            Line-of-sight velocity dispersion [km/s], broadens absorption/emission lines.
+        multi_component : bool, optional
+            If True, includes component arrays (dust, young/old spectra) in the output Spectrum.
+        **kwargs :
+            Additional parameters for stellar population model interpolation (e.g., age, Z, SFH).
+
+        Returns
+        -------
+        Spectrum
+            Synthetic `Spectrum` object with wavelength (Å) and flux (erg/s/cm²/Å),
+            including optional subcomponents if `multi_component=True`.
         """
 
+        # --- Stellar population spectra ---
         young_stellar_spec = self.interp_young_flux(**kwargs)
-        old_stellar_spec = self.interp_old_flux(**kwargs)
+        old_stellar_spec   = self.interp_old_flux(**kwargs)
 
+        # Resample to model wavelength grid
         young_stellar_spec = np.interp(self.model_wl, self.short_model_wl, young_stellar_spec)
-        old_stellar_spec = np.interp(self.model_wl, self.short_model_wl, old_stellar_spec)
+        old_stellar_spec   = np.interp(self.model_wl, self.short_model_wl, old_stellar_spec)
 
-        # --- Ionizing photons
-        index_lyman = np.searchsorted(self.model_wl, 912, side='left')
+        # --- Ionizing photons and nebular emission ---
+        index_lyman = np.searchsorted(self.model_wl, 912, side="left")
         lycont_wls = np.r_[self.model_wl[:index_lyman], np.array([912])]
 
+        # Young
         lycont_spec = np.interp(lycont_wls, self.model_wl, young_stellar_spec)
         nlyman_young = np.trapz(lycont_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
 
+        # Old
         lycont_spec = np.interp(lycont_wls, self.model_wl, old_stellar_spec)
         nlyman_old = np.trapz(lycont_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
 
+        # Remove escaped photons
         if fesc >= 0:
             young_stellar_spec[:index_lyman] *= fesc
-            old_stellar_spec[:index_lyman] *= fesc
+            old_stellar_spec[:index_lyman]  *= fesc
 
+        # Nebular emission
         nebular_lines = self.nebular_func(ion_gas, age_gas)
         nebular_young = nebular_lines * nlyman_young
-        nebular_old = nebular_lines * nlyman_old
+        nebular_old   = nebular_lines * nlyman_old
 
         young_stellar_nebular_spec = young_stellar_spec + nebular_young
-        old_stellar_nebular_spec = old_stellar_spec + nebular_old
-        stellar_nebular_spec = young_stellar_nebular_spec + old_stellar_nebular_spec
+        old_stellar_nebular_spec   = old_stellar_spec + nebular_old
+        stellar_nebular_spec       = young_stellar_nebular_spec + old_stellar_nebular_spec
 
-        # --- Dust attenuation
+        # --- Dust attenuation ---
         att_young_stellar_nebular_spec = (10 ** (-(av + av_ext) * self.k_cal)) * young_stellar_nebular_spec
-        att_old_stellar_nebular_spec = (10 ** (-av * self.k_cal)) * old_stellar_nebular_spec
-        att_stellar_nebular_spec = att_young_stellar_nebular_spec + att_old_stellar_nebular_spec
+        att_old_stellar_nebular_spec   = (10 ** (-av * self.k_cal)) * old_stellar_nebular_spec
+        att_stellar_nebular_spec       = att_young_stellar_nebular_spec + att_old_stellar_nebular_spec
 
-        # --- Dust emission
+        # --- Thermal dust re-emission ---
         lbol_init = np.trapz(stellar_nebular_spec, self.model_wl)
-        lbol_att = np.trapz(att_stellar_nebular_spec, self.model_wl)
-        dust_bol = (lbol_init - lbol_att)
+        lbol_att  = np.trapz(att_stellar_nebular_spec, self.model_wl)
+        dust_bol  = lbol_init - lbol_att
 
         tdust_spec = self.dustem_func(alpha)
+
+        # Remove stellar leakage in Dale templates
         mask_pixels = (self.model_wl >= 2.5e4) & (self.model_wl <= 3e4)
         scale = np.sum(stellar_nebular_spec[mask_pixels] * tdust_spec[mask_pixels]) / \
-                np.sum(stellar_nebular_spec[mask_pixels] * stellar_nebular_spec[mask_pixels])
+                np.sum(stellar_nebular_spec[mask_pixels] ** 2)
         tdust_spec -= scale * stellar_nebular_spec
         tdust_spec[(self.model_wl < 2.5e4) | (tdust_spec < 0.)] = 0.
 
+        # Scale dust emission
         norm = np.trapz(tdust_spec, self.model_wl)
         dust_spec = tdust_spec * dust_bol / norm
 
+        # --- Total rest-frame spectrum ---
         total_spec = att_stellar_nebular_spec + dust_spec
 
-        # --- Redshift and flux scaling
-        model_red_wl = self.model_wl * (1 + redshift)
+
+
+        # --- Apply LOS velocity broadening (in log λ space) ---
+        c = 2.99792458e5  # km/s
+
+        # --- Estimate internal broadening (instrumental) ---
+        sigma_v_internal = c / (self.model_res * 2.355)  # per-pixel σ_v array
+        sigma_v_internal_med = np.median(sigma_v_internal)
+
+        # --- Compute net broadening to apply ---
+        if sigma_v > sigma_v_internal_med:
+            sigma_v_apply = np.sqrt(sigma_v**2 - sigma_v_internal_med**2)
+        else:
+            sigma_v_apply = 0.0
+
+        # --- Apply velocity-space convolution if needed ---
+        if sigma_v_apply > 0:
+            #print(f"[broadening] Applying σ_v = {sigma_v_apply:.2f} km/s (effective)")
+            total_spec = self._vel_convolve_fft(total_spec, self.model_wl, sigma_v_apply)
+        else:
+            print("[broadening] Skipping extra broadening (already covered by internal resolution)")
+
+
+        # --- Apply systemic velocity shift ---
+        c = 2.99792458e5  # km/s
+        wl_shifted = self.model_wl * (1 + vel_sys / c)
+
+        # --- Redshift to observed frame ---
+        model_red_wl = wl_shifted * (1 + redshift)
         total_spec /= (1 + redshift)
 
-        fscale = 10 ** m_star / (dl * 1e5) ** 2
+        # --- Flux scaling to given stellar mass and luminosity distance ---
+        fscale = 10**m_star / (dl * 1e5)**2
         total_spec *= fscale
 
-        # --- FITS Header with parameters
+        # --- Build FITS header ---
         header = fits.Header()
-        header['WUNITS'] = 'A'
-        header['FUNITS'] = 'erg/s/cm2/A'
+        header["WUNITS"]  = "A"
+        header["FUNITS"]  = "erg/s/cm2/A"
+        header["REDSHIFT"] = (redshift, "Cosmological redshift")
+        header["VEL_SYS"]  = (vel_sys, "Systemic velocity [km/s]")
+        header["SIGMA_V"]  = (sigma_v, "LOS velocity dispersion [km/s]")
+        header["AV"]       = (av, "V-band attenuation (old stars)")
+        header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
+        header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
+        header["ION_GAS"]  = (ion_gas, "Ionization parameter")
+        header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
+        header["ALPHA"]    = (alpha, "Dust heating parameter")
+        header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
+        header["DL_PC"]    = (dl, "Luminosity distance [pc]")
 
-        # Add model parameters
-        header['FESC'] = (fesc, 'Ionizing photon escape fraction')
-        header['ION_GAS'] = (ion_gas, 'Gas ionization parameter')
-        header['AGE_GAS'] = (age_gas, 'Nebular region age [Myr]')
-        header['AV_OLD'] = (av, 'V-band attenuation of old stars [mag]')
-        header['AV_EXT'] = (av_ext, 'Extra V-band attenuation for young stars [mag]')
-        header['ALPHA'] = (alpha, 'Dust emission alpha (Dale+2002)')
-        header['MSTAR'] = (m_star, 'Log10 stellar mass [M_sun]')
-        header['REDSHIFT'] = (redshift, 'Redshift')
-        header['DL_PC'] = (dl, 'Luminosity distance [pc]')
-        header['MULTICMP'] = (multi_component, 'Includes subcomponents')
-        for key, val in kwargs.items():
-            # Store any extra parameters (SFH, metallicity, etc.)
-            if isinstance(val, (int, float, str)):
-                header[f'{key[:6].upper()}'] = val
+        # Add kwargs for traceability
+        for k, v in kwargs.items():
+            key = k[:8].upper()
+            try:
+                header[key] = v
+            except Exception:
+                header[key] = str(v)
 
-        # --- Final Spectrum object
+        # --- Create Spectrum object ---
         spec = Spectrum(wl=model_red_wl, resolution=self.model_res, flux=total_spec, header=header)
 
         if multi_component:
-            # arrays usefull for plotting
-            for s in [young_stellar_nebular_spec, old_stellar_nebular_spec, att_young_stellar_nebular_spec, att_old_stellar_nebular_spec, dust_spec]:
-                s /= (1+redshift)
-                s *= fscale 
+            # Save components (rescaled to observed frame)
+            for s in [young_stellar_nebular_spec, old_stellar_nebular_spec,
+                    att_young_stellar_nebular_spec, att_old_stellar_nebular_spec, dust_spec]:
+                s /= (1 + redshift)
+                s *= fscale
             spec.young_stellar_nebular = young_stellar_nebular_spec
-            spec.old_stellar_nebular = old_stellar_nebular_spec
+            spec.old_stellar_nebular   = old_stellar_nebular_spec
             spec.att_young_stellar_nebular = att_young_stellar_nebular_spec
-            spec.att_old_stellar_nebular = att_old_stellar_nebular_spec
+            spec.att_old_stellar_nebular   = att_old_stellar_nebular_spec
             spec.dust = dust_spec
 
         return spec
+
+
+    def _losvd_rfft(self, vel, sigma, wl, npad=None, c=2.99792458e5):
+        """
+        Analytic Fourier transform of a Gaussian LOSVD, following Cappellari et al. (2016).
+        """
+        npix = len(wl)
+        if npad is None:
+            npad = 2 * npix
+
+        nl = npad // 2 + 1  # size of RFFT array
+
+        # log-lambda grid properties
+        loglam = np.log(wl)
+        dloglam = np.median(np.diff(loglam))
+        kms_per_pix = c * dloglam
+
+        # convert to pixel units
+        vel_pix = vel / kms_per_pix
+        sigma_pix = sigma / kms_per_pix
+
+        # frequency vector for RFFT
+        w = np.linspace(0, np.pi, nl)
+
+        if sigma_pix == 0:
+            losvd_rfft = np.ones_like(w, dtype=complex)
+        else:
+            a = vel_pix / sigma_pix
+            losvd_rfft = np.exp(1j * a * w - 0.5 * (sigma_pix * w)**2)
+
+        return np.conj(losvd_rfft)
+        
+    def _vel_convolve_fft(self, spec, wl, sigma, vel=0.0):
+        """Velocity-space convolution using analytic LOSVD in Fourier domain."""
+        npix = len(spec)
+        npad = 2 * npix  # zero-padding to avoid wrap-around
+
+        # make LOSVD kernel for same npad length
+        fft_losvd = self._losvd_rfft(vel, sigma, wl, npad=npad)
+
+        # FFT of the input spectrum
+        fft_spec = np.fft.rfft(spec, n=npad)
+
+        # multiply in Fourier space (convolution)
+        spec_conv = np.fft.irfft(fft_spec * fft_losvd, n=npad)
+
+        # trim to original size
+        return spec_conv[:npix]
+
+
+    """
+    def apply_velocity_broadening(self, total_spec, sigma_v):
+        c = 2.99792458e5  # km/s
+
+        # --- Internal broadening (instrumental) ---
+        sigma_v_internal = c / (self.model_res * 2.355)
+        sigma_v_internal_med = np.median(sigma_v_internal)
+
+        # --- Effective σ_v to apply ---
+        if sigma_v > sigma_v_internal_med:
+            sigma_v_apply = np.sqrt(sigma_v**2 - sigma_v_internal_med**2)
+        else:
+            sigma_v_apply = 0.0
+
+        if sigma_v_apply <= 0:
+            #print(f"[broadening] No extra broadening applied (σ_v={sigma_v_apply:.2f} km/s ≤ instrumental)")
+            return total_spec
+
+        # --- Build uniform log-lambda grid ---
+        wl = self.model_wl
+        loglam = np.log(wl)
+        dloglam = np.median(np.diff(loglam))
+
+        # --- Compute sigma in pixel units ---
+        sigma_pix = sigma_v_apply / (c * dloglam)
+        #print(f"[broadening] Applying σ_v={sigma_v_apply:.1f} km/s → σ_pix={sigma_pix:.2f}")
+
+        # --- Interpolate flux onto uniform log-lambda grid ---
+        loglam_uniform = np.linspace(loglam[0], loglam[-1], len(wl))
+        flux_log = np.interp(np.exp(loglam_uniform), wl, total_spec)
+
+        # --- Build Gaussian kernel (truncate at ±4σ) ---
+        size = int(4 * sigma_pix)
+        x = np.arange(-size, size + 1)
+        kernel = np.exp(-0.5 * (x / sigma_pix)**2)
+        kernel /= kernel.sum()
+
+        # --- Convolve using FFT (fast) ---
+        flux_smooth = fftconvolve(flux_log, kernel, mode='same')
+
+        # --- Interpolate back to original wavelength grid ---
+        total_spec_broadened = np.interp(wl, np.exp(loglam_uniform), flux_smooth)
+
+        return total_spec_broadened
+    """
+
+
+
+
+
+
+
+
+
+
+
 
 
 
