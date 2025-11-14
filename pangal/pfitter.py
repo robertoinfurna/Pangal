@@ -134,7 +134,7 @@ class PFitter(): # Parametric fitter
 
         
         # Handles PARAMETERS: removes fixed parameters
-        self.fix_pars = dict(fix_pars)
+        self.fix_pars = fix_pars
         if not spec:
             self.fix_pars["vel_sys"] = 0
             self.fix_pars["sigma_vel"] = 0
@@ -166,7 +166,11 @@ class PFitter(): # Parametric fitter
 
         # --- Precompute constants ---
         if spec:
-            print("Fitting spectrum")
+
+            obs_wl = spec.wl
+            obs_R = spec.resolution
+            interp_R = interp1d(obs_wl, obs_R, kind='linear', bounds_error=False, fill_value='extrapolate')
+            self.obs_resolution_on_model_grid = interp_R(self.model_wl)
     
         if phot:
             # Convert PhotometryTable object into arrays
@@ -342,8 +346,9 @@ class PFitter(): # Parametric fitter
         m_star,
         redshift,
         dl,
-        vel_sys=None,                      # systemic velocity [km/s]
+        vel_sys=None,                        # systemic velocity [km/s]
         sigma_vel=None,                      # LOS velocity dispersion [km/s]
+        observed_spectrum_resolution=None,   # If provided (it's an array) builds the model spectrum to the required resolution
         multi_component=False,
         **kwargs,
     ):
@@ -448,8 +453,10 @@ class PFitter(): # Parametric fitter
         total_spec = att_stellar_nebular_spec + dust_spec
 
 
-
+        # BROADENING
         # --- Apply LOS velocity broadening (in log λ space) ---
+        # --- Rescale the model spectrum to a required resolution to compare with data
+
         wl_shifted = self.model_wl
         if vel_sys and sigma_vel:
             c = 2.99792458e5  # km/s
@@ -464,6 +471,7 @@ class PFitter(): # Parametric fitter
             else:
                 sigma_v_apply = 0.0
 
+
             if sigma_v_apply > 0:
                 total_spec = self._vel_convolve_fft(total_spec, self.model_wl, sigma_v_apply)
 
@@ -474,6 +482,41 @@ class PFitter(): # Parametric fitter
         # --- Redshift to observed frame ---
         model_red_wl = wl_shifted * (1 + redshift)
         total_spec /= (1 + redshift)
+
+
+        # --- Match model resolution to observed resolution R(λ) ---
+        if observed_spectrum_resolution is not None:
+            c = 2.99792458e5  # km/s
+
+            # Convert observed R to σ_v(λ)
+            fwhm_obs = model_red_wl / observed_spectrum_resolution
+            sigma_obs_kms = (fwhm_obs / 2.355) * (c / model_red_wl)
+
+            # Convert model intrinsic R to σ_v
+            fwhm_model = model_red_wl / self.model_res
+            sigma_model_kms = (fwhm_model / 2.355) * (c / model_red_wl)
+
+            # σ to apply
+            sigma_apply = np.sqrt(np.maximum(0, sigma_obs_kms**2 - sigma_model_kms**2))
+
+            # Perform convolution in chunks. FFT convolution assumes a constant σ over the whole array.
+            # Split the spectrum into chunks. Convolve each chunk with a constant σ (≈ the median in that chunk)
+            N_chunks = 12
+            idxs = np.array_split(np.arange(len(total_spec)), N_chunks)
+            model_conv = np.empty_like(total_spec)
+
+            for idx in idxs:
+                sigma_local = np.median(sigma_apply[idx])
+                wl_local    = model_red_wl[idx]
+                spec_local  = total_spec[idx]
+
+                model_conv[idx] = self._vel_convolve_fft(
+                    spec_local, wl_local, sigma_local, vel=0.0
+                )
+
+            total_spec = model_conv
+
+
 
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
@@ -568,6 +611,8 @@ class PFitter(): # Parametric fitter
 
         # trim to original size
         return spec_conv[:npix]
+
+
 
 
     """

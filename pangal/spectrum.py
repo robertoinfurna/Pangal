@@ -122,6 +122,10 @@ class Spectrum:
     
    
 
+
+
+   
+
     def plot(
         self,
         spectra=None,
@@ -142,10 +146,11 @@ class Spectrum:
         figsize=None,
         x_units=None,   # e.g. 'A', 'nm', 'um', 'eV', 'Hz'
         y_units=None,   # e.g. 'erg/s/cm2/A', 'Jy', 'mJy'
-        legend=None,
         phot_points=None,
         synth_phot_points=None,
-        phot_legend=True,
+        spec_legend=None,
+        show_phot_legend=True,
+        show_spec_legend=True,
     ):
 
 
@@ -181,6 +186,9 @@ class Spectrum:
             ax = axes[0, j]
             global_fmax = -np.inf
             global_fmin = np.inf
+
+            spec_handles = []
+            spec_labels = []
 
 
             for i, spec in enumerate(spectra):
@@ -235,8 +243,8 @@ class Spectrum:
 
                 # --- labels
                 label = (
-                    ", ".join(f"{legend[k]}={spec.header[k]}" for k in legend if k in spec.header)
-                    if legend else None
+                    ", ".join(f"{spec_legend[k]}={spec.header[k]}" for k in spec_legend if k in spec.header)
+                    if spec_legend else None
                 ) or spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
 
 
@@ -245,6 +253,7 @@ class Spectrum:
                 fmin = np.nanmin(flux[mask])
                 global_fmax = max(global_fmax, fmax)
                 global_fmin = min(global_fmin, fmin)
+
 
                 # --- Plot spectrum with errorbars if available ---
                 if flux_err is not None:
@@ -256,6 +265,20 @@ class Spectrum:
                     )
                 else:
                     ax.plot(wl, flux, color=c, lw=1, label=label)
+
+                if flux_err is not None:
+                    handle = ax.errorbar(
+                        wl, flux, yerr=flux_err, fmt='o', markersize=2,
+                        color=c, ecolor=ecolor, elinewidth=1.0,
+                        capsize=2, capthick=1.0, linestyle='-', lw=0.5,
+                        label=label
+                    )
+                else:
+                    handle = ax.plot(wl, flux, color=c, lw=1, label=label)[0]
+
+                spec_handles.append(handle)
+                spec_labels.append(label)
+
 
 
                 # --- Overlay real and synthetic photometric points ---
@@ -327,7 +350,7 @@ class Spectrum:
                             band_labels[band] = nice_filter_names.get(band, band)
 
                     # --- Unified legend (only one entry per band) ---
-                    if phot_legend:
+                    if show_phot_legend:
                         handles = list(band_handles.values())
                         labels = list(band_labels.values())
 
@@ -365,7 +388,16 @@ class Spectrum:
             else:
                 ax.set_ylabel(f"Flux ({y_u})")
 
-            ax.legend()
+            # --- Spectrum legend (separate from photometric legend) ---
+            if show_spec_legend:
+                ax.legend(
+                    spec_handles,
+                    spec_labels,
+                    title="Spectra",
+                    loc="upper left",
+                    frameon=False
+                )
+
 
             # --- Optional overlays ---
             if show_filters:
@@ -403,8 +435,12 @@ class Spectrum:
                             va="top", fontsize=9, ha='center', clip_on=True,
                             bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
+
+
         plt.tight_layout(rect=[0, 0, 0.85, 1])
         plt.show()
+
+
 
 
 
@@ -526,3 +562,418 @@ class Spectrum:
             return f_lambda * (wl_A**2) / c / 1e-26
         else:
             raise ValueError(f"Unsupported flux unit: {new_units}")
+        
+
+
+
+
+
+"""
+import numpy as np
+import random
+import glob
+from copy import deepcopy
+from collections import Counter, defaultdict
+
+# Astropy
+from astropy.io import fits
+from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
+from astropy.coordinates import Angle, SkyCoord
+from astropy import units as u
+
+# Astropy modeling and regions
+from astropy.modeling import models, fitting
+from regions import (
+    PixCoord,
+    SkyRegion,
+    EllipsePixelRegion,
+    EllipseSkyRegion,
+    EllipseAnnulusPixelRegion,
+    CirclePixelRegion,
+)
+
+# Scipy
+from scipy.optimize import curve_fit
+from scipy.stats import norm as stat_norm
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import interp1d
+
+# Skimage
+from skimage import measure
+from skimage.draw import polygon
+from skimage.measure import find_contours
+from skimage.transform import rotate
+
+# Matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import Normalize, LogNorm
+from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
+from matplotlib import cm
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+
+# Dataclasses
+from dataclasses import dataclass, field
+
+
+
+from ..image import Image
+from ..cube import Cube
+from ..region import Region, Point, Contours
+from ..filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
+
+from ..data.spectral_lines import spectral_lines, UBGVRI_filters, atmospheric_lines
+
+
+        
+        
+        
+        
+# FIT LINES BLOCK
+        
+        
+from scipy.stats import norm as stat_norm
+from scipy.optimize import curve_fit
+
+
+
+# All lines share the same velocity dispersion (same Gaussian width in km/s) because they come from the same gas region and are kinematically coupled
+# [N II] λ6583 / λ6548 flux ratio = 2.96 (quantum mechanics. Storey & Zeippen (2000))
+
+lambda_Ha = spectral_lines['Ha']
+lambda_NII_6548 = spectral_lines['[N II] 6548']
+lambda_NII_6583 = spectral_lines['[N II] 6583']
+
+def model_Ha_emission(wl, z, continuum, amplitude_Ha, amplitude_NII_6583, sigma):
+
+    amplitude_NII_6548 = amplitude_NII_6583 / 2.96
+
+    ha_profile     = amplitude_Ha        * stat_norm(loc=lambda_Ha*(1+z),      scale=sigma).pdf(wl)
+    nii_6583_prof  = amplitude_NII_6583  * stat_norm(loc=lambda_NII_6583*(1+z), scale=sigma).pdf(wl)
+    nii_6548_prof  = amplitude_NII_6548  * stat_norm(loc=lambda_NII_6548*(1+z), scale=sigma).pdf(wl)
+
+    return continuum + ha_profile + nii_6583_prof + nii_6548_prof
+
+
+lambda_Hb = spectral_lines['Hb']
+
+
+def model_Hb_emission(wl, continuum, amplitude_Hb_em, amplitude_Hb_abs, z_abs, sigma_abs, *, z_em, sigma_em):
+    return continuum + amplitude_Hb_em * stat_norm(loc=lambda_Hb*(1+z_em), scale=sigma_em).pdf(wl) + amplitude_Hb_abs * stat_norm(loc=lambda_Hb*(1+z_abs), scale=sigma_abs).pdf(w)
+
+def model_Hb_emission(wl, continuum, amplitude_Hb, *, z, sigma):
+    return continuum + amplitude_Hb * stat_norm(loc=lambda_Hb*(1+z), scale=sigma).pdf(wl)
+
+
+# --- [OIII] doublet ---
+# Very strong in low-metallicity/star-forming galaxies
+# [O III] λ4959	always 1/3 the intensity of λ5007 (quantum mechanics)
+
+lambda_OIII_5007 = spectral_lines['[O III] 5007']
+lambda_OIII_4959 = spectral_lines['[O III] 4959']
+
+def model_OIII(wl, continuum, amplitude_OIII_5007, *, sigma, z):
+    amplitude_OIII_4959 = amplitude_OIII_5007 / 3
+    return continuum + amplitude_OIII_5007 * stat_norm(loc=lambda_OIII_5007*(1+z), scale=sigma).pdf(wl) + \
+           amplitude_OIII_4959 * stat_norm(loc=lambda_OIII_4959*(1+z), scale=sigma).pdf(wl)
+
+
+# --- [SII] doublet ---
+# [SII] 6716 and [SII] 6731 intensity ratio is very sensitive to electron density (nₑ) in the range 10^2-10^4 cm-3
+
+lambda_SII_6716 = spectral_lines['[S II] 6716']
+lambda_SII_6731 = spectral_lines['[S II] 6731']
+
+def model_SII(wl, continuum, amplitude_SII_6716, amplitude_SII_6731, *, sigma, z):
+    return continuum + amplitude_SII_6716* stat_norm(loc=lambda_SII_6716*(1+z), scale=sigma).pdf(wl) + \
+           amplitude_SII_6731 * stat_norm(loc=lambda_SII_6731*(1+z), scale=sigma).pdf(wl)
+
+# --- [HeI] 5876 + Na I D doublet
+
+lambda_HeI = spectral_lines['He I 5876']
+
+def model_HeI(wl, continuum, amplitude_HeI, *, sigma, z):
+    return continuum + amplitude_HeI* stat_norm(loc=lambda_HeI*(1+z), scale=sigma).pdf(wl) 
+
+
+### --- Balmer absorption lines --- ###
+
+from scipy.special import wofz
+
+def voigt(x, amp, center, sigma, gamma):
+    z = ((x - center) + 1j*gamma) / (sigma * np.sqrt(2))
+    return amp * np.real(wofz(z)) / (sigma * np.sqrt(2*np.pi))
+
+# the sigma (Gaussian width) and γ (Lorentzian width) in Voigt profiles are generally different across the Balmer series — not equal
+
+
+def model_Balmer_absorption(wl, lambda_center, continuum, amplitude, sigma, gamma):
+    line_profile = voigt(wl,amplitude,lambda_center,sigma, gamma)
+    return continuum + line_profile 
+
+
+
+from functools import partial
+
+def fit_lines(self, spectra, z_mean=0, plot=True):
+
+    lines = []
+    for i, spec in enumerate(spectra):
+
+        #print(f"Spectrum of region str(i+1))")
+        
+        wl = spec.wl 
+        flux = spec.flux 
+        err = spec.flux_err    
+
+
+        mask_Ha = (wl > (lambda_Ha * (1 + z_mean) - 50)) & (wl< (lambda_Ha * (1 + z_mean) + 50))
+        wlave_Ha = wl[mask_Ha]
+        flux_Ha = flux[mask_Ha]
+        err_Ha = err[mask_Ha]
+
+        mask_Hb = (wl > (lambda_Hb * (1 + z_mean) - 50)) & (wl< (lambda_Hb * (1 + z_mean) + 50))
+        wlave_Hb = wl[mask_Hb]
+        flux_Hb = flux[mask_Hb]
+        err_Hb = err[mask_Hb]
+
+        mask_OIII = (wl > (lambda_OIII_4959 * (1 + z_mean) - 50)) & (wl< (lambda_OIII_5007 * (1 + z_mean) + 50))
+        wlave_OIII = wl[mask_OIII]
+        flux_OIII = flux[mask_OIII]
+        err_OIII = err[mask_OIII]
+
+        mask_SII = (wl > (lambda_SII_6716 * (1 + z_mean) - 50)) & (wl< (lambda_SII_6731 * (1 + z_mean) + 50))
+        wlave_SII = wl[mask_SII]
+        flux_SII = flux[mask_SII]
+        err_SII = err[mask_SII]
+
+        mask_HeI = (wl > (lambda_HeI * (1 + z_mean) - 50)) & (wl< (lambda_HeI * (1 + z_mean) + 50))
+        wlave_HeI = wl[mask_HeI]
+        flux_HeI = flux[mask_HeI]
+        err_HeI = err[mask_HeI]
+        
+
+        median_Ha = np.median(flux_Ha)
+        median_Hb = np.median(flux_Hb)
+
+
+        # Check if the line is in emission or absorption
+        #def mad(arr):
+        #    return np.median(np.abs(arr - np.median(arr)))
+
+        #peak_Ha = np.max(flux_Ha)
+        #peak_Hb = np.max(flux_Hb)
+        #cont_Ha = np.median(flux_Ha)
+        #cont_Hb = np.median(flux_Hb)
+        #noise_Ha = mad(flux_Ha)
+        #noise_Hb = mad(flux_Hb)
+
+        #if (peak_Ha - cont_Ha) / noise_Ha > 3 or (peak_Hb - cont_Hb) / noise_Hb > 3:
+        #    print("LINES IN EMISSION")
+
+        if flux_Ha[np.argmax(abs(flux_Ha - median_Ha))] >  median_Ha: # and flux_Hb[np.argmax(abs(flux_Hb - median_Hb))] > median_Hb:
+            print('LINES IN EMISSION')
+
+            q1, q2 = np.nanquantile(flux_Ha, [0.16, 0.84])
+            subset = flux_Ha[(flux_Ha >= q1) & (flux_Ha <= q2)]
+            estimated_err = np.std(subset)
+
+            guess = [z_mean, np.median(flux_Ha), np.max(flux_Ha), np.max(flux_Ha)/2, 2.0]
+            popt_Ha, pcov_Ha = curve_fit(model_Ha_emission, wave_Ha, flux_Ha, p0=guess, sigma=err_Ha, absolute_sigma=True)
+            z_fit, cont_Ha, amp_Ha, amp_NII_6583, sigma_fit = popt_Ha
+
+            model_vals = model_Ha_emission(wave_Ha, *popt_Ha)
+            residuals = flux_Ha - model_vals
+            chi2 = np.sum((residuals / estimated_err) ** 2)
+            dof = len(wave_Ha) - len(popt_Ha)
+            chi2_red_Ha = chi2 / dof
+
+
+            # Initial guess for Hβ fit:
+            # [continuum, amplitude_Hb_emission, amplitude_Hb_absorption, z_absorption, sigma_absorption]
+            
+            #guess_Hb = [
+            #    np.median(flux_Hb),        # continuum
+            #    np.max(flux_Hb),           # emission amplitude (positive)
+            #    -np.abs(np.min(flux_Hb)),  # absorption amplitude (negative)
+            #    z_fit,                     # absorption z guess (start with emission z)
+            #    sigma_fit                  # absorption sigma guess (start with emission sigma)
+            #]
+            
+            guess_Hb = [np.median(flux_Hb), np.max(flux_Hb)]
+
+            # Fix z_em and sigma_em from Ha fit via partial
+            #model_Hb_fixed = partial(model_Hb_emission, z_em=z_fit, sigma_em=sigma_fit)
+            model_Hb_fixed = partial(model_Hb_emission, z=z_fit, sigma=sigma_fit)
+
+
+            # Define bounds to enforce absorption amplitude negative:
+            bounds_Hb = (
+                [-np.inf,       0,       -np.abs(np.min(flux_Hb)),  z_fit - 0.001,  0],   # lower bounds: continuum, amplitude_em >=0, amplitude_abs <0, small z range, sigma > 0
+                [np.inf,  1.5*max(flux_Hb),          0,    z_fit + 0.001,  8]  # upper bounds: continuum, amplitude_abs < 0 so max 0
+            )
+
+            popt_Hb, pcov_Hb = curve_fit(
+                model_Hb_fixed, wave_Hb, flux_Hb, p0=guess_Hb, sigma=err_Hb, absolute_sigma=True,) #bounds=bounds_Hb
+            
+            #cont_Hb, amp_Hb_em, amp_Hb_abs, z_abs, sigma_abs = popt_Hb
+            cont_Hb, amp_Hb = popt_Hb
+
+            model_vals = model_Hb_fixed(wave_Hb, *popt_Hb)
+            residuals = flux_Hb - model_vals
+            chi2 = np.sum((residuals / err_Hb) ** 2)
+            dof = len(wave_Hb) - len(popt_Hb)
+            chi2_red_Hb = chi2 / dof
+
+
+
+
+            # --- Fit OIII doublet
+
+            model_OIII_fixed = partial(model_OIII, z=z_fit, sigma=sigma_fit)
+
+            guess = [np.median(flux_OIII), np.max(flux_OIII)]
+            popt_OIII, pcov_OIII = curve_fit(model_OIII_fixed, wave_OIII, flux_OIII, p0=guess, sigma=err_OIII, absolute_sigma=True)
+            cont_OIII, amp_OIII = popt_OIII
+
+            model_vals = model_OIII_fixed(wave_OIII, *popt_OIII)
+            residuals = flux_OIII - model_vals
+            chi2 = np.sum((residuals / err_OIII) ** 2)
+            dof = len(wave_OIII) - len(popt_OIII)
+            chi2_red_OIII = chi2 / dof
+
+
+            # --- Fit SII doublet
+
+            model_SII_fixed = partial(model_SII, z=z_fit, sigma=sigma_fit)
+
+            guess = [np.median(flux_SII), np.max(flux_SII), np.max(flux_SII)]
+            popt_SII, pcov_SII = curve_fit(model_SII_fixed, wave_SII, flux_SII, p0=guess, sigma=err_SII, absolute_sigma=True)
+            cont_SII, amp_SII_6716, amp_SII_6731 = popt_SII
+            
+            model_vals = model_SII_fixed(wave_SII, *popt_SII)
+            residuals = flux_SII - model_vals
+            chi2 = np.sum((residuals / err_SII) ** 2)
+            dof = len(wave_SII) - len(popt_SII)
+            print(chi2)
+            print(dof)
+            chi2_red_SII = chi2 / dof
+
+            # --- Fit HeI + Na doublet
+
+            model_HeI_fixed = partial(model_HeI, z=z_fit, sigma=sigma_fit)
+
+            guess = [np.median(flux_HeI), np.max(flux_HeI)]
+            popt_HeI, pcov_HeI = curve_fit(model_HeI_fixed, wave_HeI, flux_HeI, p0=guess, sigma=err_HeI, absolute_sigma=True)
+            cont_HeI, amp_HeI = popt_HeI
+            
+            model_vals = model_HeI_fixed(wave_HeI, *popt_HeI)
+            residuals = flux_HeI - model_vals
+            chi2 = np.sum((residuals / err_HeI) ** 2)
+            dof = len(wave_HeI) - len(popt_HeI)
+            print(chi2)
+            print(dof)
+            chi2_red_HeI = chi2 / dof
+
+            if plot:
+                fig, ax = plt.subplots(2, 3, figsize=(12, 6))
+                ax = ax.flatten()
+
+                w_array = np.linspace(wave_Ha[0], wave_Ha[-1], 1000)
+                ax[0].errorbar(wave_Ha, flux_Ha, yerr=err_Ha, fmt='o', markersize=3, color='black', alpha=0.8)
+                ax[0].plot(wave_Ha, flux_Ha, linestyle='-', alpha=0.3, color='black')
+                ax[0].plot(w_array, cont_Ha + amp_Ha*stat_norm(lambda_Ha*(1+z_fit),sigma_fit).pdf(w_array), color='red',label='$H\\alpha$')
+                ax[0].plot(w_array, cont_Ha + (amp_NII_6583/2.96)*stat_norm(lambda_NII_6548*(1+z_fit),sigma_fit).pdf(w_array), color='orange',label='[NII] 6548')
+                ax[0].plot(w_array, cont_Ha + amp_NII_6583*stat_norm(lambda_NII_6583*(1+z_fit),sigma_fit).pdf(w_array), color='darkgreen', label='[NII] 6583')
+                ax[0].plot(w_array, np.full(w_array.shape, cont_Ha), color='navy', linewidth=1)
+                ax[0].legend(loc='upper right', frameon=False)
+                ax[0].text(0.02, 0.98, f"$\\tilde{{\chi^2}}=$ {chi2_red_Ha:.2f}", transform=ax[0].transAxes, ha='left', va='top', fontsize=8, color='black')
+
+                w_array = np.linspace(wave_Hb[0], wave_Hb[-1], 1000)
+                ax[1].errorbar(wave_Hb, flux_Hb, yerr=err_Hb, fmt='o', markersize=3, color='black', alpha=0.8)
+                ax[1].plot(wave_Hb, flux_Hb, linestyle='-', alpha=0.3, color='black')
+                
+                ax[1].plot(w_array, cont_Hb + amp_Hb*stat_norm(lambda_Hb*(1+z_fit), sigma_fit).pdf(w_array), color='purple',label='$H\\beta$')
+                #ax[1].plot(w_array, cont_Hb + amp_Hb_abs*stat_norm(lambda_Hb*(1+z_abs), sigma_abs).pdf(w_array), color='red')
+                ax[1].plot(w_array, np.full(w_array.shape, cont_Hb), color='navy', linewidth=1)
+                ax[1].legend(loc='upper right', frameon=False)
+                ax[1].text(0.02, 0.98, f"$\\tilde{{\chi^2}}=$ {chi2_red_Hb:.2f}", transform=ax[1].transAxes, ha='left', va='top', fontsize=8, color='black')
+
+                w_array = np.linspace(wave_OIII[0], wave_OIII[-1], 1000)
+                ax[2].errorbar(wave_OIII, flux_OIII, yerr=err_OIII, fmt='o', markersize=3, color='black', alpha=0.8)
+                ax[2].plot(wave_OIII, flux_OIII, linestyle='-', alpha=0.3, color='black')
+                ax[2].plot(w_array, cont_OIII + amp_OIII*stat_norm(lambda_OIII_5007*(1+z_fit), sigma_fit).pdf(w_array), color='purple',label='[OIII] 5007')
+                ax[2].plot(w_array, cont_OIII + (amp_OIII/3)*stat_norm(lambda_OIII_4959*(1+z_fit), sigma_fit).pdf(w_array), color='lime',label='[OIII] 4959')
+                ax[2].plot(w_array, np.full(w_array.shape, cont_OIII), color='navy', linewidth=1)
+                ax[2].legend(loc='upper right', frameon=False)
+                ax[2].text(0.02, 0.98, f"$\\tilde{{\chi^2}}=$ {chi2_red_OIII:.2f}", transform=ax[2].transAxes, ha='left', va='top', fontsize=8, color='black')
+
+                w_array = np.linspace(wave_SII[0], wave_SII[-1], 1000)
+                ax[3].errorbar(wave_SII, flux_SII, yerr=err_SII, fmt='o', markersize=3, color='black', alpha=0.8)
+                ax[3].plot(wave_SII, flux_SII, linestyle='-', alpha=0.3, color='black')
+                ax[3].plot(w_array, cont_SII + amp_SII_6716*stat_norm(lambda_SII_6716*(1+z_fit), sigma_fit).pdf(w_array), color='purple',label='[SII] 6716')
+                ax[3].plot(w_array, cont_SII + amp_SII_6731*stat_norm(lambda_SII_6731*(1+z_fit), sigma_fit).pdf(w_array), color='lime',label='[SII] 6731')
+                ax[3].plot(w_array, np.full(w_array.shape, cont_SII), color='navy', linewidth=1)
+                ax[3].legend(loc='upper right', frameon=False)
+                ax[3].text(0.02, 0.98, f"$\\tilde{{\chi^2}}=$ {chi2_red_SII:.2f}", transform=ax[3].transAxes, ha='left', va='top', fontsize=8, color='black')
+
+                w_array = np.linspace(wave_HeI[0], wave_HeI[-1], 1000)
+                ax[4].errorbar(wave_HeI, flux_HeI, yerr=err_HeI, fmt='o', markersize=3, color='black', alpha=0.8)
+                ax[4].plot(wave_HeI, flux_HeI, linestyle='-', alpha=0.3, color='black')
+                ax[4].plot(w_array, cont_HeI + amp_HeI*stat_norm(lambda_HeI*(1+z_fit), sigma_fit).pdf(w_array), color='purple',label='[HeI] 5876')
+                ax[4].plot(w_array, np.full(w_array.shape, cont_HeI), color='navy', linewidth=1)
+                ax[4].legend(loc='upper right', frameon=False)
+                ax[4].text(0.02, 0.98, f"$\\tilde{{\chi^2}}=$ {chi2_red_HeI:.2f}", transform=ax[4].transAxes, ha='left', va='top', fontsize=8, color='black')
+
+                for i in range(5):
+                    ax[i].set_xlabel("Wavelength [Å]")
+                ax[0].set_ylabel("Flux [erg/s/cm²/Å/arcsec²]")
+                ax[3].set_ylabel("Flux [erg/s/cm²/Å/arcsec²]")
+
+                sigma_v = (sigma_fit / lambda_Ha) * 2.99e5 * (z_fit-z_mean)
+                fig.suptitle(f"Region {i+1}: $z = {z_fit:.5f} \pm {np.sqrt(pcov_Ha[0, 0]):.5f}$, $\sigma_v = {sigma_v:.5f} km/s$")
+
+                plt.tight_layout()
+                plt.show()
+
+            lines.append(None)
+
+        else:
+            print("Line in absorption")
+
+            if plot:
+                fig, ax = plt.subplots(1, 2, figsize=(12, 3))
+
+            for i, balmer_line in enumerate(['Ha', 'Hb']):
+                lambda_center = spectral_lines[balmer_line] * (1 + z_mean)
+                mask_fit = (w > (lambda_center - 50)) & (w < (lambda_center + 50))
+                wave_fit = w[mask_fit]
+                flux_fit = flux[mask_fit]
+                err_fit = err[mask_fit]
+
+                guess = [lambda_center, np.median(flux_fit), np.max(flux_fit), 2.0, 2.0]
+                popt, pcov = curve_fit(model_Balmer_absorption, wave_fit, flux_fit, p0=guess, sigma=err_fit, absolute_sigma=True)
+                lambda_center_fit, cont_fit, amp_fit, sigma_fit, gamma_fit = popt
+                z_fit = lambda_center_fit / spectral_lines[balmer_line] - 1
+
+                model_fit = model_Balmer_absorption(wave_fit, *popt)
+
+                if plot:
+                    ax[i].errorbar(wave_fit, flux_fit, yerr=err_fit, fmt='o', markersize=3, color='black', alpha=0.8)
+                    ax[i].plot(wave_fit, flux_fit, linestyle='-', alpha=0.3, color='black')
+                    ax[i].plot(wave_fit, model_fit, 'r--', label='Voigt fit')
+                    ax[i].set_title(f"{balmer_line} fit")
+                    ax[i].set_xlabel("Wavelength [Å]")
+
+    return lines
+        
+
+
+
+"""
+
+
+
+
