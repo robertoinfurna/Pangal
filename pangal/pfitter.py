@@ -134,11 +134,15 @@ class PFitter(): # Parametric fitter
 
         
         # Handles PARAMETERS: removes fixed parameters
-        self.fix_pars = fix_pars
+        self.fix_pars = dict(fix_pars)
+        if not spec:
+            self.fix_pars["vel_sys"] = 0
+            self.fix_pars["sigma_vel"] = 0
         free_pars = [p for p in self.model_pars + ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star", "vel_sys", "sigma_vel"]
                      if p not in self.fix_pars]
         self.free_pars = free_pars
-        
+
+
         # Create the sampler
         log_likelihood = self.make_log_likelihood(spec, phot, free_pars, bands)
         prior_transform = self.make_prior_transform(custom_priors)
@@ -207,15 +211,14 @@ class PFitter(): # Parametric fitter
             fesc, ion_gas, age_gas, av, av_ext, alpha, m_star, vel_sys, sigma_vel = [param_values[n] for n in param_names]
             kwargs = {key: value for key, value in zip(self.model_pars, model_pars)}
 
-            if not spec:
-                vel_sys = None
-                sigma_vel = None
 
             # Build synthetic spectrum
             synth_spec = self.synthetic_spectrum(**kwargs,
                                                     fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
                                                     av=av, av_ext=av_ext, alpha=alpha,
-                                                    m_star=m_star, redshift=0, dl=100)
+                                                    m_star=m_star, 
+                                                    vel_sys=vel_sys,sigma_vel=sigma_vel, 
+                                                    redshift=0, dl=100)
 
             if phot:
                 model_phot = []
@@ -269,13 +272,9 @@ class PFitter(): # Parametric fitter
     def make_prior_transform(self, custom_priors):
 
         # --- Validate custom priors ---
-        all_pars = list(self.model_pars) + [
-            p for p in ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star","vel_sys","sigma_vel"]
-            if p not in self.fix_pars
-        ]
         for key, val in custom_priors.items():
-            if key not in all_pars:
-                raise ValueError(f"Unknown parameter in prior_dict: '{key}'. Valid names: {all_pars}")
+            if key not in self.free_pars:
+                raise ValueError(f"Unknown parameter in prior_dict: '{key}'. Valid names: {self.free_pars}")
             if 'type' not in val:
                 raise ValueError(f"Missing 'type' field for prior '{key}'. Must be 'uniform' or 'gaussian'.")
             if val['type'] == 'uniform' and not all(k in val for k in ['low', 'high']):
@@ -293,7 +292,7 @@ class PFitter(): # Parametric fitter
             'alpha':   {'type': 'uniform', 'low': self.dustem_alpha[0], 'high': self.dustem_alpha[-1]},
             'm_star':  {'type': 'uniform', 'low': 7.0, 'high': 11.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
-            'sigma_vel': {'type': 'uniform', 'low': 0.0, 'high': 200.0},
+            'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
@@ -305,7 +304,7 @@ class PFitter(): # Parametric fitter
 
         # --- Print priors ---
         print("\nPriors:")
-        for p in all_pars:
+        for p in self.free_pars:
             if priors[p]['type'] == 'uniform':
                 print(f"  - {p}: Uniform({priors[p]['low']}, {priors[p]['high']})")
             elif priors[p]['type'] == 'gaussian':
@@ -316,7 +315,7 @@ class PFitter(): # Parametric fitter
         # --- Define transform function based on priors ---
         def prior_transform(u):
             x = np.zeros_like(u)
-            for i, name in enumerate(all_pars):
+            for i, name in enumerate(self.free_pars):
                 prior = priors[name]
                 if prior['type'] == 'uniform':
                     x[i] = prior['low'] + u[i] * (prior['high'] - prior['low'])
@@ -648,6 +647,13 @@ class PFitter(): # Parametric fitter
         #resample 
         samples, weights = fit_result.samples, np.exp(fit_result.logwt - fit_result.logz[-1])
         equal_samples = resample_equal(samples, weights)
+
+        print("DEBUG free_pars:", self.free_pars)
+        print("DEBUG equal_samples shape:", equal_samples.shape)
+        print("DEBUG min/max of each col:")
+        for i,p in enumerate(self.free_pars):
+            print(p, np.nanmin(equal_samples[:,i]), np.nanmax(equal_samples[:,i]))
+
     
         # Map parameter names to nicer LaTeX labels
         latex_labels = {
@@ -661,7 +667,9 @@ class PFitter(): # Parametric fitter
             "av": r"$A_V$",
             "av_ext": r"$A_{V,ext}$",
             "alpha": r"$\alpha$",
-            "m_star": r"$\log(M_\star)$"
+            "m_star": r"$\log(M_\star)$",
+            "vel_sys": r"$v [km/s]$",
+            "sigma_vel": r"$\\sigma_v [km/s]$"
         }
         labels = [latex_labels.get(p, p) for p in self.free_pars]
     
