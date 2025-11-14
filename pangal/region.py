@@ -1,5 +1,7 @@
 import numpy as np
 import random
+import os
+
 from copy import deepcopy
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -9,7 +11,7 @@ from astropy.io import fits
 from astropy import units as u
 from astropy.coordinates import SkyCoord, Angle
 from astropy.wcs import WCS
-from astropy.wcs.utils import proj_plane_pixel_scales
+from astropy.wcs.utils import proj_plane_pixel_scales, pixel_to_skycoord
 
 from scipy.optimize import curve_fit
 from scipy.stats import norm as stat_norm
@@ -17,6 +19,7 @@ from scipy.ndimage import gaussian_filter, median_filter
 from scipy.interpolate import interp1d
 
 import matplotlib.pyplot as plt
+import matplotlib.path as mpath
 import matplotlib.gridspec as gridspec
 from matplotlib import cm
 from matplotlib.lines import Line2D
@@ -39,8 +42,9 @@ from regions import (
     EllipseSkyRegion,
     CircleSkyRegion
 )
+from regions import Regions as pyreg
 
-from .filters import Filter, map_filter_names, nice_filter_names
+from .filter import Filter, map_filter_names, nice_filter_names
 
 
 @dataclass
@@ -181,7 +185,94 @@ class Region:
                          'caption_fontsize': caption_fontsize}.items():
             setattr(self, key, val if val is not None else getattr(self, key))
             
-            
+
+    def to_ds9(self, filepath: str, system: str = 'fk5', append: bool = False):
+        """
+        Export the Region mask as a DS9 polygon region file in celestial (FK5) coordinates.
+        If append=True, append regions to an existing .reg file instead of overwriting it.
+        """
+        if not filepath.endswith('.reg'):
+            filepath += '.reg'
+
+        header = f"""# Region file format: DS9 version 4.1
+    global color={self.color} width={self.linewidth} font="helvetica 10 normal" select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1
+    {system}
+    """
+
+        # Write header only if not appending or file doesn't exist
+        write_header = not append or not os.path.exists(filepath)
+
+        mode = "a" if append else "w"
+        with open(filepath, mode) as f:
+            if write_header:
+                f.write(header)
+
+            # Find mask contours
+            contours = find_contours(self.mask, level=0.5)
+            for contour in contours:
+                sky_coords = pixel_to_skycoord(contour[:, 1], contour[:, 0], self.wcs)
+                ra_vals, dec_vals = sky_coords.ra.deg, sky_coords.dec.deg
+
+                points = ", ".join(f"{ra:.6f},{dec:.6f}" for ra, dec in zip(ra_vals, dec_vals))
+                label = f"text={{{self.label or ''}}}" if self.label else ""
+                f.write(f"polygon({points}) # color={self.color} width={self.linewidth} {label}\n")
+
+        print(f"DS9 region file {'appended to' if append else 'saved'}: {os.path.abspath(filepath)}")
+
+        
+
+
+    @classmethod
+    def from_ds9(cls, reg_path: str, wcs, image_shape: tuple, color: str = 'cyan', linewidth: float = 2):
+        """
+        Create one or more Region objects from a DS9 region file.
+
+        Parameters
+        ----------
+        reg_path : str
+            Path to the DS9 .reg file.
+        wcs : astropy.wcs.WCS
+            WCS object associated with the target image.
+        image_shape : tuple
+            Shape of the target image (ny, nx).
+        color : str, optional
+            Color for plotting aesthetics.
+        linewidth : float, optional
+            Line width for plotting aesthetics.
+
+        Returns
+        -------
+        list[Region]
+            A list of Region objects corresponding to the DS9 regions.
+        """
+        regions = pyreg.read(reg_path, format='ds9')
+        region_list = []
+
+        # Meshgrid for point inclusion test
+        y_coords, x_coords = np.meshgrid(np.arange(image_shape[0]), np.arange(image_shape[1]), indexing='ij')
+        points = np.vstack((x_coords.ravel(), y_coords.ravel())).T
+
+        for reg in regions:
+            mask = np.zeros(image_shape, dtype=bool)
+
+            # For polygon-type regions:
+            if hasattr(reg, 'vertices') and reg.vertices is not None:
+                region_coords = reg.vertices
+                x_coords = region_coords.x
+                y_coords = region_coords.y
+                vertices = np.array([[xi, yi] for xi, yi in zip(x_coords, y_coords)])
+                path = mpath.Path(vertices)
+                mask_reg = path.contains_points(points).reshape(mask.shape)
+                mask |= mask_reg
+            else:
+                # For analytic regions like circle/ellipse
+                mask = reg.to_mask(mode='center').to_image(image_shape).astype(bool)
+
+            region_list.append(cls(mask=mask, wcs=wcs, image_shape=image_shape,
+                                color=color, linewidth=linewidth, label=getattr(reg.meta, 'text', None)))
+
+        print(f"{len(region_list)} region(s) loaded from {reg_path}")
+        return region_list
 
 
 

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from astropy.io import fits
 
-from .filters import Filter, map_filter_names, nice_filter_names
+from .filter import Filter, map_filter_names, nice_filter_names
 
 
 
@@ -51,25 +51,157 @@ class PhotometryTable:
 
     @property
     def df(self):
+        """Return the photometric table as a DataFrame."""
         df = pd.DataFrame.from_dict(self.data, orient='index', columns=['Value', 'Error'])
         df.index.name = 'Band'
-        
-        # Add SNR column
         df['SNR'] = df['Value'] / df['Error']
-        
-        #units = self.header.get('units', 'Unknown Units')
         return df
 
+    def print(self, phot_tables=None, nice_filter_names=None):
+        """
+        If phot_tables is None → return this object's DataFrame.
+        If phot_tables is a list → return a combined styled DataFrame.
+        """
+        # Case 1: behave like the old property
+        if phot_tables is None:
+            return self.df
 
-def print_photometric_tables(photometric_tables_list, nice_filters_name=None):
-    """
-    Combine multiple PhotometryTable objects into a single DataFrame.
-    Each column corresponds to a region, each row to a band (renamed via nice_filters_name).
-    Values are formatted as 'value ± error (SNR)'.
-    Cells with SNR <= 5 are displayed in red.
-    """
-    import pandas as pd
+        # Case 2: combine multiple phot tables
+        return _print_photometric_tables(
+            photometric_tables_list=phot_tables,
+            nice_filters_name=nice_filter_names
+        )
 
+
+    def to_fits(self, filename, tables=None):
+        """
+        Export this PhotometryTable or a list of PhotometryTables to a FITS file.
+
+        Parameters
+        ----------
+        filename : str
+            Output FITS file name (overwritten if exists).
+        tables : PhotometryTable or iterable of PhotometryTable, optional
+            If provided, these tables will be written.
+            If None, only this instance will be written.
+        """
+
+        if tables is None:
+            tables = [self]    # save only this table
+        elif (not isinstance(tables, Iterable)) or isinstance(tables, (dict, str)):
+            tables = [tables]  # ensure list
+
+        hdul = fits.HDUList([fits.PrimaryHDU()])
+
+        for i, pt in enumerate(tables):
+
+            # pt.data should be {band: (value, error)}
+            data_dict = pt.data
+
+            t = Table()
+            bands  = []
+            values = []
+            errors = []
+            snrs   = []
+
+            for band, (value, error) in data_dict.items():
+                bands.append(band)
+                values.append(value)
+                errors.append(error)
+                snrs.append(value / error if error else None)
+
+            t["BAND"]  = bands
+            t["VALUE"] = values
+            t["ERROR"] = errors
+            t["SNR"]   = snrs
+
+            hdu = fits.BinTableHDU(t)
+
+            if hasattr(pt, "header") and pt.header:
+                for key, val in pt.header.items():
+                    try:
+                        hdu.header[key] = val
+                    except Exception:
+                        pass  # skip invalid FITS keywords
+
+            if hasattr(pt, "region") and pt.region and hasattr(pt.region, "name"):
+                extname = f"PHOT_{pt.region.name}"
+            else:
+                extname = f"PHOT_{i}"
+
+            hdu.name = extname[:68]  # FITS name limit
+
+            hdul.append(hdu)
+            
+        hdul.writeto(filename, overwrite=True)
+        print(f"Written {len(tables)} photometry table(s) to {filename}")
+
+
+
+
+    def from_fits(self, filename):
+        """
+        Load photometry data from a FITS file.
+        
+        - If the FITS contains a single table, fills `self` and returns None.
+        - If the FITS contains multiple tables, returns a list of PhotometryTable instances.
+        """
+        hdul = fits.open(filename)
+        phot_tables = []
+
+        for hdu in hdul[1:]:  # skip primary HDU
+            if not isinstance(hdu, fits.BinTableHDU):
+                continue
+
+            tbl = Table(hdu.data)
+
+            if len(tbl) != 1:
+                raise ValueError(
+                    f"Extension {hdu.name} contains {len(tbl)} rows. "
+                    "Each photometry table should contain exactly one row."
+                )
+
+            row = tbl[0]
+
+            # Reconstruct dictionary: band → (value, error)
+            data = {band: (val, err) for band, val, err in zip(
+                row["BAND"], row["VALUE"], row["ERROR"]
+            )}
+
+            # Create a new instance
+            phot = PhotometryTable(data=data, header=dict(hdu.header))
+
+            # Restore region name if present in extension name
+            if hdu.name.startswith("PHOT_"):
+                name = hdu.name[5:]
+                if name:
+                    try:
+                        phot.region = type("RegionStub", (), {"name": name})()
+                    except Exception:
+                        pass
+
+            phot_tables.append(phot)
+
+        hdul.close()
+
+        if len(phot_tables) == 1:
+            # Fill self and return None
+            self.data = phot_tables[0].data
+            self.header = phot_tables[0].header
+            if hasattr(phot_tables[0], "region"):
+                self.region = phot_tables[0].region
+            return None
+        else:
+            # Return list of new PhotometryTable instances
+            return phot_tables
+
+
+
+
+
+
+
+def _print_photometric_tables(photometric_tables_list, nice_filters_name=None):
     combined = {}
     snr_dict = {}
 
@@ -115,7 +247,9 @@ def print_photometric_tables(photometric_tables_list, nice_filters_name=None):
     )
 
     return df
-    
+
+
+
 
 
 # --- Functions to read and to write PhotometryTable to fits

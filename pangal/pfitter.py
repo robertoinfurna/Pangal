@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from bisect import bisect_left
-from scipy.special import erf
+from scipy.special import erf, erfinv
 from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.ndimage import gaussian_filter1d #?
 from scipy.signal import fftconvolve
@@ -135,7 +135,7 @@ class PFitter(): # Parametric fitter
         
         # Handles PARAMETERS: removes fixed parameters
         self.fix_pars = fix_pars
-        free_pars = [p for p in self.model_pars + ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star"]
+        free_pars = [p for p in self.model_pars + ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star", "vel_sys", "sigma_vel"]
                      if p not in self.fix_pars]
         self.free_pars = free_pars
         
@@ -181,6 +181,7 @@ class PFitter(): # Parametric fitter
                 trans_arrays[b] = F.transmission_curve(self.model_wl[mask[b]])
                 pivot_wls[b] = F.pivot_wavelength
     
+    
         # --- Define log-likelihood ---
         def log_likelihood(pars):
             
@@ -188,62 +189,62 @@ class PFitter(): # Parametric fitter
             phot_lhood = 0
 
 
-            if spec: 
-                print('SPEC!')
+            # --- Handles parameters
+            idx = 0
+            n_model_pars = len(self.model_pars)
+            model_pars = pars[idx : idx + n_model_pars]
+            idx += n_model_pars
 
-                
-            
+            param_names = ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star","vel_sys","sigma_vel"]
+            param_values = {}
+            for name in param_names:
+                if name in self.fix_pars:
+                    param_values[name] = self.fix_pars[name]
+                else:
+                    param_values[name] = pars[idx]
+                    idx += 1
+
+            fesc, ion_gas, age_gas, av, av_ext, alpha, m_star, vel_sys, sigma_vel = [param_values[n] for n in param_names]
+            kwargs = {key: value for key, value in zip(self.model_pars, model_pars)}
+
+            if not spec:
+                vel_sys = None
+                sigma_vel = None
+
+            # Build synthetic spectrum
+            synth_spec = self.synthetic_spectrum(**kwargs,
+                                                    fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
+                                                    av=av, av_ext=av_ext, alpha=alpha,
+                                                    m_star=m_star, redshift=0, dl=100)
+
             if phot:
-                idx = 0
-                n_model_pars = len(self.model_pars)
-                model_pars = pars[idx : idx + n_model_pars]
-                idx += n_model_pars
-    
-                param_names = ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star"]
-                param_values = {}
-                for name in param_names:
-                    if name in self.fix_pars:
-                        param_values[name] = self.fix_pars[name]
-                    else:
-                        param_values[name] = pars[idx]
-                        idx += 1
-    
-                fesc, ion_gas, age_gas, av, av_ext, alpha, m_star = [param_values[n] for n in param_names]
-                kwargs = {key: value for key, value in zip(self.model_pars, model_pars)}
-    
-                # Build synthetic spectrum
-                synth_spec = self.synthetic_spectrum(**kwargs,
-                                                     fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
-                                                     av=av, av_ext=av_ext, alpha=alpha,
-                                                     m_star=m_star, redshift=0, dl=100)
-    
                 model_phot = []
                 for b in bands:
                     spec_array = synth_spec.flux[mask[b]]
                     if len(spec_array) == 0:
                         model_phot.append(np.nan)
                         continue
-    
+
                     num_int = np.trapz(trans_arrays[b] * spec_array, self.model_wl[mask[b]])
                     norm_int = np.trapz(trans_arrays[b], self.model_wl[mask[b]])
                     if norm_int == 0:
                         model_phot.append(np.nan)
                         continue
-    
+
                     phot_point = num_int / norm_int
 
                     # CHECK THIS
                     # Convert to mJy if needed
                     c = 2.99792458e18  # Å/s
                     phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
-    
+
                     model_phot.append(phot_point)
-    
+
                 model_phot = np.array(model_phot)
-    
+
                 if not np.all(np.isfinite(model_phot)):
                     return -1e100
-    
+
                 for i in range(len(phot_points)):
                     if upper_lims[i] == 0:
                         phot_lhood += -0.5 * (
@@ -253,16 +254,15 @@ class PFitter(): # Parametric fitter
                         )
                     else:
                         terf = 0.5 * (1 + erf((phot_points[i] - model_phot[i]) /
-                                              (np.sqrt(2.) * phot_errors[i])))
+                                                (np.sqrt(2.) * phot_errors[i])))
                         phot_lhood += np.log(terf)
-    
-            if not np.isfinite(phot_lhood):
-                return -1e100
+        
+                if not np.isfinite(phot_lhood):
+                    return -1e100
+            
             
             return spec_lhood + phot_lhood
 
-            
-    
         return log_likelihood
     
     
@@ -270,7 +270,7 @@ class PFitter(): # Parametric fitter
 
         # --- Validate custom priors ---
         all_pars = list(self.model_pars) + [
-            p for p in ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star"]
+            p for p in ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star","vel_sys","sigma_vel"]
             if p not in self.fix_pars
         ]
         for key, val in custom_priors.items():
@@ -291,7 +291,9 @@ class PFitter(): # Parametric fitter
             'av':      {'type': 'uniform', 'low': 0.0, 'high': 1.0},
             'av_ext':  {'type': 'uniform', 'low': 0.0, 'high': 1.0},
             'alpha':   {'type': 'uniform', 'low': self.dustem_alpha[0], 'high': self.dustem_alpha[-1]},
-            'm_star':  {'type': 'uniform', 'low': 7.0, 'high': 11.0}
+            'm_star':  {'type': 'uniform', 'low': 7.0, 'high': 11.0},
+            'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
+            'sigma_vel': {'type': 'uniform', 'low': 0.0, 'high': 200.0},
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
@@ -327,6 +329,9 @@ class PFitter(): # Parametric fitter
 
         return prior_transform
 
+
+
+
     def synthetic_spectrum(
         self,
         fesc,
@@ -338,8 +343,8 @@ class PFitter(): # Parametric fitter
         m_star,
         redshift,
         dl,
-        vel_sys=0.0,       # systemic velocity [km/s]
-        sigma_v=0.0,       # LOS velocity dispersion [km/s]
+        vel_sys=None,                      # systemic velocity [km/s]
+        sigma_vel=None,                      # LOS velocity dispersion [km/s]
         multi_component=False,
         **kwargs,
     ):
@@ -369,7 +374,7 @@ class PFitter(): # Parametric fitter
             Luminosity distance to the galaxy in parsecs (used for flux scaling).
         vel_sys : float, optional
             Systemic velocity offset [km/s], adds an extra Doppler shift to the spectrum.
-        sigma_v : float, optional
+        sigma_vel : float, optional
             Line-of-sight velocity dispersion [km/s], broadens absorption/emission lines.
         multi_component : bool, optional
             If True, includes component arrays (dust, young/old spectra) in the output Spectrum.
@@ -446,33 +451,31 @@ class PFitter(): # Parametric fitter
 
 
         # --- Apply LOS velocity broadening (in log λ space) ---
-        c = 2.99792458e5  # km/s
+        wl_shifted = self.model_wl
+        if vel_sys and sigma_vel:
+            c = 2.99792458e5  # km/s
 
-        # --- Estimate internal broadening (instrumental) ---
-        sigma_v_internal = c / (self.model_res * 2.355)  # per-pixel σ_v array
-        sigma_v_internal_med = np.median(sigma_v_internal)
+            # --- Estimate internal broadening (instrumental) ---
+            sigma_v_internal = c / (self.model_res * 2.355)  # per-pixel σ_v array
+            sigma_v_internal_med = np.median(sigma_v_internal)
 
-        # --- Compute net broadening to apply ---
-        if sigma_v > sigma_v_internal_med:
-            sigma_v_apply = np.sqrt(sigma_v**2 - sigma_v_internal_med**2)
-        else:
-            sigma_v_apply = 0.0
+            # --- Compute net broadening to apply ---
+            if sigma_vel > sigma_v_internal_med:
+                sigma_v_apply = np.sqrt(sigma_vel**2 - sigma_v_internal_med**2)
+            else:
+                sigma_v_apply = 0.0
 
-        # --- Apply velocity-space convolution if needed ---
-        if sigma_v_apply > 0:
-            #print(f"[broadening] Applying σ_v = {sigma_v_apply:.2f} km/s (effective)")
-            total_spec = self._vel_convolve_fft(total_spec, self.model_wl, sigma_v_apply)
-        else:
-            print("[broadening] Skipping extra broadening (already covered by internal resolution)")
+            if sigma_v_apply > 0:
+                total_spec = self._vel_convolve_fft(total_spec, self.model_wl, sigma_v_apply)
+
+            wl_shifted *= (1 + vel_sys / c)
 
 
-        # --- Apply systemic velocity shift ---
-        c = 2.99792458e5  # km/s
-        wl_shifted = self.model_wl * (1 + vel_sys / c)
 
         # --- Redshift to observed frame ---
         model_red_wl = wl_shifted * (1 + redshift)
         total_spec /= (1 + redshift)
+
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
         fscale = 10**m_star / (dl * 1e5)**2
@@ -484,7 +487,7 @@ class PFitter(): # Parametric fitter
         header["FUNITS"]  = "erg/s/cm2/A"
         header["REDSHIFT"] = (redshift, "Cosmological redshift")
         header["VEL_SYS"]  = (vel_sys, "Systemic velocity [km/s]")
-        header["SIGMA_V"]  = (sigma_v, "LOS velocity dispersion [km/s]")
+        header["SIGMA_V"]  = (sigma_vel, "LOS velocity dispersion [km/s]")
         header["AV"]       = (av, "V-band attenuation (old stars)")
         header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
         header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
@@ -569,7 +572,7 @@ class PFitter(): # Parametric fitter
 
 
     """
-    def apply_velocity_broadening(self, total_spec, sigma_v):
+    def apply_velocity_broadening(self, total_spec, sigma_vel):
         c = 2.99792458e5  # km/s
 
         # --- Internal broadening (instrumental) ---

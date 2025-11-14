@@ -49,7 +49,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from .image import Image
 from .cube import Cube
 from .region import Region, Point, Contours
-from .filters import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
+from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
 
 from .pangal_methods.plot import plot
 from .pangal_methods.photometry import photometry, surface_brightness_profile, inspect_photometry
@@ -121,7 +121,7 @@ class PanGal:
     # METHODS
 
     @property
-    def list(self):
+    def overview(self):
         print('Images: \n')  
         print(list(self.images.keys()))
         print('\nCubes: \n')  
@@ -472,9 +472,15 @@ class PanGal:
                         i_min, i_max = 0, len(channels)
 
                     # Slice cube
-                    cube = hdul[1].data[i_min:i_max, :, :]
+                    cube = hdul[1].data[i_min:i_max, :, :] 
                     var  = hdul[2].data[i_min:i_max, :, :]
                     wl   = wl[i_min:i_max]
+
+                    # convert to erg/s/cm-2/A
+                    cube *= 1e-20
+                    var *= 1e-40
+                    header['FUNITS'] = 'erg/s/cm2/A'
+                    header['WUNITS'] = 'A'
 
                     # Update header if saving
                     header['CRVAL3'] = wl[0]
@@ -502,8 +508,6 @@ class PanGal:
         
                     dtheta_pix_deg = abs(header['CD1_1'])  # degrees per pixel
                     area_pix_arcsec2 = (dtheta_pix_deg * 3600)**2
-
-                    units = 1e-20        # converts in erg/s/cm2/A
         
                     wcs = WCS(header).celestial
 
@@ -517,7 +521,6 @@ class PanGal:
                     self.cubes[cube_name] = Cube(
                         cube=cube,
                         var=var,
-                        units=units,
                         wl=wl,
                         dw=dw,
                         resolution=resolution,
@@ -542,7 +545,7 @@ class PanGal:
                         integrated_band = np.nansum(cube[channel_inf:channel_sup, :, :], axis=0)
                         
                 
-                        image = integrated_band * dw / bandwidth * units     # in erg/s/cm2/A 
+                        image = integrated_band * dw / bandwidth 
 
                         ZP =  - 2.5 * np.log10(pivot_wavelength**2/2.998e18) - 48.60
                         ZP_err = 0
