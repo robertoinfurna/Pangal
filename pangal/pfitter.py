@@ -9,17 +9,33 @@ from scipy.signal import fftconvolve
 import itertools
 import os
 
-
 from dynesty import NestedSampler
 from dynesty import plotting as dyplot
 from dynesty.utils import resample_equal
 import corner
 
 from .spectrum import Spectrum
+from .run import Run
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
 from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator
 
+"""
+PFitter
+   ├── run_fit(...)    → creates a new Run() instance
+   │                      fills it with settings + results
+   │                      stores it in self.runs list
+   ├── many other functions
+   └── runs : list[Run]
+
+Run
+   ├── stores: data, phot, spectrum, priors
+   ├── stores: processed observed spectrum (normalized)
+   ├── stores: obs resolution on model grid
+   ├── stores: sampler result
+   ├── stores: likelihood function
+   └── lightweight methods if needed
+"""
 
 
 class PFitter(): # Parametric fitter
@@ -72,7 +88,7 @@ class PFitter(): # Parametric fitter
         # This can be moved above for computing dust_wl only once?
         self.dustem_func, self.dustem_alpha = self.load_dust_emission_models(self.model_wl,dustemimodel)
 
-
+        self.runs = []        # <- list of Run objects
 
     # methods
 
@@ -82,274 +98,277 @@ class PFitter(): # Parametric fitter
     model_grid_interpolator = model_grid_interpolator
 
 
-    
-    def run_fit(self,
+
+    # --- FIT Structure
+    # run_fit()               →   sets up the fit, calls make_log_likelihood()
+    # make_log_likelihood()   →   precomputes constants, returns log_likelihood()
+    # log_likelihood()        →   called thousands of times by the sampler
+
+    """
+    run_fit()
+        ├── crop + normalize obs spectrum
+        ├── setup parameters
+        ├── sampler = NestedSampler(log_likelihood, ...)
+        └── run sampler
+
+    make_log_likelihood()
+        ├── precompute resolution interpolation
+        ├── precompute photometry arrays
+        ├── precompute masks/transmission filters
+        ├── return log_likelihood()  # closure capturing the above
+    """
             
-        spec= None,
-        phot= None,
 
-        bands= None,            # if I want to use only some of the bands in phot dict
-        spectral_range = None,  # use only a portion of the observed spectrum
+    def run_fit(self,
+                spec=None,
+                phot=None,
+                bands=None,
+                spectral_range=None,
+                fix_pars=None,
+                custom_priors=None,
+                polymax=7,
+                nlive=500,
+                dlogz=0.01):
 
-        fix_pars={},            # dictionary 
-        custom_priors={},       # dictionary
+        # ------- safe copies for mutable inputs -------
+        fix_pars = {} if fix_pars is None else dict(fix_pars)
+        custom_priors = {} if custom_priors is None else dict(custom_priors)
 
-        polymax = 7,    
+        run = Run()     # new Run container
+        run.pfitter = self
 
-        nlive = 500,
-        dlogz = 0.01,
+        # store user inputs
+        run.spec = spec
+        run.phot = phot
+        run.spectral_range = spectral_range
+        run.polymax = polymax
+        run.custom_priors = custom_priors
 
-        ):
-
-        # Filter bands to only those present in map_filter_names
-        if bands: 
+        # --- bands selection ---
+        if bands:
             for b in bands:
                 if b not in map_filter_names.keys():
                     raise ValueError(f'Unrecognized filter: {b}. Abort')
-            self.bands = bands
+            run.bands = list(bands)
         else:
-            self.bands = [b for b in phot.photometry.keys() if b in map_filter_names.keys()]
-        # Print which filters are used
-        print(f"Using the following photometric filters: {', '.join(self.bands)}")
+            run.bands = [b for b in phot.photometry.keys() if b in map_filter_names.keys()]
 
+        print(f"Using the following photometric filters: {', '.join(run.bands)}")
 
-        # crops the segment of the observed spectrum I actually want to compare to the model, and normalizes it using a nth order polynomial function
-        if spec:
-            # --- Crop wavelength range ---
-            mask = (spec.wl >= spectral_range[0]) & (spec.wl <= spectral_range[1])
-            wl_crop = spec.wl[mask]
-            flux_crop = spec.flux[mask]
-            err_crop = spec.flux_err[mask]
+        # --- preprocess observed spectrum once (done here) ---
+        if spec is not None and spectral_range is not None:
+            run.norm_wl, run.norm_flux, run.norm_flux_err, run.continuum = \
+                self._preprocess_observed_spectrum(spec, spectral_range, polymax)
+        else:
+            run.norm_wl = run.norm_flux = run.norm_flux_err = run.continuum = None
 
-            # --- Filter out invalid pixels ---
-            good = np.isfinite(wl_crop) & np.isfinite(flux_crop) & np.isfinite(err_crop) & (err_crop > 0)
-            wl_crop = wl_crop[good]
-            flux_crop = flux_crop[good]
-            err_crop = err_crop[good]
-
-            # --- Fit polynomial to the continuum ---
-            # We use weighted fitting with 1/error^2 weights
-            self.polymax = polymax
-            coeff = np.polyfit(wl_crop, flux_crop, deg=polymax, w=1./err_crop)
-            continuum = np.polyval(coeff, wl_crop)
-
-            # --- Normalize flux and errors ---
-
-            self.normalized_obs_wl_for_likelihood = wl_crop
-            self.normalized_obs_flux_for_likelihood = flux_crop / continuum
-            self.normalized_obs_err_for_likelihood = err_crop / continuum
-
-
-        # Redshift and luminosity distance
+        # --- redshift and luminosity distance ---
         if phot and hasattr(phot, 'header') and 'redshift' in phot.header:
-            self.redshift = phot.header['redshift']
+            run.redshift = phot.header['redshift']
         elif spec and hasattr(spec, 'header') and 'redshift' in spec.header:
-            self.redshift = spec.header['redshift']
+            run.redshift = spec.header['redshift']
         else:
-            print("Redshift not provided and not found in phot dictionary or spectrum header. Set to 0.")
-            self.redshift = 0
-       
-        #Derive luminosity distance in Mpc
-        if phot and 'dl' in phot.header.keys():
-            self.dl = phot.header['dl']
+            run.redshift = 0
+            print("Redshift not provided; set to 0.")
+
+        if phot and hasattr(phot, 'header') and 'dl' in phot.header:
+            run.dl = phot.header['dl']
         elif spec and hasattr(spec, 'header') and 'dl' in spec.header:
-            self.dl = spec.header['dl']
+            run.dl = spec.header['dl']
         else:
             from astropy.cosmology import FlatLambdaCDM
-            cosmo = FlatLambdaCDM(H0=70,Om0=0.3)        
-            self.dl = cosmo.luminosity_distance(self.redshift).value
+            cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
+            run.dl = cosmo.luminosity_distance(run.redshift).value
 
+        # ------- fix_pars handling (copy, don't mutate caller) -------
+        run.fix_pars = dict(fix_pars)  # safe copy
 
-        
-        # Handles PARAMETERS: removes fixed parameters
-        self.fix_pars = fix_pars
-        if not spec:
-            self.fix_pars["vel_sys"] = None
-            self.fix_pars["sigma_vel"] = None
-        free_pars = [p for p in self.model_pars + ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star", "vel_sys", "sigma_vel"]
-                     if p not in self.fix_pars]
-        self.free_pars = free_pars
+        # If there is no spectrum, treat vel params as fixed/unavailable
+        if spec is None:
+            # do not mutate caller dict (we already copied)
+            run.fix_pars.setdefault("vel_sys", None)
+            run.fix_pars.setdefault("sigma_vel", None)
 
+        # ------- build lists of free parameters (separate model and global) -------
+        run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
 
-        # Create the sampler
-        log_likelihood = self.make_log_likelihood(spec, phot, free_pars, bands)
-        prior_transform = self.make_prior_transform(custom_priors)
+        global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
+                    "alpha", "m_star", "vel_sys", "sigma_vel"]
+        run.free_global_pars = [p for p in global_pars if p not in run.fix_pars]
+
+        run.free_pars = run.free_model_pars + run.free_global_pars
+
+        # --- build likelihood and prior (pass run.bands) ---
+        run.log_likelihood = self.make_log_likelihood(run, spec, phot, run.free_pars, run.bands)
+        run.prior_transform = self.make_prior_transform(run, run.custom_priors)
 
         print("Initializing live points")
-        sampler = NestedSampler(log_likelihood, prior_transform, ndim=len(free_pars),nlive=100) #self.nlive
+        run.sampler = NestedSampler(run.log_likelihood, run.prior_transform, ndim=len(run.free_pars), nlive=nlive)
 
-        # Run the nested sampling
-        sampler.run_nested(dlogz=dlogz, print_progress=True)
+        # --- run sampler ---
+        run.sampler.run_nested(dlogz=dlogz, print_progress=True)
+        run.result = run.sampler.results
 
-        # Access results
-        res = sampler.results
-
-        # safe to save internally the result
-        self.fit = res
-
-        return res
-
-    
-    def make_log_likelihood(self, spec, phot, free_pars, bands):
-
-        # --- Precompute constants ---
+        # Save run into PFitter
+        self.runs.append(run)
+        return run
 
 
-        if spec:
+    def make_log_likelihood(self, run, spec, phot, free_pars, bands):
+        # precompute and attach to run for transparency
 
-            # the model spectrum must be degraded to the observed spectrum resolution
-            # this interpolates the observed reoslution to the model wavelength grid
-            self.obs_resolution_on_model_grid = interp1d(
+        # --- resolution interpolation for model grid (if spectrum provided) ---
+        if spec is not None:
+            run.obs_resolution_on_model_grid = interp1d(
                 spec.wl, spec.resolution, kind="linear",
                 bounds_error=False, fill_value="extrapolate"
             )(self.model_wl)
-        else: self.obs_resolution_on_model_grid = None
+        else:
+            run.obs_resolution_on_model_grid = None
 
+        # --- photometric precomputations ---
+        if phot is not None:
+            run.phot_points = np.array([phot.data[b][0] for b in bands])
+            run.phot_errors = np.array([phot.data[b][1] for b in bands])
+            run.upper_lims = (run.phot_points / run.phot_errors < 5).astype(int)
 
-        if phot:
-            # Convert PhotometryTable object into arrays
-            phot_points = np.array([phot.data[b][0] for b in bands])
-            phot_errors = np.array([phot.data[b][1] for b in bands])
-            upper_lims = (phot_points / phot_errors < 5).astype(int)
-    
-            # Precompute filter transmission curves on the model wavelength grid
-            mask = {}
-            trans_arrays = {}
-            pivot_wls = {}
+            run.trans_mask = {}
+            run.trans_arrays = {}
+            run.pivot_wls = {}
             for b in bands:
                 F = Filter(b)
                 lmin, lmax = F.wavelength_range
-                mask[b] = (self.model_wl >= lmin) & (self.model_wl <= lmax)
-                trans_arrays[b] = F.transmission_curve(self.model_wl[mask[b]])
-                pivot_wls[b] = F.pivot_wavelength
-    
-    
-        # --- Define log-likelihood ---
+                mask_b = (self.model_wl >= lmin) & (self.model_wl <= lmax)
+                run.trans_mask[b] = mask_b
+                run.trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
+                run.pivot_wls[b] = F.pivot_wavelength
+
+        # --- closure used by the sampler ---
         def log_likelihood(pars):
-            
-            spec_lhood = 0
-            phot_lhood = 0
+            spec_lhood = 0.0
+            phot_lhood = 0.0
 
-
-            # --- Handles parameters
             idx = 0
-            n_model_pars = len(self.model_pars)
-            model_pars = pars[idx : idx + n_model_pars]
-            idx += n_model_pars
 
-            param_names = ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star","vel_sys","sigma_vel"]
-            param_values = {}
-            for name in param_names:
-                if name in self.fix_pars:
-                    param_values[name] = self.fix_pars[name]
+            # ---- MODEL PARAMETERS: only read the *free* model params from pars ----
+            free_model_names = run.free_model_pars
+            n_free_model = len(free_model_names)
+            model_free_values = np.array([]) if n_free_model == 0 else pars[idx: idx + n_free_model]
+            idx += n_free_model
+
+            # Build model kwargs including fixed model params
+            model_kwargs = {}
+            for name in self.model_pars:
+                if name in run.fix_pars:
+                    model_kwargs[name] = run.fix_pars[name]
                 else:
-                    param_values[name] = pars[idx]
+                    # find index in free_model_names
+                    pos = free_model_names.index(name)
+                    model_kwargs[name] = model_free_values[pos]
+
+            # ---- GLOBAL / NAMED PARAMETERS ----
+            named_order = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
+                        "alpha", "m_star", "vel_sys", "sigma_vel"]
+            named_values = {}
+            for name in named_order:
+                if name in run.fix_pars:
+                    named_values[name] = run.fix_pars[name]
+                else:
+                    named_values[name] = pars[idx]
                     idx += 1
 
-            fesc, ion_gas, age_gas, av, av_ext, alpha, m_star, vel_sys, sigma_vel = [param_values[n] for n in param_names]
-            kwargs = {key: value for key, value in zip(self.model_pars, model_pars)}
+            # unpack named params for readability
+            fesc = named_values["fesc"]
+            ion_gas = named_values["ion_gas"]
+            age_gas = named_values["age_gas"]
+            av = named_values["av"]
+            av_ext = named_values["av_ext"]
+            alpha = named_values["alpha"]
+            m_star = named_values["m_star"]
+            vel_sys = named_values["vel_sys"]
+            sigma_vel = named_values["sigma_vel"]
 
+            # --- Build synthetic spectrum (pass run.obs_resolution_on_model_grid) ---
+            synth_spec = self.synthetic_spectrum(**model_kwargs,
+                                                fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
+                                                av=av, av_ext=av_ext, alpha=alpha,
+                                                m_star=m_star,
+                                                vel_sys=vel_sys, sigma_vel=sigma_vel,
+                                                redshift=0, dl=100,
+                                                observed_spectrum_resolution=run.obs_resolution_on_model_grid)
 
-            # Build synthetic spectrum
-            synth_spec = self.synthetic_spectrum(**kwargs,
-                                                    fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
-                                                    av=av, av_ext=av_ext, alpha=alpha,
-                                                    m_star=m_star, 
-                                                    vel_sys=vel_sys,sigma_vel=sigma_vel, 
-                                                    redshift=0, dl=100,
-                                                    observed_spectrum_resolution=self.obs_resolution_on_model_grid,
-                                                    )
-
-            if phot:
+            # ----------------- Photometric likelihood -----------------
+            if phot is not None:
                 model_phot = []
                 for b in bands:
-                    spec_array = synth_spec.flux[mask[b]]
+                    mask_b = run.trans_mask[b]
+                    spec_array = synth_spec.flux[mask_b]
                     if len(spec_array) == 0:
                         model_phot.append(np.nan)
                         continue
-
-                    num_int = np.trapz(trans_arrays[b] * spec_array, self.model_wl[mask[b]])
-                    norm_int = np.trapz(trans_arrays[b], self.model_wl[mask[b]])
-                    if norm_int == 0:
+                    num_int = np.trapz(run.trans_arrays[b] * spec_array, self.model_wl[mask_b])
+                    den = np.trapz(run.trans_arrays[b], self.model_wl[mask_b])
+                    if den == 0:
                         model_phot.append(np.nan)
                         continue
-
-                    phot_point = num_int / norm_int
-
-                    # CHECK THIS
-                    # Convert to mJy if needed
+                    phot_point = num_int / den
+                    # convert to mJy if needed
                     c = 2.99792458e18  # Å/s
-                    phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
-
+                    phot_point = phot_point * run.pivot_wls[b]**2 / c / 1e-26
                     model_phot.append(phot_point)
-
                 model_phot = np.array(model_phot)
-
                 if not np.all(np.isfinite(model_phot)):
                     return -1e100
-
-                for i in range(len(phot_points)):
-                    if upper_lims[i] == 0:
+                for i in range(len(run.phot_points)):
+                    if run.upper_lims[i] == 0:
                         phot_lhood += -0.5 * (
-                            (phot_points[i] - model_phot[i])**2 / phot_errors[i]**2
-                            + np.log(phot_errors[i]**2)
+                            (run.phot_points[i] - model_phot[i])**2 / run.phot_errors[i]**2
+                            + np.log(run.phot_errors[i]**2)
                             + np.log(2. * np.pi)
                         )
                     else:
-                        terf = 0.5 * (1 + erf((phot_points[i] - model_phot[i]) /
-                                                (np.sqrt(2.) * phot_errors[i])))
+                        terf = 0.5 * (1 + erf((run.phot_points[i] - model_phot[i]) /
+                                            (np.sqrt(2.) * run.phot_errors[i])))
+                        if terf <= 0:
+                            return -1e100
                         phot_lhood += np.log(terf)
-        
-                if not np.isfinite(phot_lhood):
-                    return -1e100
-                
-            if spec:
 
-                wl_obs = self.normalized_obs_wl_for_likelihood
-                flux_obs = self.normalized_obs_flux_for_likelihood
-                err_obs = self.normalized_obs_err_for_likelihood
+            # ----------------- Spectral likelihood (features only) -------------
+            if spec is not None:
+                wl_obs = run.norm_wl
+                flux_obs = run.norm_flux
+                err_obs = run.norm_flux_err
 
-                # Interpolate model to observed wavelength grid
-                model_flux_interp = np.interp(wl_obs, synth_spec.wl, synth_spec.flux)
+                # interpolate model to observed wl (use interp1d so we can extrapolate if needed)
+                interp_model = interp1d(synth_spec.wl, synth_spec.flux, kind='linear',
+                                        bounds_error=False, fill_value='extrapolate')
+                model_flux_interp = interp_model(wl_obs)
 
-                # Fit a polynomial to the model spectrum to remove its continuum
-                coeff_model = np.polyfit(wl_obs, model_flux_interp, deg=self.polymax)
+                # remove continuum from model with same polynomial degree used on observed data
+                coeff_model = np.polyfit(wl_obs, model_flux_interp, deg=run.polymax)
                 model_continuum = np.polyval(coeff_model, wl_obs)
-
-                # Normalize the model spectrum by its continuum
                 model_flux_norm = model_flux_interp / model_continuum
 
-                # --- Compute Gaussian log-likelihood using continuum-normalized spectra ---
+                # compute residuals and gaussian log-likelihood
                 residual = flux_obs - model_flux_norm
-                inv_var = 1.0 / err_obs**2
-                spec_lhood = -0.5 * np.sum(residual**2 * inv_var + np.log(2*np.pi / inv_var))
-                
+                inv_var = 1.0 / (err_obs**2)
+                spec_lhood = -0.5 * np.sum(residual**2 * inv_var + np.log(2 * np.pi / inv_var))
 
-            
             return spec_lhood + phot_lhood
 
         return log_likelihood
-    
-    
 
 
+    def make_prior_transform(self, run, custom_priors):
+        # safe copy
+        custom_priors = {} if custom_priors is None else dict(custom_priors)
 
+        # validate custom priors against the free parameters
+        for key in custom_priors.keys():
+            if key not in run.free_pars:
+                raise ValueError(f"Unknown parameter in prior_dict: {key}")
 
-
-    def make_prior_transform(self, custom_priors):
-
-        # --- Validate custom priors ---
-        for key, val in custom_priors.items():
-            if key not in self.free_pars:
-                raise ValueError(f"Unknown parameter in prior_dict: '{key}'. Valid names: {self.free_pars}")
-            if 'type' not in val:
-                raise ValueError(f"Missing 'type' field for prior '{key}'. Must be 'uniform' or 'gaussian'.")
-            if val['type'] == 'uniform' and not all(k in val for k in ['low', 'high']):
-                raise ValueError(f"Uniform prior '{key}' must define 'low' and 'high'.")
-            if val['type'] == 'gaussian' and not all(k in val for k in ['mean', 'sigma']):
-                raise ValueError(f"Gaussian prior '{key}' must define 'mean' and 'sigma'.")
-
-        # --- Default priors ---
+        # default priors
         priors = {
             'fesc':    {'type': 'uniform', 'low': 0.0, 'high': 1.0},
             'ion_gas': {'type': 'uniform', 'low': self.nebular_ions[0], 'high': self.nebular_ions[-1]},
@@ -365,38 +384,35 @@ class PFitter(): # Parametric fitter
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
             priors[p] = {'type': 'uniform', 'low': lo, 'high': hi}
 
-        # --- Override with user-defined priors ---
-        for p in custom_priors.keys():
-            priors[p] = custom_priors[p]
+        # override with custom
+        for p, v in custom_priors.items():
+            priors[p] = v
 
-        # --- Print priors ---
+        # print priors for the free params only
         print("\nPriors:")
-        for p in self.free_pars:
-            if priors[p]['type'] == 'uniform':
-                print(f"  - {p}: Uniform({priors[p]['low']}, {priors[p]['high']})")
-            elif priors[p]['type'] == 'gaussian':
-                print(f"  - {p}: Gaussian(mean={priors[p]['mean']}, sigma={priors[p]['sigma']})")
+        for p in run.free_pars:
+            pr = priors[p]
+            if pr['type'] == 'uniform':
+                print(f"  - {p}: Uniform({pr['low']}, {pr['high']})")
+            elif pr['type'] == 'gaussian':
+                print(f"  - {p}: Gaussian(mean={pr['mean']}, sigma={pr['sigma']})")
             else:
-                print(f"  - {p}: {priors[p]['type']}")
+                print(f"  - {p}: {pr}")
 
-        # --- Define transform function based on priors ---
+        # transform from unit cube to physical space
         def prior_transform(u):
             x = np.zeros_like(u)
-            for i, name in enumerate(self.free_pars):
+            for i, name in enumerate(run.free_pars):
                 prior = priors[name]
                 if prior['type'] == 'uniform':
                     x[i] = prior['low'] + u[i] * (prior['high'] - prior['low'])
                 elif prior['type'] == 'gaussian':
-                    # Use inverse CDF of normal distribution
                     x[i] = prior['mean'] + prior['sigma'] * np.sqrt(2) * erfinv(2 * u[i] - 1)
                 else:
-                    raise ValueError(f"Unsupported prior type '{prior['type']}' for parameter '{name}'.")
+                    raise ValueError(f"Unsupported prior type {prior['type']} for {name}")
             return x
 
         return prior_transform
-
-
-
 
     def synthetic_spectrum(
         self,
@@ -679,117 +695,42 @@ class PFitter(): # Parametric fitter
 
 
 
-
-    """
-    def apply_velocity_broadening(self, total_spec, sigma_vel):
-        c = 2.99792458e5  # km/s
-
-        # --- Internal broadening (instrumental) ---
-        sigma_v_internal = c / (self.model_res * 2.355)
-        sigma_v_internal_med = np.median(sigma_v_internal)
-
-        # --- Effective σ_v to apply ---
-        if sigma_v > sigma_v_internal_med:
-            sigma_v_apply = np.sqrt(sigma_v**2 - sigma_v_internal_med**2)
-        else:
-            sigma_v_apply = 0.0
-
-        if sigma_v_apply <= 0:
-            #print(f"[broadening] No extra broadening applied (σ_v={sigma_v_apply:.2f} km/s ≤ instrumental)")
-            return total_spec
-
-        # --- Build uniform log-lambda grid ---
-        wl = self.model_wl
-        loglam = np.log(wl)
-        dloglam = np.median(np.diff(loglam))
-
-        # --- Compute sigma in pixel units ---
-        sigma_pix = sigma_v_apply / (c * dloglam)
-        #print(f"[broadening] Applying σ_v={sigma_v_apply:.1f} km/s → σ_pix={sigma_pix:.2f}")
-
-        # --- Interpolate flux onto uniform log-lambda grid ---
-        loglam_uniform = np.linspace(loglam[0], loglam[-1], len(wl))
-        flux_log = np.interp(np.exp(loglam_uniform), wl, total_spec)
-
-        # --- Build Gaussian kernel (truncate at ±4σ) ---
-        size = int(4 * sigma_pix)
-        x = np.arange(-size, size + 1)
-        kernel = np.exp(-0.5 * (x / sigma_pix)**2)
-        kernel /= kernel.sum()
-
-        # --- Convolve using FFT (fast) ---
-        flux_smooth = fftconvolve(flux_log, kernel, mode='same')
-
-        # --- Interpolate back to original wavelength grid ---
-        total_spec_broadened = np.interp(wl, np.exp(loglam_uniform), flux_smooth)
-
-        return total_spec_broadened
-    """
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def cornerplot(self, fit_result, show_stats=True, cmap='viridis', alpha=0.7,):
-        """
-        Make a corner plot from Dynesty fit results.
-    
-        Parameters
-        ----------
-        fit_result : dynesty results object
-            The nested sampling results.
-        show_stats : bool
-            Whether to display mean ± std on top of histograms.
-        cmap : str
-            Matplotlib colormap for 2D contours.
-        alpha : float
-            Transparency for 2D contour fills.
-        """    
-        #resample 
-        samples, weights = fit_result.samples, np.exp(fit_result.logwt - fit_result.logz[-1])
-        equal_samples = resample_equal(samples, weights)
-    
-        # Map parameter names to nicer LaTeX labels
-        latex_labels = {
-            "age": r"$\mathrm{Age~[Myr]}$",
-            "tau_main": r"$\tau_\mathrm{main} \mathrm{~[Myr]}$",
-            "age_trunc": r"$Q_\\text{AGE}\mathrm{~[Myr]}$",
-            "tau_trunc": r"$\\tau_\\text{Q}\mathrm{~[Myr]}$",
-            "fesc": r"$f_\mathrm{esc}$",
-            "ion_gas": r"$U_\mathrm{ion}$",
-            "age_gas": r"$\mathrm{Age_{gas}}$",
-            "av": r"$A_V$",
-            "av_ext": r"$A_{V,ext}$",
-            "alpha": r"$\alpha$",
-            "m_star": r"$\log(M_\star)$",
-            "vel_sys": r"$v [km/s]$",
-            "sigma_vel": r"$\\sigma_v [km/s]$"
-        }
-        labels = [latex_labels.get(p, p) for p in self.free_pars]
-    
-        plt.close('all')
-        fig = corner.corner(equal_samples, labels=self.free_pars,
-                    color='k', plot_contours=True, fill_contours=True,
-                    cmap=cmap, alpha=alpha)
+    def _preprocess_observed_spectrum(self,spec,spectral_range,polymax):
         
-        if show_stats:
-            means = np.mean(equal_samples, axis=0)
-            stds = np.std(equal_samples, axis=0)
-            # corner creates n*n axes, diagonal axes are at positions 0, n+1, 2*(n+1), ...
-            diag_axes = [fig.axes[i*(len(self.free_pars)+1)] for i in range(len(self.free_pars))]
-            for i, ax in enumerate(diag_axes):
-                ax.set_title(f"{means[i]:.3f} ± {stds[i]:.3f}", fontsize=10, pad=12)
-    
-        plt.show()
+        # --- Crop wavelength range ---
+        mask = (spec.wl >= spectral_range[0]) & (spec.wl <= spectral_range[1])
+        wl_crop = spec.wl[mask]
+        flux_crop = spec.flux[mask]
+        err_crop = spec.flux_err[mask]
+
+        # --- Filter out invalid pixels ---
+        good = np.isfinite(wl_crop) & np.isfinite(flux_crop) & np.isfinite(err_crop) & (err_crop > 0)
+        wl_crop = wl_crop[good]
+        flux_crop = flux_crop[good]
+        err_crop = err_crop[good]
+
+        # --- Fit polynomial to the continuum ---
+        # We use weighted fitting with 1/error^2 weights
+        coeff = np.polyfit(wl_crop, flux_crop, deg=polymax, w=1./err_crop)
+        continuum = np.polyval(coeff, wl_crop)
+
+        # --- Normalize flux and errors ---
+        normalized_obs_wl_for_likelihood = wl_crop
+        normalized_obs_flux_for_likelihood = flux_crop / continuum
+        normalized_obs_err_for_likelihood = err_crop / continuum
+
+        return normalized_obs_wl_for_likelihood, normalized_obs_flux_for_likelihood, normalized_obs_err_for_likelihood, continuum
+
+
+
+
+
+
+
+
+
+
+
 
 
 
