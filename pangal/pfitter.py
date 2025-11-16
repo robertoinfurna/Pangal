@@ -88,10 +88,11 @@ class PFitter(): # Parametric fitter
         spec= None,
         phot= None,
 
-        bands= None,          # if I want to use only some of the bands in phot dict
+        bands= None,            # if I want to use only some of the bands in phot dict
+        spectral_range = None,  # use only a portion of the observed spectrum
 
-        fix_pars={},          # dictionary 
-        custom_priors={},        # dictionary
+        fix_pars={},            # dictionary 
+        custom_priors={},       # dictionary
 
         polymax = 7,    
 
@@ -110,7 +111,34 @@ class PFitter(): # Parametric fitter
             self.bands = [b for b in phot.photometry.keys() if b in map_filter_names.keys()]
         # Print which filters are used
         print(f"Using the following photometric filters: {', '.join(self.bands)}")
-        
+
+
+        # crops the segment of the observed spectrum I actually want to compare to the model, and normalizes it using a nth order polynomial function
+        if spec:
+            # --- Crop wavelength range ---
+            mask = (spec.wl >= spectral_range[0]) & (spec.wl <= spectral_range[1])
+            wl_crop = spec.wl[mask]
+            flux_crop = spec.flux[mask]
+            err_crop = spec.flux_err[mask]
+
+            # --- Filter out invalid pixels ---
+            good = np.isfinite(wl_crop) & np.isfinite(flux_crop) & np.isfinite(err_crop) & (err_crop > 0)
+            wl_crop = wl_crop[good]
+            flux_crop = flux_crop[good]
+            err_crop = err_crop[good]
+
+            # --- Fit polynomial to the continuum ---
+            # We use weighted fitting with 1/error^2 weights
+            self.polymax = polymax
+            coeff = np.polyfit(wl_crop, flux_crop, deg=polymax, w=1./err_crop)
+            continuum = np.polyval(coeff, wl_crop)
+
+            # --- Normalize flux and errors ---
+
+            self.normalized_obs_wl_for_likelihood = wl_crop
+            self.normalized_obs_flux_for_likelihood = flux_crop / continuum
+            self.normalized_obs_err_for_likelihood = err_crop / continuum
+
 
         # Redshift and luminosity distance
         if phot and hasattr(phot, 'header') and 'redshift' in phot.header:
@@ -136,8 +164,8 @@ class PFitter(): # Parametric fitter
         # Handles PARAMETERS: removes fixed parameters
         self.fix_pars = fix_pars
         if not spec:
-            self.fix_pars["vel_sys"] = 0
-            self.fix_pars["sigma_vel"] = 0
+            self.fix_pars["vel_sys"] = None
+            self.fix_pars["sigma_vel"] = None
         free_pars = [p for p in self.model_pars + ["fesc", "ion_gas", "age_gas", "av", "av_ext", "alpha", "m_star", "vel_sys", "sigma_vel"]
                      if p not in self.fix_pars]
         self.free_pars = free_pars
@@ -165,13 +193,19 @@ class PFitter(): # Parametric fitter
     def make_log_likelihood(self, spec, phot, free_pars, bands):
 
         # --- Precompute constants ---
+
+
         if spec:
 
-            obs_wl = spec.wl
-            obs_R = spec.resolution
-            interp_R = interp1d(obs_wl, obs_R, kind='linear', bounds_error=False, fill_value='extrapolate')
-            self.obs_resolution_on_model_grid = interp_R(self.model_wl)
-    
+            # the model spectrum must be degraded to the observed spectrum resolution
+            # this interpolates the observed reoslution to the model wavelength grid
+            self.obs_resolution_on_model_grid = interp1d(
+                spec.wl, spec.resolution, kind="linear",
+                bounds_error=False, fill_value="extrapolate"
+            )(self.model_wl)
+        else: self.obs_resolution_on_model_grid = None
+
+
         if phot:
             # Convert PhotometryTable object into arrays
             phot_points = np.array([phot.data[b][0] for b in bands])
@@ -222,7 +256,9 @@ class PFitter(): # Parametric fitter
                                                     av=av, av_ext=av_ext, alpha=alpha,
                                                     m_star=m_star, 
                                                     vel_sys=vel_sys,sigma_vel=sigma_vel, 
-                                                    redshift=0, dl=100)
+                                                    redshift=0, dl=100,
+                                                    observed_spectrum_resolution=self.obs_resolution_on_model_grid,
+                                                    )
 
             if phot:
                 model_phot = []
@@ -266,13 +302,40 @@ class PFitter(): # Parametric fitter
         
                 if not np.isfinite(phot_lhood):
                     return -1e100
-            
+                
+            if spec:
+
+                wl_obs = self.normalized_obs_wl_for_likelihood
+                flux_obs = self.normalized_obs_flux_for_likelihood
+                err_obs = self.normalized_obs_err_for_likelihood
+
+                # Interpolate model to observed wavelength grid
+                model_flux_interp = np.interp(wl_obs, synth_spec.wl, synth_spec.flux)
+
+                # Fit a polynomial to the model spectrum to remove its continuum
+                coeff_model = np.polyfit(wl_obs, model_flux_interp, deg=self.polymax)
+                model_continuum = np.polyval(coeff_model, wl_obs)
+
+                # Normalize the model spectrum by its continuum
+                model_flux_norm = model_flux_interp / model_continuum
+
+                # --- Compute Gaussian log-likelihood using continuum-normalized spectra ---
+                residual = flux_obs - model_flux_norm
+                inv_var = 1.0 / err_obs**2
+                spec_lhood = -0.5 * np.sum(residual**2 * inv_var + np.log(2*np.pi / inv_var))
+                
+
             
             return spec_lhood + phot_lhood
 
         return log_likelihood
     
     
+
+
+
+
+
     def make_prior_transform(self, custom_priors):
 
         # --- Validate custom priors ---
@@ -453,14 +516,17 @@ class PFitter(): # Parametric fitter
         total_spec = att_stellar_nebular_spec + dust_spec
 
 
+
         # BROADENING
         # --- Apply LOS velocity broadening (in log λ space) ---
-        # --- Rescale the model spectrum to a required resolution to compare with data
+        # --- Shift using systemic velocity
 
-        wl_shifted = self.model_wl
+        #wl_shifted = self.model_wl
+        c = 2.99792458e5  # km/s
+        wl_shifted = self.model_wl.copy()
+
         if vel_sys and sigma_vel:
-            c = 2.99792458e5  # km/s
-
+            
             # --- Estimate internal broadening (instrumental) ---
             sigma_v_internal = c / (self.model_res * 2.355)  # per-pixel σ_v array
             sigma_v_internal_med = np.median(sigma_v_internal)
@@ -486,8 +552,7 @@ class PFitter(): # Parametric fitter
 
         # --- Match model resolution to observed resolution R(λ) ---
         if observed_spectrum_resolution is not None:
-            c = 2.99792458e5  # km/s
-
+          
             # Convert observed R to σ_v(λ)
             fwhm_obs = model_red_wl / observed_spectrum_resolution
             sigma_obs_kms = (fwhm_obs / 2.355) * (c / model_red_wl)
@@ -692,13 +757,6 @@ class PFitter(): # Parametric fitter
         #resample 
         samples, weights = fit_result.samples, np.exp(fit_result.logwt - fit_result.logz[-1])
         equal_samples = resample_equal(samples, weights)
-
-        print("DEBUG free_pars:", self.free_pars)
-        print("DEBUG equal_samples shape:", equal_samples.shape)
-        print("DEBUG min/max of each col:")
-        for i,p in enumerate(self.free_pars):
-            print(p, np.nanmin(equal_samples[:,i]), np.nanmax(equal_samples[:,i]))
-
     
         # Map parameter names to nicer LaTeX labels
         latex_labels = {
