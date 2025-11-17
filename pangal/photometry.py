@@ -26,143 +26,122 @@ from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, Angle
 from astropy import units as u
 
-from ..image import Image
-from ..cube import Cube
-from ..region import Region, Point, Contours
-from ..filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names, default_filter_colors
+from .image import Image
+from .cube import Cube
+from .region import Region, Point, Contours
+from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names, default_filter_colors
 
 from .plot import add_ra_dec_ticks
 
-from ..photometry_table import PhotometryTable
-
+from .photometry_table import PhotometryTable
 
 def photometry(self,              
-               regions,                      # List of photometric regions (each is a region object with RA/Dec shape)
-               bands=None,                   # List of band names (e.g., ['FUV','NUV','IRAC1']). Default: all bands available.
-               units='mJy',                  # Output units: 'mJy', 'mJy_arcsec2', 'mag', 'mag_arcsec2', 'erg_s_cm2_A', 'erg_s_cm2_A_arcsec2',
-                                             # 'erg_s_cm2', 'erg_s_cm2_arcsec2'
-               threshold_quantile=0.9,       # Used to threshold background flux for clipping
-               n_background_regions=500,     # Number of random regions sampled for background estimation
-               background_exclude_regions = [],  # List of regions to exclude when estimating background
-               print_output = True,          # Print detailed output for each region
-               ):
-    """
-    Perform aperture photometry with sky background subtraction and uncertainty estimation.
+               regions,
+               bands=None,
+               units='mJy',
+               threshold_quantile=0.9,
+               n_background_regions=500,
+               background_exclude_regions=[],
+               print_output=True):
 
-    Parameters
-    ----------
-    regions : list of region objects
-        Each region defines a sky aperture (RA/Dec polygon or circle) for which to extract flux.
-
-    bands : list of str, optional
-        Which image bands to perform photometry on. If None, use all available.
-
-    units : str
-        Output flux units. One of 'mJy', 'mag', or 'erg_s_cm2_A'.
-
-    Returns
-    -------
-    photometric_list : list of PhotometryTable objects
-        For region i, (flux, error) tuples are accessible through phot_list[i].data
-    """
-
-    # Ensure inputs are in list format
+    # force lists
     if not isinstance(regions, (list, tuple)):
         regions = [regions]
     if not isinstance(background_exclude_regions, (list, tuple)):
         background_exclude_regions = [background_exclude_regions]
+
     if bands is None:
-        bands = self.images.keys()  # Use all available bands
+        bands = self.images.keys()
 
-    # Initialize output container
-    photometric_list = [PhotometryTable() for _ in range(len(regions))]
-
-    # Check units
-    if units not in ['mJy', 'mJy_arcsec2', 'mag', 'mag_arcsec2', 'erg_s_cm2_A', 'erg_s_cm2_A_arcsec2']: #, 'erg_s_cm2', 'erg_s_cm2_arcsec2']:
-        raise ValueError('Unrecognized output units: must be "mJy", "mJy_arcsec2", "mag", "mag_arcsec2", "erg_s_cm2_A", "erg_s_cm2_A_arcsec2"') #, "erg_s_cm2", "erg_s_cm2_arcsec2"')
-    
-
-    for r, reg in enumerate(regions):
-        photometric_list[r].header['units'] = units
-        photometric_list[r].region = reg
+    # ---------------------------
+    # SINGLE multi-region table
+    # ---------------------------
+    phot_table = PhotometryTable()
+    phot_table.header['UNITS'] = units
+    phot_table.header["N_REGIONS"] = len(regions)
 
 
-    # Loop through each band
+    # record region names
+    region_names = []
+    for i, reg in enumerate(regions):
+        # use header ID if present, otherwise fallback
+        region_id = reg.header.get("ID", f"Region {i+1}")
+        region_names.append(region_id)
+        phot_table.data[region_id] = {}   # empty dict for this region
+
+    # ---------------------------
+    # Photometry loop
+    # ---------------------------
     for b, band in enumerate(bands):
-    
-        # manages multiple images of the same band (mosaics)
+
+        # mosaic naming
         exposure_id = None
         if '(' in band:
             idx = band.find('(')
             exposure_id = band[idx+1:-1]
-            band = band[:idx]
+            base_band = band[:idx]
+        else:
+            base_band = band
 
-        image = self.images[band].image        # native. MOST OF THE TIMES COUNTS/S
+        image = self.images[base_band].image
+        wcs = self.images[base_band].wcs
 
         if print_output:
-            print(nice_filter_names[band])
+            print(nice_filter_names[base_band])
 
-        wcs = self.images[band].wcs  # World Coordinate System
-
-
-        # Create initial mask for sources to exclude from background estimation
+        # ---------------------------
+        # Build source mask
+        # ---------------------------
         source_mask = np.zeros_like(image, dtype=bool)
 
-        # Build source exclusion mask
         if background_exclude_regions:
             for reg in background_exclude_regions:
-                if hasattr(reg, 'project'):
-                    mask = reg.project(image, wcs).astype(bool)
-                else:
-                    raise TypeError("Each region must be a custom Region")
+                mask = reg.project(image, wcs).astype(bool)
                 source_mask |= mask
-
             outer_mask = ~source_mask
             source_area = np.sum(source_mask)
             outer_area = np.sum(outer_mask)
         else:
             print("No detected sources are masked during background estimation.")
             source_area = 0
-            outer_area = 1  # Avoid divide-by-zero later
+            outer_area = 1
 
-        # Loop over regions for photometry
+        # ---------------------------
+        # Aperture loop
+        # ---------------------------
         for r, Reg in enumerate(regions):
-            mask = Reg.project(image, wcs)  # Binary mask of region
-            n = np.nansum(mask)             # Number of pixels in region
 
-            # --- BACKGROUND ESTIMATION ---
+            mask = Reg.project(image, wcs)
+            n = np.nansum(mask)
+
+            # ---------------------------
+            # BACKGROUND ESTIMATION
+            # ---------------------------
             if outer_area > 10 * source_area:
-                # Use random region shifting for large fields
+
                 back_flux_arr = []
-                threshold = np.nanquantile(image[image>-999], threshold_quantile)
+                threshold = np.nanquantile(image[image > -999], threshold_quantile)
 
                 mask_indices = np.argwhere(mask > 0)
                 mask_values = mask[mask > 0]
 
-                while len(back_flux_arr)<n_background_regions:
-                    # Shift region randomly within the image
-                    dy = random.randint(- (image.shape[0] - 5), image.shape[0] - 5)
-                    dx = random.randint(- (image.shape[1] - 5), image.shape[1] - 5)
+                while len(back_flux_arr) < n_background_regions:
+
+                    dy = random.randint(-(image.shape[0] - 5), image.shape[0] - 5)
+                    dx = random.randint(-(image.shape[1] - 5), image.shape[1] - 5)
                     shifted = mask_indices + [dy, dx]
-                    
-                    # check if all shifted pixels are inside the image
-                    if (shifted[:,0].min() < 0 or shifted[:,0].max() >= image.shape[0] or
-                        shifted[:,1].min() < 0 or shifted[:,1].max() >= image.shape[1]):
-                        continue  # reject this shift
+
+                    if (shifted[:, 0].min() < 0 or shifted[:, 0].max() >= image.shape[0] or
+                        shifted[:, 1].min() < 0 or shifted[:, 1].max() >= image.shape[1]):
+                        continue
+
                     shifted_vals = image[shifted[:, 0], shifted[:, 1]]
 
-
-                    # extra checks
-                    # background region must not overlap with the source region
                     if np.any(source_mask[shifted[:, 0], shifted[:, 1]]):
                         continue
-
-                    # All pixels outside the original image that appear after rotation will be set to -999
-                    # Exclude regions that follow even partially outside original image
-                    if np.any(np.isclose(shifted_vals, -999, atol=1e-6)):
+                    if np.any(np.isclose(shifted_vals, -999)):
                         continue
 
-                    # Reject bright outliers using threshold
                     back_flux = np.nansum(shifted_vals * mask_values)
                     if back_flux < threshold * n:
                         back_flux_arr.append(back_flux)
@@ -171,37 +150,31 @@ def photometry(self,
                 background_standard_dev = np.std(back_flux_arr)
 
             else:
-                # Use histogram fitting for small fields or masked background
                 masked_image = np.where(source_mask, image, np.nan)
-                flattened_data = masked_image[
-                    (~np.isnan(masked_image)) & (masked_image != -999)
-                ].flatten()
-
-                bins = np.linspace(np.nanquantile(flattened_data, 0.005),
-                                   np.nanquantile(flattened_data, 0.9))
-                hist, bins = np.histogram(flattened_data, bins=bins)
+                flattened = masked_image[(~np.isnan(masked_image)) & (masked_image != -999)]
+                bins = np.linspace(np.nanquantile(flattened, 0.005),
+                                   np.nanquantile(flattened, 0.9))
+                hist, bins = np.histogram(flattened, bins=bins)
                 bin_centers = (bins[:-1] + bins[1:]) / 2
 
-                # Fit symmetric distribution around histogram peak
                 peak_idx = np.argmax(hist)
-                peak_value = bin_centers[peak_idx]
-                flattened_data_neg = flattened_data[flattened_data < peak_value]
-                symmetric_data = np.concatenate((flattened_data_neg, 2 * peak_value - flattened_data_neg))
-                mean, std = stat_norm.fit(symmetric_data)
+                peak = bin_centers[peak_idx]
+
+                neg = flattened[flattened < peak]
+                symmetric = np.concatenate((neg, 2*peak - neg))
+                mean, std = stat_norm.fit(symmetric)
 
                 mean_background_flux = mean * n
                 background_standard_dev = std * np.sqrt(n)
 
-            # --- FLUX MEASUREMENT ---
-
+            # -------------------
+            # FLUX + UNCERTAINTY 
+            # -------------------
             flux = np.nansum(image * mask)
             flux_sky_subtracted = flux - mean_background_flux
 
-            # --- UNCERTAINTY ESTIMATION ---
-
-            exptime = self.images[band].exptime
-            if exptime:          # Herschel PACS has no exptime
-                # Convert counts/s to total counts for Poisson error
+            exptime = self.images[base_band].exptime
+            if exptime:
                 total_counts = flux_sky_subtracted * exptime
                 poisson_err = np.sqrt(total_counts) / exptime
             else:
@@ -209,62 +182,66 @@ def photometry(self,
 
             total_flux_err = np.sqrt(background_standard_dev**2 + poisson_err**2)
 
-            if print_output:
-                print(f"Region {r+1}: total flux: {flux:.5f}, poisson unc: {poisson_err:.5f}, "
-                      f"sky flux: {mean_background_flux:.5f}, sky std: {background_standard_dev}")
+            if print_output: 
+                print(f"Region {r+1}: total flux: {flux:.5f}, poisson unc: {poisson_err:.5f}, " f"sky flux: {mean_background_flux:.5f}, sky std: {background_standard_dev}")
 
-            # Avoid negative flux or unrealistically small error
             if flux_sky_subtracted < 0:
                 flux_sky_subtracted = background_standard_dev
             if total_flux_err / flux_sky_subtracted < 0.01:
                 total_flux_err = 0.01 * flux_sky_subtracted
 
-            # Normalize by area if needed
             if 'arcsec2' in units:
-                area_arcsec2 = n * self.images[band].area_pix_arcsec2
+                area_arcsec2 = n * self.images[base_band].area_pix_arcsec2
                 flux_sky_subtracted /= area_arcsec2
                 total_flux_err /= area_arcsec2
 
+            # ----------------
+            # UNIT CONVERSION 
+            # ----------------
+            ZP = self.images[base_band].ZP
+            ZP_err = self.images[base_band].ZP_err
 
-            # --- UNIT CONVERSION ---
-            # So far we worked on counts/s, apart for Herschel
-            ZP = self.images[band].ZP
-            ZP_err = self.images[band].ZP_err
-
-            #convert all to mag
             mag = ZP - 2.5*np.log10(flux_sky_subtracted)
-            mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)   #  Here I add calibration error!
-   
+            mag_err = np.sqrt(ZP_err**2 +
+                              (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)
+
             if 'mag' in units:
                 flux_sky_subtracted = mag
                 total_flux_err = mag_err
-                
+
             if 'mJy' in units:
                 flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
-                total_flux_err = 1e3 * 0.4*np.log(10)*10**(0.4*(-mag+8.90)) * mag_err
+                total_flux_err = 1e3 * 0.4*np.log(10) * 10**(0.4*(-mag+8.90)) * mag_err
 
             if 'erg_s_cm2_A' in units:
-                flux_sky_subtracted = 2.998e18 / self.images[band].pivot_wavelength**2 * 10**(0.4*(-mag-48.60))
-                total_flux_err = 2.998e18 / self.images[band].pivot_wavelength**2  * 0.4*np.log(10)*10**(0.4*(-mag-48.60)) * mag_err
+                wl = self.images[base_band].pivot_wavelength
+                factor = 2.998e18 / (wl**2)
+                flux_sky_subtracted = factor * 10**(0.4*(-mag-48.60))
+                total_flux_err = factor * 0.4*np.log(10) * 10**(0.4*(-mag-48.60)) * mag_err
 
+            # ---------------------------
+            # Print output 
+            # ---------------------------
+            if print_output: fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
+            print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} " f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
 
-            if print_output:
-                fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
-                print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} "
-                      f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
+            # ---------------------------
+            # SAVE RESULT INTO REGION ENTRY
+            # ---------------------------
+            out_band = base_band if exposure_id is None else f"{base_band}({exposure_id})"
+            region_name = region_names[r]
 
-        
-            # Save photometry result
-            
-            # manages multiple images of the same band (mosaics)
-            if exposure_id: 
-                band = band + f"({exposure_id})"
-            
-            photometric_list[r].data[band] = (flux_sky_subtracted, total_flux_err)
+            phot_table.data[region_name][out_band] = (
+                flux_sky_subtracted,
+                total_flux_err
+            )
 
-        if print_output: print('\n')
+        if print_output:
+            print('\n')
 
-    return photometric_list
+        phot_table.header["REGIONS"] = ",".join(region_names)
+
+    return phot_table
     
 
 

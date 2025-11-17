@@ -10,67 +10,181 @@ from .filter import Filter, map_filter_names, nice_filter_names
 
 
 
-
 @dataclass
 class PhotometryTable:
-    data: dict = field(default_factory=dict)                      # Dictionary of {band: flux}
-    region: object = None                                         # Region of sky (define externally or with shapely/sregions)
-    header: fits.Header = field(default_factory=fits.Header)      # FITS header (for WCS/area info)
+    """
+    Multi-region photometry container.
 
-    @property
+    data:
+        {
+            region_name : {
+                band_name : (flux, error)
+            }
+        }
+
+    header:
+        Global header — must include UNITS.
+        For Fλ conversion, must contain:
+            PIVOT_band = wavelength_Angstrom
+    """
+    data: dict = field(default_factory=dict)
+    header: fits.Header = field(default_factory=fits.Header)
+
+    # ==========================================================
+    # --- Conversion helpers (no astropy.units)
+    # ==========================================================
+
+    @staticmethod
+    def mJy_to_Jy(f_mJy):
+        return f_mJy * 1e-3
+
+    @staticmethod
+    def Jy_to_ABmag(f_Jy):
+        with np.errstate(divide="ignore"):
+            return -2.5 * np.log10(f_Jy) + 8.90
+
+    @staticmethod
+    def ABmag_error(f_Jy, df_Jy):
+        if df_Jy is None:
+            return None
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return 1.085736 * (df_Jy / f_Jy)
+
+    @staticmethod
+    def mJy_to_flam(f_mJy, wavelength_A):
+        c = 2.99792458e18  # Å/s
+        fnu = f_mJy * 1e-26
+        return fnu * c / (wavelength_A ** 2)
+
+    # ==========================================================
+    # --- Conversions (return NEW PhotometryTable)
+    # ==========================================================
+
     def to_ABmag(self):
-        if 'mJy' in self.header['units']:
-            for band in self.data.keys(): 
-                self.data[band] = self.mJy_to_ABmag(self.data[band])
+        """Convert ALL regions from mJy → AB mag."""
+        if self.header.get("UNITS", "").lower() != "mjy":
+            raise ValueError("Units must be mJy for ABmag conversion.")
 
-    def mJy_to_ABmag(self, flux_mJy):
-        flux_Jy = flux_mJy * 1e-3
-        with np.errstate(divide='ignore'):
-            mag = -2.5 * np.log10(flux_Jy) + 8.90
-        return mag
+        new_data = {}
 
-    """
-    def mJy_to_erg_s_cm2_A(self, flux_mJy, wavelength):
-        flux_Jy = flux_mJy * 1e-3  # Jy
-        fnu = flux_Jy * u.Jy
-        wav = wavelength * u.AA
-        flam = fnu.to(u.erg / u.s / u.cm**2 / u.AA, equivalencies=u.spectral_density(wav))
-        return flam.value
+        for region, region_dict in self.data.items():
+            new_data[region] = {}
 
-    def MJy_sr_to_erg_s_cm2_A_arcsec2(self, flux_MJy_sr, wavelength):
-        flux = flux_MJy_sr * u.MJy / u.sr
-        wav = wavelength * u.AA
-        flam = flux.to(u.erg / u.s / u.cm**2 / u.AA / u.arcsec**2, equivalencies=u.spectral_density(wav))
-        return flam.value
-    """
+            for band, (flux, err) in region_dict.items():
+                f_Jy = self.mJy_to_Jy(flux)
+                df_Jy = self.mJy_to_Jy(err) if err is not None else None
 
-    @property
-    def bands(self):
-        print(self.data.keys())
+                mag = self.Jy_to_ABmag(f_Jy)
+                mag_err = self.ABmag_error(f_Jy, df_Jy)
+
+                new_data[region][band] = (mag, mag_err)
+
+        new_header = self.header.copy()
+        new_header["UNITS"] = "ABMAG"
+
+        return PhotometryTable(new_data, new_header)
+
+    # ----------------------------------------------------------
+
+    def to_flam(self):
+        """Convert ALL regions from mJy → erg/s/cm²/Å."""
+        if self.header.get("UNITS", "").lower() != "mjy":
+            raise ValueError("Units must be mJy for Fλ conversion.")
+
+        new_data = {}
+
+        for region, region_dict in self.data.items():
+            new_data[region] = {}
+
+            for band, (flux, err) in region_dict.items():
+
+                pivot_key = f"PIVOT_{band}"
+                if pivot_key not in self.header:
+                    raise KeyError(f"Missing pivot wavelength: {pivot_key}")
+
+                wav = self.header[pivot_key]
+
+                flam = self.mJy_to_flam(flux, wav)
+                flam_err = self.mJy_to_flam(err, wav) if err is not None else None
+
+                new_data[region][band] = (flam, flam_err)
+
+        new_header = self.header.copy()
+        new_header["UNITS"] = "erg/s/cm2/A"
+
+        return PhotometryTable(new_data, new_header)
 
 
-    @property
-    def df(self):
-        """Return the photometric table as a DataFrame."""
-        df = pd.DataFrame.from_dict(self.data, orient='index', columns=['Value', 'Error'])
-        df.index.name = 'Band'
-        df['SNR'] = df['Value'] / df['Error']
-        return df
 
-    def print(self, phot_tables=None, nice_filter_names=None):
-        """
-        If phot_tables is None → return this object's DataFrame.
-        If phot_tables is a list → return a combined styled DataFrame.
-        """
-        # Case 1: behave like the old property
-        if phot_tables is None:
-            return self.df
+    # ==========================================================
+    # --- Printing utilities
+    # ==========================================================
 
-        # Case 2: combine multiple phot tables
-        return _print_photometric_tables(
-            photometric_tables_list=phot_tables,
-            nice_filters_name=nice_filter_names
+
+    def print(self, region=None, nice_filter_names=None):
+
+        if region: # prints single region
+            if region not in self.data:
+                raise KeyError(f"Region '{region}' not found.")
+
+            region_data = self.data[region]
+            df = pd.DataFrame.from_dict(region_data, orient="index",
+                                        columns=["Value", "Error"])
+            df.index.name = "Band"
+            df["SNR"] = df["Value"] / df["Error"]
+            return df
+        
+        # prints all regions
+
+        combined = {}
+        snr_map = {}
+
+        for region, region_dict in self.data.items():
+            df = pd.DataFrame.from_dict(region_dict, orient="index",
+                                        columns=["Value", "Error"])
+            df.index.name = "Band"
+            df["SNR"] = df["Value"] / df["Error"]
+
+            # rename filters if provided
+            if nice_filter_names:
+                df.index = [nice_filter_names.get(b, b) for b in df.index]
+
+            formatted = df.apply(
+                lambda row: f"{row['Value']:.3f} ± {row['Error']:.3f} ({row['SNR']:.1f})",
+                axis=1
+            )
+            combined[region] = formatted
+            snr_map[region] = df["SNR"]
+
+        result = pd.DataFrame(combined)
+        result.index.name = "Band"
+        snr_df = pd.DataFrame(snr_map, index=result.index)
+
+        def highlight(val, snr):
+            return "color: red" if snr <= 5 else ""
+
+        styled = result.style.apply(
+            lambda col: [highlight(v, s) for v, s in zip(col, snr_df[col.name])],
+            axis=0
         )
+
+        return styled
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     def to_fits(self, filename, tables=None):
@@ -137,8 +251,6 @@ class PhotometryTable:
         print(f"Written {len(tables)} photometry table(s) to {filename}")
 
 
-
-
     def from_fits(self, filename):
         """
         Load photometry data from a FITS file.
@@ -197,124 +309,4 @@ class PhotometryTable:
 
 
 
-
-
-
-
-def _print_photometric_tables(photometric_tables_list, nice_filters_name=None):
-    combined = {}
-    snr_dict = {}
-
-    for i, pt in enumerate(photometric_tables_list):
-        # Region label
-        if pt.region is not None and hasattr(pt.region, "name"):
-            region_label = f"Region {pt.region.name}"
-        else:
-            region_label = f"Region {i+1}"
-
-        # Copy the DataFrame
-        df = pt.df.copy()
-
-        # Rename bands if mapping provided
-        df.index = [nice_filter_names.get(b, b) for b in df.index]
-
-        # Format value ± error (SNR)
-        formatted = df.apply(
-            lambda row: f"{row['Value']:.3f} ± {row['Error']:.3f} ({row['SNR']:.1f})",
-            axis=1
-        )
-        combined[region_label] = formatted
-
-        # Keep SNR for styling
-        snr_dict[region_label] = df['SNR']
-
-    # Merge all into a DataFrame
-    result = pd.DataFrame(combined)
-    result.index.name = "Band"
-
-    # Create a DataFrame with the same shape for SNR
-    snr_df = pd.DataFrame(snr_dict, index=result.index)
-
-    # Style: red text if SNR <= 5
-    def highlight_low_snr(val, snr_val):
-        if snr_val <= 5:
-            return 'color: red'
-        return ''
-
-    df = result.style.apply(
-        lambda col: [highlight_low_snr(v, s) for v, s in zip(col, snr_df[col.name])],
-        axis=0
-    )
-
-    return df
-
-
-
-
-
-# --- Functions to read and to write PhotometryTable to fits
-
-def PhotometryTable_to_fits(filename, tables):
-
-    if not isinstance(tables, Iterable) or isinstance(tables, dict):
-        tables = [tables] 
-
-    hdul = fits.HDUList()
-    hdul.append(fits.PrimaryHDU())  # Empty primary HDU
-
-    for i, table in enumerate(tables):
-        # Convert photometry data to an astropy Table
-        data_dict = table.data
-        t = Table()
-        for band, value in data_dict.items():
-            t[band] = [value]  # Store as single-row table
-
-        # Create a BinTableHDU from the Table
-        hdu = fits.BinTableHDU(t)
-        
-        # Attach header from PhotometryTable (if any)
-        if table.header:
-            for key in table.header:
-                try:
-                    hdu.header[key] = table.header[key]
-                except Exception:
-                    pass  # Ignore any conflicts or FITS-invalid keywords
-
-        # Give the extension a name
-        hdu.name = f"PHOT_{i}" if len(tables) > 1 else "PHOTOMETRY"
-
-        hdul.append(hdu)
-
-    # Write to disk
-    hdul.writeto(filename, overwrite=True)
-    print(f"Written {len(tables)} photometry table(s) to {filename}")
-
-
-
-def fits_to_PhotometryTable(filename):
-
-    hdul = fits.open(filename)
-
-    phot_tables = []
-    for hdu in hdul[1:]:  # Skip primary HDU
-        if not isinstance(hdu, fits.BinTableHDU):
-            continue
-
-        tbl = Table(hdu.data)
-        if len(tbl) != 1:
-            raise ValueError("Each photometry table should contain exactly one row.")
-
-        # Extract data from the single row
-        data_dict = {col: tbl[col][0] for col in tbl.colnames}
-        phot_table = PhotometryTable(
-            data=data_dict,
-            header=hdu.header
-        )
-        phot_tables.append(phot_table)
-
-    hdul.close()
-
-    if len(phot_tables) == 1:
-        return phot_tables[0]
-    return phot_tables
 
