@@ -9,26 +9,26 @@ from astropy.io import fits
 from .filter import Filter, map_filter_names, nice_filter_names
 
 
-
 @dataclass
 class PhotometryTable:
-    """
-    Multi-region photometry container.
-
-    data:
-        {
-            region_name : {
-                band_name : (flux, error)
-            }
-        }
-
-    header:
-        Global header — must include UNITS.
-        For Fλ conversion, must contain:
-            PIVOT_band = wavelength_Angstrom
-    """
     data: dict = field(default_factory=dict)
     header: fits.Header = field(default_factory=fits.Header)
+
+    def check_units(self):
+        unit_keys = ("UNITS", "units", "BUNIT", "bunit")
+        units = next((self.header[k] for k in unit_keys if k in self.header), None)
+
+        if units is None:
+            raise ValueError("FITS header missing required unit keyword (UNITS/BUNIT).")
+
+        allowed = {"mjy", "jy", "erg/s/cm2/a", "magab", "abmag"}
+
+        if str(units).lower() not in allowed:
+            raise ValueError(f"Unsupported photometry units '{units}'. "
+                             f"Allowed: {', '.join(allowed)}.")
+        
+        return units
+        
 
     # ==========================================================
     # --- Conversion helpers (no astropy.units)
@@ -62,8 +62,9 @@ class PhotometryTable:
 
     def to_ABmag(self):
         """Convert ALL regions from mJy → AB mag."""
-        if self.header.get("UNITS", "").lower() != "mjy":
-            raise ValueError("Units must be mJy for ABmag conversion.")
+        units = self.check_units()
+        #if self.units != "mJy" or self.units != "mjy":
+        #    raise ValueError("Units must be mJy for ABmag conversion.")
 
         new_data = {}
 
@@ -88,8 +89,9 @@ class PhotometryTable:
 
     def to_flam(self):
         """Convert ALL regions from mJy → erg/s/cm²/Å."""
-        if self.header.get("UNITS", "").lower() != "mjy":
-            raise ValueError("Units must be mJy for Fλ conversion.")
+        units = self.check_units()
+        #if self.header.get("UNITS", "").lower() != "mjy":
+        #    raise ValueError("Units must be mJy for Fλ conversion.")
 
         new_data = {}
 
@@ -123,19 +125,27 @@ class PhotometryTable:
 
     def print(self, region=None, nice_filter_names=None):
 
+        units = self.check_units()
+
+
         if region: # prints single region
             if region not in self.data:
                 raise KeyError(f"Region '{region}' not found.")
 
             region_data = self.data[region]
             df = pd.DataFrame.from_dict(region_data, orient="index",
-                                        columns=["Value", "Error"])
-            df.index.name = "Band"
+                                        columns=[f"Value {units}", f"Error {units}"])
+            
+
+            # Replace index with nice names if available
+            if nice_filter_names:
+                df.index = [nice_filter_names.get(band, band) for band in df.index]
+                df.index.name = "Band"
+
             df["SNR"] = df["Value"] / df["Error"]
             return df
         
         # prints all regions
-
         combined = {}
         snr_map = {}
 
@@ -149,6 +159,7 @@ class PhotometryTable:
             if nice_filter_names:
                 df.index = [nice_filter_names.get(b, b) for b in df.index]
 
+            # format the main text
             formatted = df.apply(
                 lambda row: f"{row['Value']:.3f} ± {row['Error']:.3f} ({row['SNR']:.1f})",
                 axis=1
@@ -156,21 +167,31 @@ class PhotometryTable:
             combined[region] = formatted
             snr_map[region] = df["SNR"]
 
+        # Create MultiIndex for columns: first line = region, second line = units
+        columns = pd.MultiIndex.from_tuples(
+            [(region, f"[{units}]") for region in combined.keys()],
+            #names=["Region", "Units"]
+        )
         result = pd.DataFrame(combined)
-        result.index.name = "Band"
-        snr_df = pd.DataFrame(snr_map, index=result.index)
+        result.columns = columns
+        #result.index.name = "Band"
 
+        # Prepare SNR for styling
+        snr_df = pd.DataFrame(snr_map)#, index=result.index)
+
+        # Highlight cells with SNR <= 5
         def highlight(val, snr):
             return "color: red" if snr <= 5 else ""
 
         styled = result.style.apply(
-            lambda col: [highlight(v, s) for v, s in zip(col, snr_df[col.name])],
+            lambda col: [highlight(v, s) for v, s in zip(col, snr_df[col.name[0]])],
             axis=0
         )
 
+        # Add a caption on top (optional)
+        styled.set_caption(f"Measurements in units of {units}")
+
         return styled
-
-
 
 
 
@@ -209,47 +230,64 @@ class PhotometryTable:
 
         for i, pt in enumerate(tables):
 
-            # pt.data should be {band: (value, error)}
-            data_dict = pt.data
-
-            t = Table()
-            bands  = []
-            values = []
-            errors = []
-            snrs   = []
-
-            for band, (value, error) in data_dict.items():
-                bands.append(band)
-                values.append(value)
-                errors.append(error)
-                snrs.append(value / error if error else None)
-
-            t["BAND"]  = bands
-            t["VALUE"] = values
-            t["ERROR"] = errors
-            t["SNR"]   = snrs
-
-            hdu = fits.BinTableHDU(t)
-
-            if hasattr(pt, "header") and pt.header:
-                for key, val in pt.header.items():
-                    try:
-                        hdu.header[key] = val
-                    except Exception:
-                        pass  # skip invalid FITS keywords
-
-            if hasattr(pt, "region") and pt.region and hasattr(pt.region, "name"):
-                extname = f"PHOT_{pt.region.name}"
+            # Determine if data is nested or flat
+            first_val = next(iter(pt.data.values()))
+            if isinstance(first_val, dict):
+                # Nested: region_name -> band -> (value, error)
+                region_items = pt.data.items()
             else:
-                extname = f"PHOT_{i}"
+                # Flat: single region
+                region_items = [("1", pt.data)]
 
-            hdu.name = extname[:68]  # FITS name limit
+            for region_name, bands_dict in region_items:
+                t = Table()
+                bands = []
+                values = []
+                errors = []
+                snrs = []
 
-            hdul.append(hdu)
-            
+                for band, val in bands_dict.items():
+                    if isinstance(val, (tuple, list)):
+                        if len(val) >= 2:
+                            value, error = val[:2]
+                        elif len(val) == 1:
+                            value, error = val[0], None
+                        else:
+                            raise ValueError(f"Data for band '{band}' has unexpected length {len(val)}")
+                    else:
+                        value, error = val, None
+
+                    bands.append(band)
+                    values.append(value)
+                    errors.append(error)
+                    snrs.append(value / error if error else None)
+
+                t["BAND"]  = bands
+                t["VALUE"] = values
+                t["ERROR"] = errors
+                t["SNR"]   = snrs
+
+                hdu = fits.BinTableHDU(t)
+
+                # Copy header
+                if hasattr(pt, "header") and pt.header:
+                    for key, val in pt.header.items():
+                        try:
+                            hdu.header[key] = val
+                        except Exception:
+                            pass
+
+                # Extension name
+                if hasattr(pt, "region") and pt.region and hasattr(pt.region, "name"):
+                    extname = f"PHOT_{pt.region.name}"
+                else:
+                    extname = f"PHOT_{region_name}"
+
+                hdu.name = extname[:68]  # FITS name limit
+                hdul.append(hdu)
+
         hdul.writeto(filename, overwrite=True)
-        print(f"Written {len(tables)} photometry table(s) to {filename}")
-
+        print(f"Written {len(hdul)-1} photometry table(s) to {filename}")
 
     def from_fits(self, filename):
         """
@@ -308,5 +346,53 @@ class PhotometryTable:
             return phot_tables
 
 
+    def from_fits(self, filename):
+        """
+        Load photometry data from a FITS file.
 
+        - Fills self.data with a flat dict (single table) or nested dict (multiple regions).
+        - Always returns self.
+        """
+        hdul = fits.open(filename)
+        tables_list = []
 
+        for hdu in hdul[1:]:  # skip primary HDU
+            if not isinstance(hdu, fits.BinTableHDU):
+                continue
+
+            tbl = Table(hdu.data)
+
+            # reconstruct band → (value, error)
+            data = {band: (val, err) for band, val, err in zip(
+                tbl["BAND"], tbl["VALUE"], tbl["ERROR"]
+            )}
+
+            phot = PhotometryTable(data=data, header=dict(hdu.header))
+
+            # restore region from extension name
+            if hdu.name.startswith("PHOT_"):
+                region_name = hdu.name[5:]
+                if region_name:
+                    phot.region = type("RegionStub", (), {"name": region_name})()
+
+            tables_list.append(phot)
+
+        hdul.close()
+
+        if len(tables_list) == 1:
+            # single table → flat
+            single = tables_list[0]
+            self.data = single.data
+            self.header = single.header
+            if hasattr(single, "region"):
+                self.region = single.region
+        else:
+            # multiple tables → nested dict: region_name -> band -> (value, error)
+            self.data = {}
+            for pt in tables_list:
+                region_name = getattr(pt, "region", None)
+                region_name = region_name.name if region_name else f"R{len(self.data)+1}"
+                self.data[region_name] = pt.data
+            self.header = tables_list[0].header  # optional
+
+        return self

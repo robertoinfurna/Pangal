@@ -58,7 +58,7 @@ def photometry(self,
     # ---------------------------
     phot_table = PhotometryTable()
     phot_table.header['UNITS'] = units
-    phot_table.header["N_REGIONS"] = len(regions)
+    phot_table.header["N_REGS"] = len(regions)
 
 
     # record region names
