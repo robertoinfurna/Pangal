@@ -144,6 +144,7 @@ class Spectrum:
         x_units=None,   # e.g. 'A', 'nm', 'um', 'eV', 'Hz'
         y_units=None,   # e.g. 'erg/s/cm2/A', 'Jy', 'mJy'
         phot_points=None,
+        phot_region=None,
         synth_phot_points=None,
         spec_legend=None,
         show_phot_legend=True,
@@ -200,8 +201,9 @@ class Spectrum:
                     if flux_err is not None:
                         flux_err = flux_err * wl
 
-                # --- Plot window ---
-                z = spec.header.get('REDSHIFT', 0)
+                
+                z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
+
                 if line:
                     if line in spectral_lines:
                         center = spectral_lines[line] * (1 + z)
@@ -248,13 +250,19 @@ class Spectrum:
                 spec_handles.append(handle)
                 spec_labels.append(label)
 
-                
+
                 # --- Photometric points ---
                 if phot_points:
                     markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
                     phot_units = phot_points.header.get('units', 'mJy')
-                    for band in phot_points.data.keys():
-                        flux_val, flux_err_val = phot_points.data[band]
+
+                    if len(phot_points.data.keys()) == 1 and not phot_region:
+                        phot_region = list(phot_points.data.keys())[0]
+                    elif not phot_region:
+                        raise ValueError("Provide the ID of the region for the photometric points")
+                    
+                    for band in phot_points.data[phot_region].keys():
+                        flux_val, flux_err_val = phot_points.data[phot_region][band]
                         pivot_wl_A = Filter(band).pivot_wavelength
                         wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
                         flux_val_conv = self._convert_flux(flux_val, pivot_wl_A, phot_units, y_u, 'A')
@@ -269,8 +277,10 @@ class Spectrum:
                             fmt=marker, color='black', ecolor='black', capsize=2, markersize=6,
                             label=f"{nice_filter_names.get(band, band)} phot"
                         )
-                        band_handles[band] = h
-                        band_labels[band] = nice_filter_names.get(band, band)
+                        if x0 <= wl_plot <= x1:
+                            band_handles[band] = h
+                            band_labels[band] = nice_filter_names.get(band, band)
+
 
                 # --- Synthetic photometric points (larger, white-filled) ---
                 if synth_phot_points:
@@ -297,6 +307,7 @@ class Spectrum:
                         band_handles[band] = h
                         band_labels[band] = nice_filter_names.get(band, band)
 
+
             # --- Axis limits ---
             if zoom_on_line: log = False
             if log:
@@ -309,8 +320,17 @@ class Spectrum:
             ax.set_ylim(y0, y1)
 
             # --- Axis labels ---
-            ax.set_xlabel(f"Wavelength ({x_u})")
-            ax.set_ylabel(f"{'λFλ' if per_wavelength else 'Flux'} ({y_u})")
+            if x_u == 'A': 
+                unit_label = 'Å'
+            else:
+                unit_label = x_u 
+            ax.set_xlabel(f"Wavelength ({unit_label})")
+            ylabel = r"$\lambda \times F_\lambda$" if per_wavelength else "Flux"
+            if y_u == 'erg/s/cm2/A':
+                unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
+            else: unit_label = y_u
+            ax.set_ylabel(f"{ylabel} ({unit_label})")
+
 
             # --- Spectra legend ---
             if show_spec_legend:
@@ -327,11 +347,56 @@ class Spectrum:
                     else:
                         handles.append(h)
                 labels = list(band_labels.values())
-                ax.legend(handles, labels, title="Photometric bands", loc="center left",
-                        bbox_to_anchor=(1.02, 0.5), frameon=False)
+                ax.legend(
+                    handles, labels,
+                    title=f"Photometric bands: {phot_region or ''}",
+                    loc="center left",
+                    bbox_to_anchor=(1.02, 0.5),
+                    frameon=False
+                )
+
+
+
+            # --- Optionals ---
+
+            if show_H_lines:
+                for name in ['Lya','Ha','Hb','Hg','Hd']:
+                    wavelength = spectral_lines[name]
+                    wl_shift = self._angstrom_to_wl(wavelength * (1 + z), x_u)
+                    if wl_shift > x0 and wl_shift < x1:
+                        ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
+                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
+                        ax.text(wl_shift, 1.1 * fmax, name_map.get(name, name),
+                                rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
+                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
+            if show_all_spectral_lines:
+                for name, wavelength in spectral_lines.items():
+                    wavelength = spectral_lines[name]
+                    wl_shift = self._angstrom_to_wl(wavelength * (1 + z), x_u)
+                    if wl_shift > x0 and wl_shift < x1:
+                        ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
+                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
+                        ax.text(wl_shift, 1.1 * fmax, name_map.get(name, name),
+                                rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
+                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
+
+            if show_atmospheric_lines:
+                for name, wavelength in atmospheric_lines.items():
+                    wl_plot = self._angstrom_to_wl(wavelength, x_u)
+                    if wl_plot > x0 and wl_plot < x1:
+                        ax.axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
+                        ax.text(wl_plot, 1.1 * fmax, name, rotation=90, color='cyan',
+                                va="bottom", fontsize=9, ha='center', clip_on=True,
+                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
+
 
         plt.tight_layout(rect=[0,0,0.85,1])
         plt.show()
+
+
 
 
     # CONVERSION
@@ -452,6 +517,57 @@ class Spectrum:
         else:
             raise ValueError(f"Unsupported flux unit: {new_units}")
         
+
+
+    # --------------------------------------------------
+    # FITS EXPORT
+    # --------------------------------------------------
+    def to_fits(self, filename: str):
+        """
+        Save spectrum to a FITS file.
+        """
+        cols = []
+
+        if self.wl is not None:
+            cols.append(fits.Column(name="WAVELENGTH", format="D", array=self.wl))
+        if self.resolution is not None:
+            cols.append(fits.Column(name="RESOLUTION", format="D", array=self.resolution))
+        if self.flux is not None:
+            cols.append(fits.Column(name="FLUX", format="D", array=self.flux))
+        if self.flux_err is not None:
+            cols.append(fits.Column(name="FLUX_ERR", format="D", array=self.flux_err))
+
+        hdu = fits.BinTableHDU.from_columns(cols, header=self.header)
+
+        hdu.writeto(filename, overwrite=True)
+
+    # --------------------------------------------------
+    # FITS IMPORT
+    # --------------------------------------------------
+    def from_fits(self, filename: str):
+        """
+        Load spectrum from a FITS file.
+        Returns a new Spectrum instance.
+        """
+        with fits.open(filename) as hdul:
+            data = hdul[1].data
+            hdr = hdul[1].header
+
+            wl         = data["WAVELENGTH"] if "WAVELENGTH" in data.columns.names else None
+            resolution = data["RESOLUTION"] if "RESOLUTION" in data.columns.names else None
+            flux       = data["FLUX"]       if "FLUX"       in data.columns.names else None
+            flux_err   = data["FLUX_ERR"]   if "FLUX_ERR"   in data.columns.names else None
+
+            return Spectrum(
+                wl=np.array(wl) if wl is not None else None,
+                resolution=np.array(resolution) if resolution is not None else None,
+                flux=np.array(flux) if flux is not None else None,
+                flux_err=np.array(flux_err) if flux_err is not None else None,
+                header=hdr
+            )
+
+
+
 
 
 

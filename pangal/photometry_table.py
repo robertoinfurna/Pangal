@@ -123,7 +123,7 @@ class PhotometryTable:
     # ==========================================================
 
 
-    def print(self, region=None, nice_filter_names=None):
+    def print(self, region=None):
 
         units = self.check_units()
 
@@ -136,11 +136,8 @@ class PhotometryTable:
             df = pd.DataFrame.from_dict(region_data, orient="index",
                                         columns=[f"Value {units}", f"Error {units}"])
             
-
-            # Replace index with nice names if available
-            if nice_filter_names:
-                df.index = [nice_filter_names.get(band, band) for band in df.index]
-                df.index.name = "Band"
+            df.index = [nice_filter_names.get(band, band) for band in df.index]
+            df.index.name = "Band"
 
             df["SNR"] = df["Value"] / df["Error"]
             return df
@@ -346,6 +343,7 @@ class PhotometryTable:
             return phot_tables
 
 
+
     def from_fits(self, filename):
         """
         Load photometry data from a FITS file.
@@ -379,20 +377,20 @@ class PhotometryTable:
 
         hdul.close()
 
-        if len(tables_list) == 1:
+        #if len(tables_list) == 1:
             # single table → flat
-            single = tables_list[0]
-            self.data = single.data
-            self.header = single.header
-            if hasattr(single, "region"):
-                self.region = single.region
-        else:
-            # multiple tables → nested dict: region_name -> band -> (value, error)
-            self.data = {}
-            for pt in tables_list:
-                region_name = getattr(pt, "region", None)
-                region_name = region_name.name if region_name else f"R{len(self.data)+1}"
-                self.data[region_name] = pt.data
-            self.header = tables_list[0].header  # optional
+        #    single = tables_list[0]
+        #    self.data = single.data
+        #    self.header = single.header
+        #    if hasattr(single, "region"):
+        #        self.region = single.region
+        #else:
+        # multiple tables → nested dict: region_name -> band -> (value, error)
+        self.data = {}
+        for pt in tables_list:
+            region_name = getattr(pt, "region", None)
+            region_name = region_name.name if region_name else f"R{len(self.data)+1}"
+            self.data[region_name] = pt.data
+        self.header = tables_list[0].header  # optional
 
         return self

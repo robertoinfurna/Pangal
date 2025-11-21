@@ -119,7 +119,11 @@ class PFitter(): # Parametric fitter
     """
             
 
+    # MENAGANES COMPLEX PHOTOMETRIC TABLES FOR MULTIPLE OBJECTS.
+    # MENAGES COMPLEX SPECTRA
+
     def run_fit(self,
+                obj_id=None,
                 spec=None,
                 phot=None,
                 bands=None,
@@ -129,6 +133,55 @@ class PFitter(): # Parametric fitter
                 polymax=7,
                 nlive=500,
                 dlogz=0.01):
+        
+
+        
+        if phot and not spec:
+            if len(phot.data) == 1: 
+
+                return self._run_single_fit(
+                            obj_id=None,
+                            spec=None,
+                            phot=None,
+                            bands,
+                            spectral_range,
+                            fix_pars,
+                            custom_priors,
+                            polymax,
+                            nlive,
+                            dlogz)
+            
+            elif obj_id:
+
+
+
+
+
+                
+            
+
+        #if phot and not spec:
+
+
+        #if phot and spec:
+        
+
+            
+
+
+
+    # internal
+    def _run_single_fit(self,
+                obj_id,
+                spec,
+                phot,
+                bands,
+                spectral_range,
+                fix_pars,
+                custom_priors,
+                polymax,
+                nlive,
+                dlogz):
 
         # ------- safe copies for mutable inputs -------
         fix_pars = {} if fix_pars is None else dict(fix_pars)
@@ -163,14 +216,16 @@ class PFitter(): # Parametric fitter
             run.norm_wl = run.norm_flux = run.norm_flux_err = run.continuum = None
 
         # --- redshift and luminosity distance ---
-        if phot and hasattr(phot, 'header') and 'redshift' in phot.header:
-            run.redshift = phot.header['redshift']
-        elif spec and hasattr(spec, 'header') and 'redshift' in spec.header:
-            run.redshift = spec.header['redshift']
+        z_keys = ("REDSHIFT", "redshift", "z")
+        if phot and hasattr(phot, "header"):
+            run.redshift = next((phot.header[k] for k in z_keys if k in phot.header), None)
+        elif spec and hasattr(spec, "header"):
+            run.redshift = next((spec.header[k] for k in z_keys if k in spec.header), None)
         else:
+            run.redshift = None
+        if run.redshift is None:
             run.redshift = 0
             print("Redshift not provided; set to 0.")
-
         if phot and hasattr(phot, 'header') and 'dl' in phot.header:
             run.dl = phot.header['dl']
         elif spec and hasattr(spec, 'header') and 'dl' in spec.header:
@@ -214,6 +269,7 @@ class PFitter(): # Parametric fitter
         return run
 
 
+
     def make_log_likelihood(self, run, spec, phot, free_pars, bands):
         # precompute and attach to run for transparency
 
@@ -228,8 +284,8 @@ class PFitter(): # Parametric fitter
 
         # --- photometric precomputations ---
         if phot is not None:
-            run.phot_points = np.array([phot.data[b][0] for b in bands])
-            run.phot_errors = np.array([phot.data[b][1] for b in bands])
+            run.phot_points = np.array([phot.data[][b][0] for b in bands])
+            run.phot_errors = np.array([phot.data[][b][1] for b in bands])
             run.upper_lims = (run.phot_points / run.phot_errors < 5).astype(int)
 
             run.trans_mask = {}
