@@ -12,7 +12,9 @@ from .filter import Filter, map_filter_names, nice_filter_names
 @dataclass
 class PhotometryTable:
     data: dict = field(default_factory=dict)
+    redshifts: dict = field(default_factory=dict)  # e.g., {object_id: z}
     header: fits.Header = field(default_factory=fits.Header)
+
 
     def check_units(self):
         unit_keys = ("UNITS", "units", "BUNIT", "bunit")

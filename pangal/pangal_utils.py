@@ -29,9 +29,9 @@ from bisect import bisect_left
 
 from copy import deepcopy
 
-from ..image import Image
-from ..cube import Cube
-from ..region import Region, Point, Contours
+from .image import Image
+from .cube import Cube
+from .region import Region 
 
 # Area of one pixel in deg^2 or arcsec^2 
 def area_pixel(wcs,arcsec=False):

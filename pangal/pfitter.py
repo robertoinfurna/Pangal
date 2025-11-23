@@ -14,6 +14,7 @@ from dynesty import plotting as dyplot
 from dynesty.utils import resample_equal
 import corner
 
+from .photometry_table import PhotometryTable
 from .spectrum import Spectrum
 from .run import Run
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
@@ -119,13 +120,28 @@ class PFitter(): # Parametric fitter
     """
             
 
-    # MENAGANES COMPLEX PHOTOMETRIC TABLES FOR MULTIPLE OBJECTS.
-    # MENAGES COMPLEX SPECTRA
+    """
+    run_fit()
+        ├── crop + normalize obs spectrum
+        ├── setup parameters
+        ├── sampler = NestedSampler(log_likelihood, ...)
+        └── run sampler
+
+    make_log_likelihood()
+        ├── precompute resolution interpolation
+        ├── precompute photometry arrays
+        ├── precompute masks/transmission filters
+        ├── return log_likelihood()  # closure capturing the above
+    """
+            
+
+    # RUNS SINGLE PHIT
+    # IF phot contains more than one object, obj_id must be provided!
 
     def run_fit(self,
-                obj_id=None,
                 spec=None,
                 phot=None,
+                obj_id=None,
                 bands=None,
                 spectral_range=None,
                 fix_pars=None,
@@ -134,61 +150,7 @@ class PFitter(): # Parametric fitter
                 nlive=500,
                 dlogz=0.01):
         
-
-        
-        if phot and not spec:
-            if len(phot.data) == 1: 
-
-                return self._run_single_fit(
-                            obj_id=None,
-                            spec=None,
-                            phot=None,
-                            bands,
-                            spectral_range,
-                            fix_pars,
-                            custom_priors,
-                            polymax,
-                            nlive,
-                            dlogz)
-            
-            elif obj_id:
-
-
-
-
-
-                
-            
-
-        #if phot and not spec:
-
-
-        #if phot and spec:
-        
-
-            
-
-
-
-    # internal
-    def _run_single_fit(self,
-                obj_id,
-                spec,
-                phot,
-                bands,
-                spectral_range,
-                fix_pars,
-                custom_priors,
-                polymax,
-                nlive,
-                dlogz):
-
-        # ------- safe copies for mutable inputs -------
-        fix_pars = {} if fix_pars is None else dict(fix_pars)
-        custom_priors = {} if custom_priors is None else dict(custom_priors)
-
         run = Run()     # new Run container
-        run.pfitter = self
 
         # store user inputs
         run.spec = spec
@@ -196,6 +158,41 @@ class PFitter(): # Parametric fitter
         run.spectral_range = spectral_range
         run.polymax = polymax
         run.custom_priors = custom_priors
+        
+        if phot is not None:
+            if not isinstance(phot, PhotometryTable):
+                raise TypeError(
+                    f"'phot' must be a PhotometryTable instance, got {type(phot).__name__} instead."
+                )
+            if len(phot.data) == 1: run.obj_id = next(iter(phot.data))
+            # More than one object → obj_id is mandatory
+            else:
+                if  obj_id is None:
+                    raise ValueError(
+                        f"PhotometryTable contains multiple objects ({len(phot.data)}). "
+                        f"An obj_id must be provided."
+                    )
+                elif  obj_id is not None and obj_id not in phot.data.keys():
+                    raise ValueError(
+                        f"obj_id '{obj_id}' not found in photometry table."
+                    )
+                else: 
+                    run.obj_id = obj_id
+        if spec is not None:
+            if not isinstance(spec, Spectrum):
+                raise TypeError(
+                    f"'spec' must be a Spectrum instance, got {type(spec).__name__} instead."
+                )
+        if phot is None and spec is None:
+            raise ValueError(
+                "At least one of 'phot' or 'spec' must be provided."
+            )
+
+
+        # ------- safe copies for mutable inputs -------
+        fix_pars = {} if fix_pars is None else dict(fix_pars)
+        custom_priors = {} if custom_priors is None else dict(custom_priors)
+
 
         # --- bands selection ---
         if bands:
@@ -204,9 +201,10 @@ class PFitter(): # Parametric fitter
                     raise ValueError(f'Unrecognized filter: {b}. Abort')
             run.bands = list(bands)
         else:
-            run.bands = [b for b in phot.photometry.keys() if b in map_filter_names.keys()]
+            run.bands = [b for b in phot.data[run.obj_id].keys() if b in map_filter_names.keys()]
 
         print(f"Using the following photometric filters: {', '.join(run.bands)}")
+
 
         # --- preprocess observed spectrum once (done here) ---
         if spec is not None and spectral_range is not None:
@@ -216,16 +214,14 @@ class PFitter(): # Parametric fitter
             run.norm_wl = run.norm_flux = run.norm_flux_err = run.continuum = None
 
         # --- redshift and luminosity distance ---
-        z_keys = ("REDSHIFT", "redshift", "z")
-        if phot and hasattr(phot, "header"):
-            run.redshift = next((phot.header[k] for k in z_keys if k in phot.header), None)
-        elif spec and hasattr(spec, "header"):
-            run.redshift = next((spec.header[k] for k in z_keys if k in spec.header), None)
+        if phot and hasattr(phot, 'header') and 'redshift' in phot.header:
+            run.redshift = phot.header['redshift']
+        elif spec and hasattr(spec, 'header') and 'redshift' in spec.header:
+            run.redshift = spec.header['redshift']
         else:
-            run.redshift = None
-        if run.redshift is None:
             run.redshift = 0
             print("Redshift not provided; set to 0.")
+
         if phot and hasattr(phot, 'header') and 'dl' in phot.header:
             run.dl = phot.header['dl']
         elif spec and hasattr(spec, 'header') and 'dl' in spec.header:
@@ -233,16 +229,20 @@ class PFitter(): # Parametric fitter
         else:
             from astropy.cosmology import FlatLambdaCDM
             cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
-            run.dl = cosmo.luminosity_distance(run.redshift).value
+            run.dl = cosmo.luminosity_distance(run.redshift).value ### CHECK HERE!
 
         # ------- fix_pars handling (copy, don't mutate caller) -------
-        run.fix_pars = dict(fix_pars)  # safe copy
+        run.fix_pars = dict(fix_pars)                 # safe copy
 
         # If there is no spectrum, treat vel params as fixed/unavailable
         if spec is None:
             # do not mutate caller dict (we already copied)
             run.fix_pars.setdefault("vel_sys", None)
             run.fix_pars.setdefault("sigma_vel", None)
+            for par in ("vel_sys", "sigma_vel"):
+                if par in run.custom_priors:
+                    run.custom_priors.pop(par)
+                    print(f"Warning: Removed prior for '{par}' because no spectrum is provided.")
 
         # ------- build lists of free parameters (separate model and global) -------
         run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
@@ -269,7 +269,6 @@ class PFitter(): # Parametric fitter
         return run
 
 
-
     def make_log_likelihood(self, run, spec, phot, free_pars, bands):
         # precompute and attach to run for transparency
 
@@ -284,8 +283,8 @@ class PFitter(): # Parametric fitter
 
         # --- photometric precomputations ---
         if phot is not None:
-            run.phot_points = np.array([phot.data[][b][0] for b in bands])
-            run.phot_errors = np.array([phot.data[][b][1] for b in bands])
+            run.phot_points = np.array([phot.data[run.obj_id][b][0] for b in bands])
+            run.phot_errors = np.array([phot.data[run.obj_id][b][1] for b in bands])
             run.upper_lims = (run.phot_points / run.phot_errors < 5).astype(int)
 
             run.trans_mask = {}
@@ -776,18 +775,5 @@ class PFitter(): # Parametric fitter
         normalized_obs_err_for_likelihood = err_crop / continuum
 
         return normalized_obs_wl_for_likelihood, normalized_obs_flux_for_likelihood, normalized_obs_err_for_likelihood, continuum
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

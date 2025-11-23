@@ -26,10 +26,10 @@ from scipy.ndimage import gaussian_filter
 from scipy.interpolate import interp1d
 
 
-from ..image import Image
-from ..cube import Cube
-from ..region import Region, Point, Contours
-from ..filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
+from .image import Image
+from .cube import Cube
+from .region import Region 
+from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
 
 
 # INTERACTIVE SKY COORDS NOT WORKING!!
@@ -89,6 +89,54 @@ default_plot_scale_lims = {
     'herschel_pacs_70um': (10, 100), 'herschel_pacs_100um': (10, 100), 'herschel_pacs_160um': (10, 100)
 }
          
+
+
+            
+@dataclass
+class Point:
+    coords: tuple = None
+    color: str = 'white'
+    m: str = '+'
+    s: float = 50
+    caption: str = None
+    caption_fontsize: float = 12
+    caption_offset: tuple = (0.02,0.02)
+
+    target_bands: np.array=None      # List of bands where to plot point
+
+    def plot_aesthetic(self, color=None, m=None, s=None, caption=None, caption_fontsize=None):
+        self.color = color or self.color
+        self.m = m or self.m
+        self.s = s or self.s
+        self.caption = caption if caption is not None else self.caption
+        self.caption_fontsize = caption_fontsize or self.caption_fontsize
+        self.caption_offset = caption_fontsize or self.caption_offset
+
+@dataclass
+class Contours:
+    header: fits.Header = field(default_factory=fits.Header)  # FITS header 
+    image: np.ndarray=None                              # image to compute contours on 
+    wcs: WCS=None                                       # Astropy WCS object of the image
+    levels: np.array=None                               
+
+    target_bands: np.array=None                         # List of bands where to plot contours
+    
+    # aesthetic defaults for plotting
+    color: str = 'red'
+    linestyle: str = '-'
+    linewidth: float = 2
+    alpha: float = 1
+    label: str = None
+    clabel_fmt: str = None
+    clabel_fontsize: float = 12
+
+
+    def plot_aesthetic(self, color=None, linestyle=None, linewidth=None, alpha=None, label=None, clabel_fmt=None, clabel_fontsize=None):
+        for key, val in {'color': color, 'linestyle': linestyle, 'linewidth': linewidth, 'alpha': alpha,
+                         'label': label, 'clabel_fmt': clabel_fmt, 'clabel_fontsize': clabel_fontsize}.items():
+            setattr(self, key, val if val is not None else getattr(self, key))
+
+
 
 
 def plot(self,

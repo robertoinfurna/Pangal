@@ -28,12 +28,14 @@ from astropy import units as u
 
 from .image import Image
 from .cube import Cube
-from .region import Region, Point, Contours
+from .region import Region
 from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names, default_filter_colors
 
-from .plot import add_ra_dec_ticks
+from .plot import add_ra_dec_ticks, Point, Contours
 
 from .photometry_table import PhotometryTable
+
+
 
 def photometry(self,              
                regions,
@@ -62,12 +64,13 @@ def photometry(self,
 
 
     # record region names
-    region_names = []
+    region_names_list = []
     for i, reg in enumerate(regions):
         # use header ID if present, otherwise fallback
-        region_id = reg.header.get("ID", f"Region {i+1}")
-        region_names.append(region_id)
+        region_id = reg.header['ID']
+        region_names_list.append(region_id)
         phot_table.data[region_id] = {}   # empty dict for this region
+
 
     # ---------------------------
     # Photometry loop
@@ -229,7 +232,7 @@ def photometry(self,
             # SAVE RESULT INTO REGION ENTRY
             # ---------------------------
             out_band = base_band if exposure_id is None else f"{base_band}({exposure_id})"
-            region_name = region_names[r]
+            region_name = region_names_list[r]
 
             phot_table.data[region_name][out_band] = (
                 flux_sky_subtracted,
@@ -239,7 +242,7 @@ def photometry(self,
         if print_output:
             print('\n')
 
-        phot_table.header["REGIONS"] = ",".join(region_names)
+        phot_table.header["REGIONS"] = ",".join(region_names_list)
 
     return phot_table
     

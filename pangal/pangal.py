@@ -48,14 +48,13 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 from .image import Image
 from .cube import Cube
-from .region import Region, Point, Contours
+from .region import Region
 from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
 
-from .pangal_methods.plot import plot
-from .pangal_methods.photometry import photometry, surface_brightness_profile, inspect_photometry
+from .plot import plot, Point, Contours
+from .photometry import photometry, surface_brightness_profile, inspect_photometry
 
-from .pangal_methods.spectral_analysis import fit_lines
-from .pangal_methods.utils import area_pixel, dtheta_pixel, cut_and_rotate, correct_coords_offset, mosaic, MW_extinction
+from .pangal_utils import area_pixel, dtheta_pixel, cut_and_rotate, correct_coords_offset, mosaic, MW_extinction
 
 
 # usefull data
@@ -132,8 +131,7 @@ class PanGal:
     photometry = photometry
     inspect_photometry = inspect_photometry
     surface_brightness_profile = surface_brightness_profile
-    fit_lines = fit_lines
-
+    
         
     list_filters = list_filters    # lists all available filters    
     plot_filters = plot_filters

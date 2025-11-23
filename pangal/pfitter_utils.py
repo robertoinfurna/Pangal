@@ -3,7 +3,7 @@ import numpy as np
 import astropy
 from bisect import bisect_left
 from scipy.special import erf
-from scipy.interpolate import RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator, interp1d
 import itertools
 import os
 
@@ -16,14 +16,6 @@ from .image import Image
 from .spectrum import Spectrum
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
-
-import numpy as np
-import astropy
-from bisect import bisect_left
-from scipy.special import erf
-from scipy.interpolate import RegularGridInterpolator, interp1d
-import itertools
-import os
 
 
 # UTILS
