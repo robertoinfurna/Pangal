@@ -153,6 +153,7 @@ class PFitter(): # Parametric fitter
         run = Run()     # new Run container
 
         # store user inputs
+        run.pfitter = self
         run.spec = spec
         run.phot = phot
         run.spectral_range = spectral_range
@@ -213,23 +214,33 @@ class PFitter(): # Parametric fitter
         else:
             run.norm_wl = run.norm_flux = run.norm_flux_err = run.continuum = None
 
+
         # --- redshift and luminosity distance ---
-        if phot and hasattr(phot, 'header') and 'redshift' in phot.header:
-            run.redshift = phot.header['redshift']
-        elif spec and hasattr(spec, 'header') and 'redshift' in spec.header:
+        if (spec and hasattr(spec, 'header') and any(key in spec.header for key in ['redshift', 'REDSHIFT', 'z'])):
             run.redshift = spec.header['redshift']
+        elif (phot and hasattr(phot, 'header') and any(key in phot.header for key in ['redshift', 'REDSHIFT', 'z'])):
+            run.redshift = phot.header['redshift']
         else:
             run.redshift = 0
             print("Redshift not provided; set to 0.")
 
-        if phot and hasattr(phot, 'header') and 'dl' in phot.header:
-            run.dl = phot.header['dl']
-        elif spec and hasattr(spec, 'header') and 'dl' in spec.header:
+        if spec and hasattr(spec, 'header') and 'dl' in spec.header:
             run.dl = spec.header['dl']
+        elif phot and hasattr(phot, 'header') and 'dl' in phot.header:
+            run.dl = phot.header['dl']
         else:
-            from astropy.cosmology import FlatLambdaCDM
-            cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
-            run.dl = cosmo.luminosity_distance(run.redshift).value ### CHECK HERE!
+            if run.redshift > 0:
+                from astropy.cosmology import FlatLambdaCDM
+                cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
+                run.dl = cosmo.luminosity_distance(run.redshift).value  
+            else:
+                raise ValueError('redshift is zero! Provide distance')
+            ## distance as free value!!???
+
+
+        print(run.redshift)
+        print(run.dl)
+
 
         # ------- fix_pars handling (copy, don't mutate caller) -------
         run.fix_pars = dict(fix_pars)                 # safe copy
@@ -349,8 +360,9 @@ class PFitter(): # Parametric fitter
                                                 av=av, av_ext=av_ext, alpha=alpha,
                                                 m_star=m_star,
                                                 vel_sys=vel_sys, sigma_vel=sigma_vel,
-                                                redshift=0, dl=100,
-                                                observed_spectrum_resolution=run.obs_resolution_on_model_grid)
+                                                redshift=run.redshift, dl=run.dl,
+                                                observed_spectrum_resolution=run.obs_resolution_on_model_grid,
+                                                likelihood_call=True,)
 
             # ----------------- Photometric likelihood -----------------
             if phot is not None:
@@ -484,6 +496,7 @@ class PFitter(): # Parametric fitter
         sigma_vel=None,                      # LOS velocity dispersion [km/s]
         observed_spectrum_resolution=None,   # If provided (it's an array) builds the model spectrum to the required resolution
         multi_component=False,
+        likelihood_call=False,
         **kwargs,
     ):
         """
@@ -659,46 +672,52 @@ class PFitter(): # Parametric fitter
         fscale = 10**m_star / (dl * 1e5)**2
         total_spec *= fscale
 
-        # --- Build FITS header ---
-        header = fits.Header()
-        header["WUNITS"]  = "A"
-        header["FUNITS"]  = "erg/s/cm2/A"
-        header["REDSHIFT"] = (redshift, "Cosmological redshift")
-        header["VEL_SYS"]  = (vel_sys, "Systemic velocity [km/s]")
-        header["SIGMA_V"]  = (sigma_vel, "LOS velocity dispersion [km/s]")
-        header["AV"]       = (av, "V-band attenuation (old stars)")
-        header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
-        header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
-        header["ION_GAS"]  = (ion_gas, "Ionization parameter")
-        header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
-        header["ALPHA"]    = (alpha, "Dust heating parameter")
-        header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
-        header["DL_PC"]    = (dl, "Luminosity distance [pc]")
+        if not likelihood_call:
+            # --- Build FITS header ---
+            header = fits.Header()
+            header["WUNITS"]  = "A"
+            header["FUNITS"]  = "erg/s/cm2/A"
+            header["REDSHIFT"] = (redshift, "Cosmological redshift")
+            header["VEL_SYS"]  = (vel_sys, "Systemic velocity [km/s]")
+            header["SIGMA_V"]  = (sigma_vel, "LOS velocity dispersion [km/s]")
+            header["AV"]       = (av, "V-band attenuation (old stars)")
+            header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
+            header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
+            header["ION_GAS"]  = (ion_gas, "Ionization parameter")
+            header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
+            header["ALPHA"]    = (alpha, "Dust heating parameter")
+            header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
+            header["DL_PC"]    = (dl, "Luminosity distance [pc]")
 
-        # Add kwargs for traceability
-        for k, v in kwargs.items():
-            key = k[:8].upper()
-            try:
-                header[key] = v
-            except Exception:
-                header[key] = str(v)
+            # Add kwargs for traceability
+            for k, v in kwargs.items():
+                key = k[:8].upper()
+                try:
+                    header[key] = v
+                except Exception:
+                    header[key] = str(v)
 
-        # --- Create Spectrum object ---
-        spec = Spectrum(wl=model_red_wl, resolution=self.model_res, flux=total_spec, header=header)
+            # --- Create Spectrum object ---
+            spec = Spectrum(wl=model_red_wl, resolution=self.model_res, flux=total_spec, header=header)
 
-        if multi_component:
-            # Save components (rescaled to observed frame)
-            for s in [young_stellar_nebular_spec, old_stellar_nebular_spec,
-                    att_young_stellar_nebular_spec, att_old_stellar_nebular_spec, dust_spec]:
-                s /= (1 + redshift)
-                s *= fscale
-            spec.young_stellar_nebular = young_stellar_nebular_spec
-            spec.old_stellar_nebular   = old_stellar_nebular_spec
-            spec.att_young_stellar_nebular = att_young_stellar_nebular_spec
-            spec.att_old_stellar_nebular   = att_old_stellar_nebular_spec
-            spec.dust = dust_spec
+            if multi_component:
+                # Save components (rescaled to observed frame)
+                for s in [young_stellar_nebular_spec, old_stellar_nebular_spec,
+                        att_young_stellar_nebular_spec, att_old_stellar_nebular_spec, dust_spec]:
+                    s /= (1 + redshift)
+                    s *= fscale
+                spec.young_stellar_nebular = young_stellar_nebular_spec
+                spec.old_stellar_nebular   = old_stellar_nebular_spec
+                spec.att_young_stellar_nebular = att_young_stellar_nebular_spec
+                spec.att_old_stellar_nebular   = att_old_stellar_nebular_spec
+                spec.dust = dust_spec
 
-        return spec
+            return spec
+        
+        # likelihood call. Minimal
+        else: 
+            spec = Spectrum(wl=model_red_wl, flux=total_spec)
+            return spec
 
 
     def _losvd_rfft(self, vel, sigma, wl, npad=None, c=2.99792458e5):

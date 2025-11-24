@@ -10,6 +10,7 @@ from scipy.stats import norm as stat_norm
 from scipy.ndimage import gaussian_filter, median_filter
 from scipy.interpolate import interp1d
 from scipy.integrate import quad
+from scipy.signal import savgol_filter
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -127,6 +128,8 @@ class Spectrum:
         self,
         spectra=None,
         log=True,
+        normalized=False,
+        remove_continuum=False,
         per_wavelength=False,
         winf=None,
         wsup=None,
@@ -168,6 +171,13 @@ class Spectrum:
 
         cols = zoom_on_line if zoom_on_line else [None]
 
+
+        if normalized or remove_continuum or zoom_on_line:
+            phot_points = False
+            synth_phot_points = False
+
+
+
         for j, line in enumerate(cols):
             ax = axes[0, j]
             global_fmax = -np.inf
@@ -203,6 +213,7 @@ class Spectrum:
 
                 
                 z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
+                print(z)
 
                 if line:
                     if line in spectral_lines:
@@ -230,13 +241,41 @@ class Spectrum:
                     if spec_legend else None
                 ) or spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
 
+
+                # --- Plot spectrum ---
+
+                # optional normalizations
+
+                if normalized:
+                    
+                    normalization = np.median(flux) 
+
+                elif remove_continuum:
+                    # don't mutate outer flags; use local copies if needed
+                    per_wavelength = False
+                    log = False
+
+                    # Fit continuum only inside the plotting window (x0, x1)
+                    # Use deg=3 (or 1-4 depending on shape); sigma-clipping iter=6 recommended
+                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6,
+                                                    method='poly', fit_region=(x0, x1))
+                    normalization = continuum
+
+                else:
+                    normalization = 1
+
+
+                flux /= normalization
+                if flux_err is not None:
+                    flux_err /= normalization
+
                 mask = (wl >= x0) & (wl <= x1)
                 fmax = np.nanmax(flux[mask])
                 fmin = np.nanmin(flux[mask])
                 global_fmax = max(global_fmax, fmax)
                 global_fmin = min(global_fmin, fmin)
 
-                # --- Plot spectrum ---
+
                 if flux_err is not None:
                     handle = ax.errorbar(
                         wl, flux, yerr=flux_err, fmt='o', markersize=2,
@@ -250,36 +289,6 @@ class Spectrum:
                 spec_handles.append(handle)
                 spec_labels.append(label)
 
-
-                # --- Photometric points ---
-                if phot_points:
-                    markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
-                    phot_units = phot_points.header.get('units', 'mJy')
-
-                    if len(phot_points.data.keys()) == 1 and not phot_region:
-                        phot_region = list(phot_points.data.keys())[0]
-                    elif not phot_region:
-                        raise ValueError("Provide the ID of the region for the photometric points")
-                    
-                    for band in phot_points.data[phot_region].keys():
-                        flux_val, flux_err_val = phot_points.data[phot_region][band]
-                        pivot_wl_A = Filter(band).pivot_wavelength
-                        wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
-                        flux_val_conv = self._convert_flux(flux_val, pivot_wl_A, phot_units, y_u, 'A')
-                        flux_err_conv = self._convert_flux(flux_err_val, pivot_wl_A, phot_units, y_u, 'A')
-                        if per_wavelength:
-                            flux_val_conv *= wl_plot
-                            flux_err_conv *= wl_plot
-
-                        marker = next(markers)
-                        h = ax.errorbar(
-                            wl_plot, flux_val_conv, yerr=flux_err_conv,
-                            fmt=marker, color='black', ecolor='black', capsize=2, markersize=6,
-                            label=f"{nice_filter_names.get(band, band)} phot"
-                        )
-                        if x0 <= wl_plot <= x1:
-                            band_handles[band] = h
-                            band_labels[band] = nice_filter_names.get(band, band)
 
 
                 # --- Synthetic photometric points (larger, white-filled) ---
@@ -296,8 +305,8 @@ class Spectrum:
                         # pick marker
                         marker = next(markers)
                         h = ax.scatter(
-                            wl_plot, flux_val,
-                            s=80,                # bigger marker size
+                            wl_plot, flux_val/normalization,
+                            s=200,               # bigger marker size
                             facecolors='white',  # hollow center
                             edgecolors='black',  # black edge
                             marker=marker,
@@ -306,6 +315,39 @@ class Spectrum:
                         )
                         band_handles[band] = h
                         band_labels[band] = nice_filter_names.get(band, band)
+
+
+            # --- Photometric points ---
+            if phot_points:
+                markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
+                phot_units = phot_points.header.get('units', 'mJy')
+
+                if len(phot_points.data.keys()) == 1 and not phot_region:
+                    phot_region = list(phot_points.data.keys())[0]
+                elif not phot_region:
+                    raise ValueError("Provide the ID of the region for the photometric points")
+                
+                for band in phot_points.data[phot_region].keys():
+                    flux_val, flux_err_val = phot_points.data[phot_region][band]
+                    pivot_wl_A = Filter(band).pivot_wavelength
+                    wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
+                    flux_val_conv = self._convert_flux(flux_val, pivot_wl_A, phot_units, y_u, 'A')
+                    flux_err_conv = self._convert_flux(flux_err_val, pivot_wl_A, phot_units, y_u, 'A')
+                    if per_wavelength:
+                        flux_val_conv *= wl_plot
+                        flux_err_conv *= wl_plot
+
+                    marker = next(markers)
+                    h = ax.errorbar(
+                        wl_plot, flux_val_conv, yerr=flux_err_conv,
+                        fmt=marker, color='black', ecolor='black', capsize=2, markersize=6,
+                        label=f"{nice_filter_names.get(band, band)} phot"
+                    )
+                    if x0 <= wl_plot <= x1:
+                        band_handles[band] = h
+                        band_labels[band] = nice_filter_names.get(band, band)
+
+
 
 
             # --- Axis limits ---
@@ -330,6 +372,8 @@ class Spectrum:
                 unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
             else: unit_label = y_u
             ax.set_ylabel(f"{ylabel} ({unit_label})")
+            if normalized: 
+                ax.set_ylabel("arbitrary units")
 
 
             # --- Spectra legend ---
@@ -354,6 +398,9 @@ class Spectrum:
                     bbox_to_anchor=(1.02, 0.5),
                     frameon=False
                 )
+
+
+
 
 
 
@@ -567,7 +614,104 @@ class Spectrum:
             )
 
 
+    
 
+    def _fit_continuum(self, wl, flux, deg=3, sigma=2.0, iters=5, method='poly',
+                    fit_region=None, savgol_window=301, savgol_polyorder=3):
+        """
+        Estimate continuum, optionally using only data inside fit_region.
+
+        Parameters
+        ----------
+        wl, flux : 1D arrays (floats)
+        deg : polynomial degree (for method='poly')
+        sigma, iters : sigma-clipping params
+        method : 'poly' or 'savgol' (percentile method could be added)
+        fit_region : tuple (xmin, xmax) or None. If provided, the iterative mask
+                    uses only wl inside that region to determine the continuum fit.
+                    The returned continuum is an array for the whole wl array.
+        """
+        wl = np.asarray(wl, dtype=float)
+        flux = np.asarray(flux, dtype=float)
+
+        # Basic finite-data mask
+        good = np.isfinite(wl) & np.isfinite(flux)
+        if not np.any(good):
+            raise ValueError("No finite points in wl/flux")
+
+        mask = good.copy()
+
+        # If user requested a fit region, restrict the clipping/fitting to that region
+        if fit_region is not None:
+            xmin, xmax = fit_region
+            region_mask = (wl >= xmin) & (wl <= xmax)
+        else:
+            region_mask = np.ones_like(wl, dtype=bool)
+
+        # Start with mask restricted to the region (and finite points)
+        mask = mask & region_mask
+
+        # Iterative sigma clipping done only inside the region
+        for _ in range(iters):
+            if mask.sum() < (deg + 1):  # not enough points to fit
+                break
+            x_fit = wl[mask]
+            y_fit = flux[mask]
+            # scale x for numeric stability
+            x_mean = x_fit.mean()
+            x_std = x_fit.std() if x_fit.std() > 0 else 1.0
+            x_scaled = (x_fit - x_mean) / x_std
+
+            if method == 'poly':
+                try:
+                    coeffs = np.polyfit(x_scaled, y_fit, deg)
+                    cont_est = np.polyval(coeffs, (wl - x_mean) / x_std)
+                except np.linalg.LinAlgError:
+                    cont_est = np.median(y_fit) * np.ones_like(flux)
+            elif method == 'savgol':
+                # savgol doesn't use masking directly, so compute a rough cont then clip
+                w = int(savgol_window)
+                if w % 2 == 0: w += 1
+                w = min(w, max(3, len(flux) - (1 - len(flux) % 2)))
+                cont_est = savgol_filter(flux, window_length=w, polyorder=savgol_polyorder, mode='interp')
+            else:
+                raise ValueError("Unsupported method")
+
+            resid = flux - cont_est
+            resid_mask = np.abs(resid - np.nanmedian(resid[mask])) < sigma * (np.nanstd(resid[mask]) if np.nanstd(resid[mask])>0 else 1.0)
+
+            # keep only points that are good, inside the region, and not strong deviant
+            new_mask = good & region_mask & resid_mask
+            # If no change, break
+            if np.array_equal(new_mask, mask):
+                break
+            mask = new_mask
+
+        # Final continuum: refit using final mask (if polynomial) or reuse cont_est (if savgol)
+        if method == 'poly':
+            if mask.sum() < (deg + 1):
+                # fallback to median in region
+                cont = np.median(flux[region_mask & good]) * np.ones_like(flux)
+            else:
+                x_fit = wl[mask]
+                y_fit = flux[mask]
+                x_mean = x_fit.mean(); x_std = x_fit.std() if x_fit.std()>0 else 1.0
+                coeffs = np.polyfit((x_fit - x_mean) / x_std, y_fit, deg)
+                cont = np.polyval(coeffs, (wl - x_mean) / x_std)
+        else:  # savgol
+            w = int(savgol_window)
+            if w % 2 == 0: w += 1
+            w = min(w, max(3, len(flux) - (1 - len(flux) % 2)))
+            cont = savgol_filter(flux, window_length=w, polyorder=savgol_polyorder, mode='interp')
+
+        # avoid zeros / negative continuum
+        pos = cont > 0
+        if not np.any(pos):
+            cont = np.ones_like(cont) * np.nanmedian(flux[good])
+        else:
+            cont[~pos] = np.nanmedian(cont[pos])
+
+        return cont
 
 
 
