@@ -102,7 +102,9 @@ class Run:
             "alpha": r"$\alpha$",
             "m_star": r"$\log M_\star$",
             "vel_sys": r"$v\ \mathrm{[km/s]}$",
-            "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$"
+            "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
+            "redshift": r'redshift',
+            "luminosity_distance": r'luminosity distance',
         }
 
         labels = [latex_labels.get(p, p) for p in self.free_pars]
@@ -194,11 +196,9 @@ class Run:
 
         # --- Build synthetic spectrum ---
         synth_spec = self.pfitter.synthetic_spectrum(**best_params,
-                                                    redshift=0,
-                                                    dl=100,
                                                     observed_spectrum_resolution=getattr(self, 'obs_resolution_on_model_grid', None))
 
         return synth_spec, best_params
     
-    #def summary_plot():
-    #    synth_spec, best_params = 
+
+    

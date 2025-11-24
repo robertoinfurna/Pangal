@@ -211,9 +211,9 @@ class Spectrum:
                     if flux_err is not None:
                         flux_err = flux_err * wl
 
-                
+                # pass from outside???
                 z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
-                print(z)
+    
 
                 if line:
                     if line in spectral_lines:
@@ -357,7 +357,8 @@ class Spectrum:
                 ax.set_yscale('log')
 
             y0 = ymin if ymin is not None else (0.8 * global_fmin if global_fmin > 0 else 1e-4 * global_fmax)
-            y1 = ymax if ymax is not None else 2 * global_fmax
+            #y_axis_factor = 1.1 if remove_continuum else 2
+            y1 = ymax if ymax is not None else 1.2 * global_fmax
             ax.set_xlim(x0, x1)
             ax.set_ylim(y0, y1)
 

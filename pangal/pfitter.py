@@ -214,7 +214,7 @@ class PFitter(): # Parametric fitter
         else:
             run.norm_wl = run.norm_flux = run.norm_flux_err = run.continuum = None
 
-
+        """
         # --- redshift and luminosity distance ---
         if (spec and hasattr(spec, 'header') and any(key in spec.header for key in ['redshift', 'REDSHIFT', 'z'])):
             run.redshift = spec.header['redshift']
@@ -236,10 +236,7 @@ class PFitter(): # Parametric fitter
             else:
                 raise ValueError('redshift is zero! Provide distance')
             ## distance as free value!!???
-
-
-        print(run.redshift)
-        print(run.dl)
+        """
 
 
         # ------- fix_pars handling (copy, don't mutate caller) -------
@@ -259,7 +256,7 @@ class PFitter(): # Parametric fitter
         run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
 
         global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                    "alpha", "m_star", "vel_sys", "sigma_vel"]
+                    "alpha", "m_star", "vel_sys", "sigma_vel", "luminosity_distance", "redshift"]
         run.free_global_pars = [p for p in global_pars if p not in run.fix_pars]
 
         run.free_pars = run.free_model_pars + run.free_global_pars
@@ -334,7 +331,7 @@ class PFitter(): # Parametric fitter
 
             # ---- GLOBAL / NAMED PARAMETERS ----
             named_order = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                        "alpha", "m_star", "vel_sys", "sigma_vel"]
+                        "alpha", "m_star", "vel_sys", "sigma_vel","luminosity_distance","redshift"]
             named_values = {}
             for name in named_order:
                 if name in run.fix_pars:
@@ -353,6 +350,8 @@ class PFitter(): # Parametric fitter
             m_star = named_values["m_star"]
             vel_sys = named_values["vel_sys"]
             sigma_vel = named_values["sigma_vel"]
+            luminosity_distance = named_values["luminosity_distance"]
+            redshift = named_values["redshift"]
 
             # --- Build synthetic spectrum (pass run.obs_resolution_on_model_grid) ---
             synth_spec = self.synthetic_spectrum(**model_kwargs,
@@ -360,7 +359,8 @@ class PFitter(): # Parametric fitter
                                                 av=av, av_ext=av_ext, alpha=alpha,
                                                 m_star=m_star,
                                                 vel_sys=vel_sys, sigma_vel=sigma_vel,
-                                                redshift=run.redshift, dl=run.dl,
+                                                luminosity_distance=luminosity_distance,
+                                                redshift=redshift,
                                                 observed_spectrum_resolution=run.obs_resolution_on_model_grid,
                                                 likelihood_call=True,)
 
@@ -446,6 +446,8 @@ class PFitter(): # Parametric fitter
             'm_star':  {'type': 'uniform', 'low': 7.0, 'high': 11.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
+            'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
+            'redshift': {'type': 'uniform', 'low': 0, 'high': 6},               
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
@@ -491,7 +493,7 @@ class PFitter(): # Parametric fitter
         alpha,
         m_star,
         redshift,
-        dl,
+        luminosity_distance,
         vel_sys=None,                        # systemic velocity [km/s]
         sigma_vel=None,                      # LOS velocity dispersion [km/s]
         observed_spectrum_resolution=None,   # If provided (it's an array) builds the model spectrum to the required resolution
@@ -521,8 +523,8 @@ class PFitter(): # Parametric fitter
             Logarithmic stellar mass of the galaxy (log₁₀[M*/M☉]).
         redshift : float
             Cosmological redshift of the galaxy.
-        dl : float
-            Luminosity distance to the galaxy in parsecs (used for flux scaling).
+        luminosity_distance : float
+            Luminosity distance to the galaxy in Mpc (used for flux scaling).
         vel_sys : float, optional
             Systemic velocity offset [km/s], adds an extra Doppler shift to the spectrum.
         sigma_vel : float, optional
@@ -669,7 +671,7 @@ class PFitter(): # Parametric fitter
 
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
-        fscale = 10**m_star / (dl * 1e5)**2
+        fscale = 10**m_star / (luminosity_distance * 1e5)**2
         total_spec *= fscale
 
         if not likelihood_call:
@@ -687,7 +689,7 @@ class PFitter(): # Parametric fitter
             header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
             header["ALPHA"]    = (alpha, "Dust heating parameter")
             header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
-            header["DL_PC"]    = (dl, "Luminosity distance [pc]")
+            header["DL_PC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
 
             # Add kwargs for traceability
             for k, v in kwargs.items():
