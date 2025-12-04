@@ -150,6 +150,11 @@ class PFitter(): # Parametric fitter
                 nlive=500,
                 dlogz=0.01):
         
+
+        # ------- safe copies for mutable inputs -------
+        fix_pars = {} if fix_pars is None else dict(fix_pars)
+        custom_priors = {} if custom_priors is None else dict(custom_priors)
+        
         run = Run()     # new Run container
 
         # store user inputs
@@ -157,6 +162,8 @@ class PFitter(): # Parametric fitter
         run.spec = spec
         run.phot = phot
         run.spectral_range = spectral_range
+        run.nlive = nlive
+        run.dlogz = dlogz
         run.polymax = polymax
         run.custom_priors = custom_priors
         
@@ -180,6 +187,8 @@ class PFitter(): # Parametric fitter
                 else: 
                     run.obj_id = obj_id
         if spec is not None:
+            if not spectral_range:
+                raise ValueError('Provide spectral range')
             if not isinstance(spec, Spectrum):
                 raise TypeError(
                     f"'spec' must be a Spectrum instance, got {type(spec).__name__} instead."
@@ -188,12 +197,6 @@ class PFitter(): # Parametric fitter
             raise ValueError(
                 "At least one of 'phot' or 'spec' must be provided."
             )
-
-
-        # ------- safe copies for mutable inputs -------
-        fix_pars = {} if fix_pars is None else dict(fix_pars)
-        custom_priors = {} if custom_priors is None else dict(custom_priors)
-
 
         # --- bands selection ---
         if bands:
@@ -238,9 +241,7 @@ class PFitter(): # Parametric fitter
             ## distance as free value!!???
         """
 
-
-        # ------- fix_pars handling (copy, don't mutate caller) -------
-        run.fix_pars = dict(fix_pars)                 # safe copy
+        run.fix_pars = dict(fix_pars) ##??? HERE, OR ON THE TOP?
 
         # If there is no spectrum, treat vel params as fixed/unavailable
         if spec is None:
@@ -406,10 +407,10 @@ class PFitter(): # Parametric fitter
                 flux_obs = run.norm_flux
                 err_obs = run.norm_flux_err
 
-                # interpolate model to observed wl (use interp1d so we can extrapolate if needed)
+                # interpolate NORMALIZED model to observed wl (use interp1d so we can extrapolate if needed)
                 interp_model = interp1d(synth_spec.wl, synth_spec.flux, kind='linear',
                                         bounds_error=False, fill_value='extrapolate')
-                model_flux_interp = interp_model(wl_obs)
+                model_flux_interp = interp_model(wl_obs) 
 
                 # remove continuum from model with same polynomial degree used on observed data
                 coeff_model = np.polyfit(wl_obs, model_flux_interp, deg=run.polymax)
@@ -482,6 +483,9 @@ class PFitter(): # Parametric fitter
             return x
 
         return prior_transform
+
+
+
 
     def synthetic_spectrum(
         self,
@@ -689,7 +693,7 @@ class PFitter(): # Parametric fitter
             header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
             header["ALPHA"]    = (alpha, "Dust heating parameter")
             header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
-            header["DL_PC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
+            header["DL_MPC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
 
             # Add kwargs for traceability
             for k, v in kwargs.items():
@@ -713,6 +717,8 @@ class PFitter(): # Parametric fitter
                 spec.att_young_stellar_nebular = att_young_stellar_nebular_spec
                 spec.att_old_stellar_nebular   = att_old_stellar_nebular_spec
                 spec.dust = dust_spec
+
+
 
             return spec
         
