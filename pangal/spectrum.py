@@ -120,38 +120,55 @@ class Spectrum:
         header = fits.Header()
         header['units'] = units
 
-        return PhotometryTable(data=data, header=header)
+        return PhotometryTable(data={"0":data}, header=header)
     
    
 
     def plot(
         self,
         spectra=None,
+
+
+        # main
         log=True,
         normalized=False,
         remove_continuum=False,
+        draw_continuum=False,
         per_wavelength=False,
+
+        # units
+        x_units=None,   # e.g. 'A', 'nm', 'um', 'eV', 'Hz'
+        y_units=None,   # e.g. 'erg/s/cm2/A', 'Jy', 'mJy'
+        
+        # plotting window
         winf=None,
         wsup=None,
         ymin=None,
         ymax=None,
         zoom_on_line=None,
+        
+        # aestethics
+        figsize=None,
         color=None,
         ecolor='green',
         show_snr=False,
-        show_filters=False,
+        
+        # optionals
+        redshift=None,
         show_H_lines=False,
         show_all_spectral_lines=False,
         show_atmospheric_lines=False,
-        figsize=None,
-        x_units=None,   # e.g. 'A', 'nm', 'um', 'eV', 'Hz'
-        y_units=None,   # e.g. 'erg/s/cm2/A', 'Jy', 'mJy'
+        show_filters=False,
+        
+
         phot_points=None,
         phot_region=None,
         synth_phot_points=None,
-        spec_legend=None,
+        spec_legend_pars=None,
         show_phot_legend=True,
         show_spec_legend=True,
+        spec_legend_loc="upper left",
+        spec_legend_title=None,
     ):
 
         # --- Prepare spectra list ---
@@ -211,8 +228,13 @@ class Spectrum:
                     if flux_err is not None:
                         flux_err = flux_err * wl
 
-                # pass from outside???
-                z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
+                if redshift:
+                    z = redshift
+                else:
+                    z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
+                    if "vel_sys" in spec.header: 
+                        v_sys = spec.header["vel_sys"]
+                        z += v_sys / 2.99792458e5
     
 
                 if line:
@@ -236,10 +258,19 @@ class Spectrum:
                     c = color
 
                 # --- Label ---
-                label = (
-                    ", ".join(f"{spec_legend[k]}={spec.header[k]}" for k in spec_legend if k in spec.header)
-                    if spec_legend else None
-                ) or spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
+                if isinstance(spec_legend_pars, str):
+                    label = spec.header[spec_legend_pars]
+
+                elif isinstance(spec_legend_pars, dict):
+                    label = ", ".join(
+                        f"{spec_legend_pars[k][0]}={spec.header[k]} {spec_legend_pars[k][1]}"
+                        for k in spec_legend_pars
+                        if k in spec.header
+                    )
+
+                else:
+                    label = spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
+
 
 
                 # --- Plot spectrum ---
@@ -248,7 +279,7 @@ class Spectrum:
 
                 if normalized:
                     
-                    normalization = np.median(flux) 
+                    normalization = np.median(flux) #### FIX HERE!!!
 
                 elif remove_continuum:
                     # don't mutate outer flags; use local copies if needed
@@ -285,6 +316,12 @@ class Spectrum:
                     )
                 else:
                     handle = ax.plot(wl, flux, color=c, lw=1, label=label)[0]
+
+
+                if draw_continuum:
+                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6,
+                                method='poly', fit_region=(x0, x1))
+                    ax.plot(wl,continuum,color='black',label='continuum deg 7')
 
                 spec_handles.append(handle)
                 spec_labels.append(label)
@@ -358,7 +395,7 @@ class Spectrum:
 
             y0 = ymin if ymin is not None else (0.8 * global_fmin if global_fmin > 0 else 1e-4 * global_fmax)
             #y_axis_factor = 1.1 if remove_continuum else 2
-            y1 = ymax if ymax is not None else 1.2 * global_fmax
+            y1 = ymax if ymax is not None else 1.4 * global_fmax
             ax.set_xlim(x0, x1)
             ax.set_ylim(y0, y1)
 
@@ -373,13 +410,13 @@ class Spectrum:
                 unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
             else: unit_label = y_u
             ax.set_ylabel(f"{ylabel} ({unit_label})")
-            if normalized: 
+            if normalized or remove_continuum: 
                 ax.set_ylabel("arbitrary units")
 
 
             # --- Spectra legend ---
             if show_spec_legend:
-                ax.legend(spec_handles, spec_labels, title="Spectra", loc="upper left", frameon=False)
+                ax.legend(spec_handles, spec_labels, title=spec_legend_title, loc=spec_legend_loc, frameon=False)
 
             # --- Phot legend ---
             if zoom_on_line: show_phot_legend = False
@@ -399,6 +436,9 @@ class Spectrum:
                     bbox_to_anchor=(1.02, 0.5),
                     frameon=False
                 )
+                #???
+                #if spec_legend is not None:
+                #    ax.add_artist(spec_legend)
 
 
 
@@ -414,7 +454,7 @@ class Spectrum:
                     if wl_shift > x0 and wl_shift < x1:
                         ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
                         name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                        ax.text(wl_shift, 1.1 * fmax, name_map.get(name, name),
+                        ax.text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
                                 rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
@@ -425,7 +465,7 @@ class Spectrum:
                     if wl_shift > x0 and wl_shift < x1:
                         ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
                         name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                        ax.text(wl_shift, 1.1 * fmax, name_map.get(name, name),
+                        ax.text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
                                 rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
@@ -435,7 +475,7 @@ class Spectrum:
                     wl_plot = self._angstrom_to_wl(wavelength, x_u)
                     if wl_plot > x0 and wl_plot < x1:
                         ax.axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
-                        ax.text(wl_plot, 1.1 * fmax, name, rotation=90, color='cyan',
+                        ax.text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
                                 va="bottom", fontsize=9, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
