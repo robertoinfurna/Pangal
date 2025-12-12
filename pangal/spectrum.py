@@ -66,8 +66,11 @@ class Spectrum:
 
     # Given a spectrum and a set of filters, it does the convolution with the transmission curve 
     def get_phot(self, 
-                bands,
-                units='erg/s/cm2/A'):
+                bands=None,
+                units='erg/s/cm2/A',
+                for_likelihood=False,
+                run=None,
+                ):
         """
         Computes synthetic photometric points from a spectrum and a list of bands.
 
@@ -75,8 +78,6 @@ class Spectrum:
         ----------
         bands : list
             List of band names (e.g., ['g', 'r', 'i']).
-        filters : dict
-            Optional preloaded Filter objects to speed up processing.
         units : str
             Desired output flux units (e.g., 'erg/s/cm2/A' or 'mJy').
 
@@ -85,43 +86,69 @@ class Spectrum:
         The internal integration is always done in erg/s/cm²/Å and Å.
         The output is then converted to the requested `units`.
         """
+        if for_likelihood is False:
 
-        invalid = [b for b in bands if b not in map_filter_names]
-        if invalid:
-            raise ValueError(f"Unrecognized filters: {', '.join(invalid)}")
+            invalid = [b for b in bands if b not in map_filter_names]
+            if invalid:
+                raise ValueError(f"Unrecognized filters: {', '.join(invalid)}")
 
-        # Normalize units before interpolation
-        self.convert_units(new_wl_units='A', new_flux_units='erg/s/cm2/A')
+            # Normalize units before interpolation
+            self.convert_units(new_wl_units='A', new_flux_units='erg/s/cm2/A')
 
 
 
-        spec_func = interp1d(self.wl, self.flux, bounds_error=False, fill_value=0.0)
-        data = {}
+            spec_func = interp1d(self.wl, self.flux, bounds_error=False, fill_value=0.0)
+            data = {}
 
-        for b in bands:
-            filter = Filter(b) 
-            trans_curve = filter.transmission_curve
-            lmin, lmax = filter.wavelength_range
+            for b in bands:
+                filter = Filter(b) 
+                trans_curve = filter.transmission_curve
+                lmin, lmax = filter.wavelength_range
 
-            num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l), lmin, lmax)
-            norm_int, _ = quad(lambda l: trans_curve(l), lmin, lmax)
+                num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l), lmin, lmax)
+                norm_int, _ = quad(lambda l: trans_curve(l), lmin, lmax)
 
-            phot_point = num_int / norm_int
-            pivot_w = filter.pivot_wavelength  # in Å
+                phot_point = num_int / norm_int
+                pivot_w = filter.pivot_wavelength  # in Å
 
-            # Convert to requested output units if needed
-            if units == 'mJy':
-                # Convert erg/s/cm²/Å → mJy using Fν = Fλ * λ² / c
+                # Convert to requested output units if needed
+                if units == 'mJy':
+                    # Convert erg/s/cm²/Å → mJy using Fν = Fλ * λ² / c
+                    c = 2.99792458e18  # Å/s
+                    phot_point = phot_point * pivot_w**2 / c / 1e-26
+
+                data[b] = (phot_point, np.nan)
+
+            header = fits.Header()
+            header['units'] = units
+
+            return PhotometryTable(data={"0":data}, header=header)
+        
+
+        # FOR LIKELIHOOD! self is the synthetic spectrum!
+        else: 
+
+            model_phot = []
+            for b in run.bands:
+                mask_b = run.trans_mask[b]
+                spec_array = self.flux[mask_b]
+                if len(spec_array) == 0:
+                    model_phot.append(np.nan)
+                    continue
+                num_int = np.trapz(run.trans_arrays[b] * spec_array, self.wl[mask_b])
+                den = np.trapz(run.trans_arrays[b], self.wl[mask_b])
+                if den == 0:
+                    model_phot.append(np.nan)
+                    continue
+                phot_point = num_int / den
+                # convert to mJy if needed
                 c = 2.99792458e18  # Å/s
-                phot_point = phot_point * pivot_w**2 / c / 1e-26
+                phot_point = phot_point * run.pivot_wls[b]**2 / c / 1e-26
+                model_phot.append(phot_point)
 
-            data[b] = (phot_point, np.nan)
+            return np.array(model_phot)
 
-        header = fits.Header()
-        header['units'] = units
-
-        return PhotometryTable(data={"0":data}, header=header)
-    
+        
    
 
     def plot(
@@ -146,10 +173,14 @@ class Spectrum:
         ymin=None,
         ymax=None,
         zoom_on_line=None,
+
+        custom_ylabel=None,
         
         # aestethics
         figsize=None,
         color=None,
+        linestyle_1='-',
+        linestyle_2='-',
         ecolor='green',
         show_snr=False,
         
@@ -311,11 +342,11 @@ class Spectrum:
                     handle = ax.errorbar(
                         wl, flux, yerr=flux_err, fmt='o', markersize=2,
                         color=c, ecolor=ecolor, elinewidth=1.0,
-                        capsize=2, capthick=1.0, linestyle='-', lw=0.5,
+                        capsize=2, capthick=1.0, linestyle=linestyle_1, lw=0.5,
                         label=label
                     )
                 else:
-                    handle = ax.plot(wl, flux, color=c, lw=1, label=label)[0]
+                    handle = ax.plot(wl, flux, color=c, linestyle=linestyle_2,lw=1, label=label)[0]
 
 
                 if draw_continuum:
@@ -410,8 +441,10 @@ class Spectrum:
                 unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
             else: unit_label = y_u
             ax.set_ylabel(f"{ylabel} ({unit_label})")
-            if normalized or remove_continuum: 
+            if normalized or remove_continuum:
                 ax.set_ylabel("arbitrary units")
+            if custom_ylabel: 
+                ax.set_ylabel(custom_ylabel)
 
 
             # --- Spectra legend ---
@@ -439,10 +472,6 @@ class Spectrum:
                 #???
                 #if spec_legend is not None:
                 #    ax.add_artist(spec_legend)
-
-
-
-
 
 
             # --- Optionals ---
