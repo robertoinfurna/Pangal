@@ -305,7 +305,7 @@ class Run:
             
             for model in model_spectra:
             
-                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self,model)
+                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,self.polydeg)
             
                 normalization_factor_list.append(normalization_factor)
                 normalization_factor_smoothed_list.append(normalization_factor_smoothed)
