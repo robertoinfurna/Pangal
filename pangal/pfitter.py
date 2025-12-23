@@ -182,7 +182,7 @@ class PFitter():
         if spec:
             run.spec = spec
             obs_spec_wl, obs_spec_flux, obs_spec_flux_err = self._preprocess_observed_spectrum(spec, spectral_range,atmospheric_lines)
-            run.spec_crop = Spectrum(wl=obs_spec_wl,flux=obs_spec_wl,flux_err=obs_spec_flux_err,resolution=spec.resolution,header=spec.header)
+            run.spec_crop = Spectrum(wl=obs_spec_wl,flux=obs_spec_flux,flux_err=obs_spec_flux_err,resolution=spec.resolution,header=spec.header)
 
 
         # If there is no spectrum, treat vel params as fixed/unavailable
@@ -242,6 +242,8 @@ class PFitter():
                 trans_mask[b] = mask_b
                 trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
                 pivot_wls[b] = F.pivot_wavelength
+
+            obs_resolution_on_model_grid = None
         
         if spec: 
                 obs_resolution_on_model_grid = interp1d( 
@@ -334,16 +336,16 @@ class PFitter():
             if spec is not None:
                 
                 # Returns the model spectrum ready to be compared with the observed spectrum!
-                normalization_factor, normalization_factor_smoothed, model = self._adapt_model_spectrum_to_observed_spectrum(run,synth_spec)
+                normalization_factor, normalization_factor_smoothed, model = self._adapt_model_spectrum_to_observed_spectrum(run.spec_crop,synth_spec,run.spectral_range,run.polydeg)
                 
                 # Likelihood mask 
                 mask_like = (
                     np.isfinite(model)
-                    & np.isfinite(run.obs_spec_flux)
-                    & (run.obs_spec_flux_err > 0)
+                    & np.isfinite(run.spec_crop.flux)
+                    & (run.spec_crop.flux_err > 0)
                 )
-                flux_obs = run.obs_spec_flux[mask_like]
-                flux_err = run.obs_spec_flux_err[mask_like]
+                flux_obs = run.spec_crop.flux[mask_like]
+                flux_err = run.spec_crop.flux_err[mask_like]
                 model = model[mask_like]
 
 
@@ -492,18 +494,18 @@ class PFitter():
 
 
 
-    def _adapt_model_spectrum_to_observed_spectrum(self, run, synth_spec):
+    def _adapt_model_spectrum_to_observed_spectrum(self, spec_crop, synth_spec,spectral_range,polydeg):
 
-        wl_obs = run.obs_spec_wl
-        flux_obs = run.obs_spec_flux
-        err_obs = run.obs_spec_flux_err
+        wl_obs = spec_crop.wl
+        flux_obs = spec_crop.flux
+        err_obs = spec_crop.flux_err
 
         # Interpolate model on observed wl grid WITHOUT extrapolation 
         flux_model = interp1d(synth_spec.wl, synth_spec.flux,
                                 kind='linear', bounds_error=False, fill_value=np.nan)(wl_obs) 
 
         # --- User-selected wavelength range for continuum fit ---
-        sr = run.spectral_range
+        sr = spectral_range
         wl_fit_min = sr[0][0] if isinstance(sr[0], (list, tuple)) else sr[0]
         wl_fit_max = sr[-1][1] if isinstance(sr[-1], (list, tuple)) else sr[1]
 
@@ -518,10 +520,10 @@ class PFitter():
         n_valid = mask.sum()
 
         # ---------------- 2) Determine polynomial degree ----------------
-        if n_valid < max(10, run.polydeg + 1):
-            polydeg = max(1, min(run.polydeg, n_valid - 1))
+        if n_valid < max(10, polydeg + 1):
+            polydeg = max(1, min(polydeg, n_valid - 1))
         else:
-            polydeg = min(run.polydeg, n_valid - 1)
+            polydeg = min(polydeg, n_valid - 1)
 
         # ---------------- 3) Compute raw normalization factor ----------------
         normalization_factor = np.full_like(flux_obs, np.nan)
