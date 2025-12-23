@@ -68,8 +68,9 @@ class Spectrum:
     def get_phot(self, 
                 bands=None,
                 units='erg/s/cm2/A',
-                for_likelihood=False,
-                run=None,
+                trans_arrays=None,
+                trans_mask=None,
+                pivot_wls=None,
                 ):
         """
         Computes synthetic photometric points from a spectrum and a list of bands.
@@ -86,7 +87,7 @@ class Spectrum:
         The internal integration is always done in erg/s/cm²/Å and Å.
         The output is then converted to the requested `units`.
         """
-        if for_likelihood is False:
+        if not trans_arrays:
 
             invalid = [b for b in bands if b not in map_filter_names]
             if invalid:
@@ -129,21 +130,21 @@ class Spectrum:
         else: 
 
             model_phot = []
-            for b in run.bands:
-                mask_b = run.trans_mask[b]
+            for b in bands:
+                mask_b = trans_mask[b]
                 spec_array = self.flux[mask_b]
                 if len(spec_array) == 0:
                     model_phot.append(np.nan)
                     continue
-                num_int = np.trapz(run.trans_arrays[b] * spec_array, self.wl[mask_b])
-                den = np.trapz(run.trans_arrays[b], self.wl[mask_b])
+                num_int = np.trapz(trans_arrays[b] * spec_array, self.wl[mask_b])
+                den = np.trapz(trans_arrays[b], self.wl[mask_b])
                 if den == 0:
                     model_phot.append(np.nan)
                     continue
                 phot_point = num_int / den
                 # convert to mJy if needed
                 c = 2.99792458e18  # Å/s
-                phot_point = phot_point * run.pivot_wls[b]**2 / c / 1e-26
+                phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
                 model_phot.append(phot_point)
 
             return np.array(model_phot)
@@ -192,9 +193,9 @@ class Spectrum:
         show_filters=False,
         
 
-        phot_points=None,
-        phot_region=None,
-        synth_phot_points=None,
+        phot=None,
+        synth_phot=None,
+
         spec_legend_pars=None,
         show_phot_legend=True,
         show_spec_legend=True,
@@ -263,7 +264,7 @@ class Spectrum:
                     z = redshift
                 else:
                     z = next((spec.header[k] for k in ("REDSHIFT", "redshift", "z") if k in spec.header), 0)
-                    if "vel_sys" in spec.header: 
+                    if "vel_sys" in spec.header and spec.header["vel_sys"] is not None: 
                         v_sys = spec.header["vel_sys"]
                         z += v_sys / 2.99792458e5
     
@@ -289,18 +290,20 @@ class Spectrum:
                     c = color
 
                 # --- Label ---
+                label = None
                 if isinstance(spec_legend_pars, str):
-                    label = spec.header[spec_legend_pars]
-
+                    label = spec.header.get(spec_legend_pars)
                 elif isinstance(spec_legend_pars, dict):
-                    label = ", ".join(
+                    parts = [
                         f"{spec_legend_pars[k][0]}={spec.header[k]} {spec_legend_pars[k][1]}"
                         for k in spec_legend_pars
                         if k in spec.header
-                    )
-
+                    ]
+                    label = ", ".join(parts) if parts else None
                 else:
-                    label = spec.header.get("ID", getattr(spec, "id", None)) or f"Spectrum {i + 1}"
+                    label = spec.header.get("ID", getattr(spec, "id", None))
+                if not label:
+                    label = "observed spectrum"
 
 
 
@@ -332,10 +335,11 @@ class Spectrum:
                     flux_err /= normalization
 
                 mask = (wl >= x0) & (wl <= x1)
-                fmax = np.nanmax(flux[mask])
-                fmin = np.nanmin(flux[mask])
-                global_fmax = max(global_fmax, fmax)
-                global_fmin = min(global_fmin, fmin)
+                if len(flux[mask])>0:
+                    fmax = np.nanmax(flux[mask])
+                    fmin = np.nanmin(flux[mask])
+                    global_fmax = max(global_fmax, fmax)
+                    global_fmin = min(global_fmin, fmin)
 
 
                 if flux_err is not None:
@@ -360,10 +364,10 @@ class Spectrum:
 
 
                 # --- Synthetic photometric points (larger, white-filled) ---
-                if synth_phot_points:
+                if synth_phot:
                     markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
-                    model_phot = spec.get_phot(bands=synth_phot_points, units=y_u)
-                    for band in synth_phot_points:
+                    model_phot = spec.get_phot(bands=synth_phot, units=y_u)
+                    for band in synth_phot:
                         pivot_wl_A = Filter(band).pivot_wavelength
                         wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
                         flux_val = model_phot.data[band][0]
@@ -386,17 +390,12 @@ class Spectrum:
 
 
             # --- Photometric points ---
-            if phot_points:
+            if phot:
                 markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
-                phot_units = phot_points.header.get('units', 'mJy')
-
-                if len(phot_points.data.keys()) == 1 and not phot_region:
-                    phot_region = list(phot_points.data.keys())[0]
-                elif not phot_region:
-                    raise ValueError("Provide the ID of the region for the photometric points")
+                phot_units = phot.header.get('units', 'mJy')
                 
-                for band in phot_points.data[phot_region].keys():
-                    flux_val, flux_err_val = phot_points.data[phot_region][band]
+                for band in phot.data.keys():
+                    flux_val, flux_err_val = phot.data[band]
                     pivot_wl_A = Filter(band).pivot_wavelength
                     wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
                     flux_val_conv = self._convert_flux(flux_val, pivot_wl_A, phot_units, y_u, 'A')
@@ -424,9 +423,8 @@ class Spectrum:
                 ax.set_xscale('log')
                 ax.set_yscale('log')
 
-            y0 = ymin if ymin is not None else (0.8 * global_fmin if global_fmin > 0 else 1e-4 * global_fmax)
-            #y_axis_factor = 1.1 if remove_continuum else 2
-            y1 = ymax if ymax is not None else 1.4 * global_fmax
+            y0 = ymin if ymin is not None else (0.8 * global_fmin if global_fmin > 0 else 1e-3 * global_fmax)
+            y1 = ymax if ymax is not None else (1.4 * global_fmax if log is False else 10 * global_fmax)
             ax.set_xlim(x0, x1)
             ax.set_ylim(y0, y1)
 
@@ -449,7 +447,14 @@ class Spectrum:
 
             # --- Spectra legend ---
             if show_spec_legend:
-                ax.legend(spec_handles, spec_labels, title=spec_legend_title, loc=spec_legend_loc, frameon=False)
+                spec_legend = ax.legend(
+                    spec_handles,
+                    spec_labels,
+                    title=spec_legend_title,
+                    loc=spec_legend_loc,
+                    frameon=False
+                )
+                ax.add_artist(spec_legend)  
 
             # --- Phot legend ---
             if zoom_on_line: show_phot_legend = False
@@ -464,14 +469,12 @@ class Spectrum:
                 labels = list(band_labels.values())
                 ax.legend(
                     handles, labels,
-                    title=f"Photometric bands: {phot_region or ''}",
+                    title=f"Photometry",
                     loc="center left",
                     bbox_to_anchor=(1.02, 0.5),
                     frameon=False
                 )
-                #???
-                #if spec_legend is not None:
-                #    ax.add_artist(spec_legend)
+
 
 
             # --- Optionals ---

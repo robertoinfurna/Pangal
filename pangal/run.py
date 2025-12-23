@@ -14,10 +14,12 @@ from dynesty import plotting as dyplot
 from dynesty.utils import resample_equal
 import corner
 
+from .photometry_table import PhotometryTable
 from .spectrum import Spectrum
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 
-from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator
+from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator, load_spectrum_models_from_fits
+
 
 """
 PFitter
@@ -38,8 +40,8 @@ Run
 
 class Run:
     def __init__(self):
-        self.spec = None
-        self.phot = None
+
+        self.model_file = None
         self.bands = None
         self.spectral_range = None
         self.fix_pars = None
@@ -49,16 +51,12 @@ class Run:
         self.dlogz = None
 
         # Processed data
-        self.obs_spec_wl = None, 
-        self.obs_spec_flux = None,
-        self.obs_spec_flux_err = None,
-        #self.obs_resolution_on_model_grid = None
+        self.spec = None
+        self.spec_crop = None
+        self.phot = None
 
         # Likelihood, priors, and sampler
         self.pfitter = None
-        self.log_likelihood = None
-        self.prior_transform = None
-        self.sampler = None
         self.result = None
 
 
@@ -108,6 +106,7 @@ class Run:
             "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
             "redshift": r'redshift',
             "luminosity_distance": r'luminosity distance',
+            "ln_spec_noise_scale": r'spectral noise scaling parameter'
         }
 
         labels = [latex_labels.get(p, p) for p in self.free_pars]
@@ -136,8 +135,6 @@ class Run:
                 ax.set_title(f"{means[i]:.3f} ± {stds[i]:.3f}", fontsize=10, pad=12)
 
         plt.show()
-
-
 
 
 
@@ -248,7 +245,7 @@ class Run:
 
 
     def fit_diagnostic(self,
-                        spectra=[],
+                        models=[],
 
                         method='MAP',
                     
@@ -271,25 +268,34 @@ class Run:
                         spec_legend_loc="upper left",
                         spec_legend_title=None,
 
-                        phot_points=None,
-                        phot_region=None,
-                        synth_phot_points=None,
-                        show_phot_legend=True,
                         winf_phot=1e2,
                         wsup_phot=1e7,
                         ymin=None,
                         ymax=None,
                     ):
+        
+        if self.pfitter is None: 
+                    
+            from .pfitter import PFitter
+
+            self.pfitter = PFitter(
+                model_file=self.model_file,
+                model_pars=self.model_pars,
+            )
+
+        
+        if models:
+            model_spectra = models
+        else:
+            model_spectra = [self.best_model(method=method)]
 
         if self.spec:
         
-            wl, flux_obs, flux_err, = self.obs_spec_wl, self.obs_spec_flux, self.obs_spec_flux_err
+            wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
             header = fits.Header()
             header["WUNITS"]  = "A"
             header["FUNITS"]  = "erg/s/cm2/A"
             spectrum_obs = Spectrum(wl=wl,flux=flux_obs,flux_err=flux_err,header=header)
-            
-            model_spectra = [self.best_model(method=method)] + spectra 
             
             
             normalization_factor_list = []
@@ -297,14 +303,16 @@ class Run:
             models_comparable_to_obs = []
             residuals = []
             
-            for synth_spec in model_spectra:
+            for model in model_spectra:
             
-                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self,synth_spec)
+                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self,model)
             
                 normalization_factor_list.append(normalization_factor)
                 normalization_factor_smoothed_list.append(normalization_factor_smoothed)
             
                 models_comparable_to_obs.append(model)
+
+                #flux_err 
             
                 res = (flux_obs - model) / flux_err
                 residuals.append(res)
@@ -432,9 +440,8 @@ class Run:
                 show_atmospheric_lines=False,
                 show_filters=False,
             
-                phot_points=self.phot,
-                phot_region=phot_region,
-                synth_phot_points=None,
+                phot=self.phot,
+                synth_phot=None,
                 spec_legend_pars=spec_legend_pars,
                 show_phot_legend=True,
                 show_spec_legend=True,
@@ -444,38 +451,50 @@ class Run:
 
             bands = self.bands
 
-            # This are the arrays!
-            phot_points = np.array([self.phot.data[run.obj_id][b][0] for b in bands])
-            phot_errors = np.array([self.phot.data[run.obj_id][b][1] for b in bands])
-            upper_lims = (phot_points / phot_errors < 5).astype(int)
-            
             for j,model in enumerate(model_spectra):
 
                 print('For model number: ',j+1)
 
-                model_phot_array = model.get_phot(for_likelihood=True, run=self)
+                phot_fluxes = np.array([self.phot.data[b][0] for b in self.bands])
+                phot_errors = np.array([self.phot.data[b][1] for b in self.bands])
+                upper_limits = (phot_fluxes / phot_errors < 5).astype(int)
+                phot_units = self.phot.header["UNITS"]
+            
+                trans_mask = {}
+                trans_arrays = {}
+                pivot_wls = {}
+                for b in self.bands:
+                    F = Filter(b)
+                    lmin, lmax = F.wavelength_range
+                    mask_b = (model.wl >= lmin) & (model.wl <= lmax)
+                    trans_mask[b] = mask_b
+                    trans_arrays[b] = F.transmission_curve(model.wl[mask_b])
+                    pivot_wls[b] = F.pivot_wavelength
                     
-                if not np.all(np.isfinite(model_phot_array)):
-                    print(-1e100)
-                    break
 
+                model_phot_array = model.get_phot(bands=self.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
+
+                if not np.all(np.isfinite(model_phot_array)):
+                    return -1e100
+                
                 phot_lhood = 0
-                for i in range(len(phot_points)):
-                    if upper_lims[i] == 0:
-                        contribution = -0.5 * (
-                            (phot_points[i] - model_phot_array[i])**2 / phot_errors[i]**2
-                            + np.log(phot_errors[i]**2)
-                            + np.log(2. * np.pi)
-                        ) 
+                for i in range(len(phot_fluxes)):
+                    if upper_limits[i] == 0:
+                        var = phot_errors[i]**2
+                        residual = (phot_fluxes[i] - model_phot_array[i]) / phot_errors[i]
+                        contribution = -0.5 * (residual**2 + np.log(2*np.pi*var)) 
+                        print(nice_filter_names[self.bands[i]],": ",contribution)
                         phot_lhood += contribution
-                        print(f"Band {bands[i]}: {contribution:.3f}")
                     else:
-                        terf = 0.5 * (1 + erf((phot_points[i] - model_phot_array[i]) / 
+                        terf = 0.5 * (1 + erf((phot_fluxes[i] - model_phot_array[i]) / 
                                             (np.sqrt(2.) * phot_errors[i])))
                         if terf <= 0:
                             return -1e100
-                        print(f"Band {bands[i]}: {terf:.3f}")
-                        phot_lhood += np.log(terf)
+                        contribution = np.log(terf) 
+                        print(nice_filter_names[self.bands[i]]," upper limit: ",contribution)
+                        phot_lhood += contribution
+
+
                 print('TOTAL_PHOT: ',phot_lhood)
                 if self.spec:
                     print('TOTAL_SPEC: ',chi2_models_spec[j])
@@ -485,15 +504,6 @@ class Run:
                     
 
             
-
-
-
-
-
-
-
-
-
 
 
 
@@ -516,18 +526,17 @@ class Run:
         else:
             custom_priors_serial = None
 
-        np.savez_compressed(
-            filename,
+        save_dict = dict(
             samples=self.result.samples,
             logl=self.result.logl,
             logwt=self.result.logwt,
             logz=self.result.logz,
 
-            # Parameter info
-            free_pars=np.array(self.free_pars, dtype='U'),
-            fix_pars=np.array(list(self.fix_pars.items()), dtype=object),
+            model_file=self.model_file,
+            model_pars=self.model_pars,
 
-            # Priors and run settings
+            free_pars=np.array(self.free_pars, dtype="U"),
+            fix_pars=np.array(list(self.fix_pars.items()), dtype=object),
             custom_priors=custom_priors_serial,
             spectral_range=self.spectral_range,
             polydeg=self.polydeg,
@@ -536,39 +545,147 @@ class Run:
             bands=self.bands,
         )
 
+        if self.spec is not None:
+            save_dict.update(
+                dict(
+                    obs_spec_wl=self.spec.wl,
+                    obs_spec_flux=self.spec.flux,
+                    obs_spec_flux_err=self.spec.flux_err,
+                    obs_spec_res=self.spec.resolution,
+                    obs_spec_wl_units=self.spec.header["WUNITS"],
+                    obs_spec_flux_units=self.spec.header["FUNITS"],
+                )
+            )
+
+        if self.spec_crop is not None:
+            save_dict.update(
+                dict(
+                    obs_spec_crop_wl=self.spec_crop.wl,
+                    obs_spec_crop_flux=self.spec_crop.flux,
+                    obs_spec_crop_flux_err=self.spec_crop.flux_err,
+                    obs_spec_crop_res=self.spec_crop.resolution,
+                    obs_spec_crop_wl_units=self.spec_crop.header["WUNITS"],
+                    obs_spec_crop_flux_units=self.spec_crop.header["FUNITS"],
+                )
+            )
+
+        if self.phot is not None:
+            save_dict.update(
+                dict(
+                    phot_band=self.bands,
+                    phot_fluxes=[self.phot.data[key][0] for key in self.bands],
+                    phot_errors=[self.phot.data[key][1] for key in self.bands],
+                    phot_units=self.phot.header["UNITS"],
+                )
+            )
+
+        np.savez_compressed(filename, **save_dict)
+
         print(f"Saved fit results to {filename}")
 
 
     def load(self, filename):
         """Load dynesty samples, priors, and metadata from NPZ into this Run object."""
 
-        data = np.load(filename, allow_pickle=True)
+        with np.load(filename, allow_pickle=True) as data:
 
-        # Recreate dynesty Result-like object
-        class Result: pass
-        r = Result()
-        r.samples = data['samples']
-        r.logl    = data['logl']
-        r.logwt   = data['logwt']
-        r.logz    = data['logz']
+            # -------------------------------------------------
+            # Recreate dynesty Result-like object
+            # -------------------------------------------------
+            class Result:
+                pass
 
-        # Restore into self
-        self.result = r
-        self.free_pars = list(data['free_pars'])
-        self.fix_pars  = dict(data['fix_pars'])
+            r = Result()
+            r.samples = data["samples"]
+            r.logl    = data["logl"]
+            r.logwt   = data["logwt"]
+            r.logz    = data["logz"]
+            self.result = r
 
-        print(self.free_pars)
-        print(self.fix_pars)
-        print(self.result)
+            # -------------------------------------------------
+            # Restore parameter info
+            # -------------------------------------------------
+            self.free_pars = list(data["free_pars"])
+            self.fix_pars  = dict(data["fix_pars"].tolist())
 
-        # Restore priors and other metadata
-        self.custom_priors  = data.get('custom_priors', None)
-        self.spectral_range = data.get('spectral_range', None)
-        self.polydeg      = data.get('polydeg', None)
-        self.nlive          = data.get('nlive', None)
-        self.dlogz          = data.get('dlogz', None)
-        self.bands          = data.get('bands', None)
+            # -------------------------------------------------
+            # Restore priors
+            # -------------------------------------------------
+            if "custom_priors" in data and data["custom_priors"] is not None:
+                self.custom_priors = data["custom_priors"].tolist()
+            else:
+                self.custom_priors = None
+
+            # -------------------------------------------------
+            # Restore metadata
+            # -------------------------------------------------
+            self.spectral_range = data["spectral_range"] if "spectral_range" in data else None
+            self.polydeg = int(data["polydeg"]) if "polydeg" in data else None
+            self.nlive   = int(data["nlive"]) if "nlive" in data else None
+            self.dlogz   = float(data["dlogz"]) if "dlogz" in data else None
+            self.bands   = data["bands"].tolist() if "bands" in data else None
+
+            # -------------------------------------------------
+            # Restore observed photometry
+            # -------------------------------------------------
+            self.phot = None
+            if "phot_fluxes" in data:
+                phot_fluxes = data["phot_fluxes"]
+                phot_errors = data["phot_errors"]
+                bands = data["phot_band"].tolist()
+
+                phot_dict = {
+                    b: (phot_fluxes[i], phot_errors[i])
+                    for i, b in enumerate(bands)
+                }
+
+                hdr = fits.Header()
+                if "phot_units" in data:
+                    hdr["UNITS"] = data["phot_units"].item()
+
+                self.phot = PhotometryTable(data=phot_dict, header=hdr)
+
+            # -------------------------------------------------
+            # Restore observed spectrum
+            # -------------------------------------------------
+            self.spec = None
+            if "obs_spec_wl" in data:
+                hdr = fits.Header()
+                hdr["WUNITS"] = data["obs_spec_wl_units"].item()
+                hdr["FUNITS"] = data["obs_spec_flux_units"].item()
+
+                self.spec = Spectrum(
+                    wl=data["obs_spec_wl"],
+                    flux=data["obs_spec_flux"],
+                    flux_err=data["obs_spec_flux_err"],
+                    resolution=data["obs_spec_res"],
+                    header=hdr,
+                )
+
+            # -------------------------------------------------
+            # Restore cropped observed spectrum
+            # -------------------------------------------------
+            self.spec_crop = None
+            if "obs_spec_crop_wl" in data:
+                hdr = fits.Header()
+                hdr["WUNITS"] = data["obs_spec_crop_wl_units"].item()
+                hdr["FUNITS"] = data["obs_spec_crop_flux_units"].item()
+
+                self.spec_crop = Spectrum(
+                    wl=data["obs_spec_crop_wl"],
+                    flux=data["obs_spec_crop_flux"],
+                    flux_err=data["obs_spec_crop_flux_err"],
+                    resolution=data["obs_spec_crop_res"],
+                    header=hdr,
+                )
+
+            # ---------------------------------------------------
+            # Restore pfitter
+            # ---------------------------------------------------
+
+
+            self.model_file = data["model_file"].item()
+            self.model_pars = data["model_pars"]
 
         print(f"Loaded fit results from {filename}")
-
         return self

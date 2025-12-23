@@ -1,6 +1,7 @@
 
 import numpy as np
 import astropy
+from astropy.io import fits
 from bisect import bisect_left
 from scipy.special import erf
 from scipy.interpolate import RegularGridInterpolator, interp1d
@@ -26,6 +27,30 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(this_dir, ".", "data")
 data_dir = os.path.normpath(data_dir)
 
+
+def load_spectrum_models_from_fits(filename):
+    with fits.open(filename) as hdul:
+        # Wavelength array from primary HDU
+        wl,resolution = hdul[0].data
+        nmodels = len(hdul) - 1
+
+        models = []
+        for i in range(1, len(hdul)):
+            data = hdul[i].data
+            header = hdul[i].header
+
+
+            spec = Spectrum(wl=wl,resolution=resolution,flux=data["FLUX"])
+
+            spec.flux_young = data["FLUX_YOUNG"]
+            spec.flux_old   = data["FLUX_OLD"]
+            
+            # Keep the model's metadata
+            spec.header.update(header)
+
+            models.append(spec)
+
+    return models
 
 
 def load_nebular_tables(self,wl,resolution,emimetal,emimodel):

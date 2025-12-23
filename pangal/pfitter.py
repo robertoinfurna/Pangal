@@ -20,7 +20,7 @@ from .run import Run
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 from .data.spectral_lines import atmospheric_lines
 
-from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator
+from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator, load_spectrum_models_from_fits
 
 """
 PFitter
@@ -44,11 +44,20 @@ class PFitter():
     
     # Parametric fitter: this first block loads a grid of models
 
-    def __init__(self, model_list, model_pars, cosmo=None, dustemimodel='dh02', leitatt=True, uv_bump=True, emimetal=0.0017, emimodel='2018'):
+    def __init__(self, model_file, model_pars, cosmo=None, dustemimodel='dh02', leitatt=True, uv_bump=True, emimetal=0.0017, emimodel='2018'):
 
-        self.model_pars = model_pars  # list the variables defyning the model grid
         print(f"Initializing PFitter object")
-        print(f"   Model parameters: {', '.join(self.model_pars)}\n")
+        self.model_file = model_file
+        self.model_pars = model_pars  # list the variables defyning the model grid
+        self.cosmo = cosmo
+        self.dustemimodel = dustemimodel
+        self.leiatt = leitatt
+        self.uv_bump = uv_bump
+        self.emimetal = emimetal
+        self.emimodel = emimodel
+
+        print("Loading models from ",model_file)
+        model_list = load_spectrum_models_from_fits(model_file)
 
         # Menages model grid
         if not isinstance(model_list, list):
@@ -110,7 +119,6 @@ class PFitter():
     def run_fit(self,
                 spec=None,   # observed spectrum (a spectrum object)
                 phot=None,   # observed photometry 
-                obj_id=None,
                 bands=None,
                 spectral_range=None,
                 fix_pars=None,
@@ -119,43 +127,11 @@ class PFitter():
                 nlive=500,
                 dlogz=0.01):
         
-
-        # ------- safe copies for mutable inputs -------
-        fix_pars = {} if fix_pars is None else dict(fix_pars)
-        custom_priors = {} if custom_priors is None else dict(custom_priors)
-        
-        run = Run()     # new Run container
-
-        # store user inputs
-        run.pfitter = self
-        run.phot = phot
-        run.spec = spec
-        run.spectral_range = spectral_range
-        run.nlive = nlive
-        run.dlogz = dlogz
-        run.polydeg = polydeg
-        run.custom_priors = custom_priors
-        run.fix_pars = dict(fix_pars) 
-        
         if phot is not None:
             if not isinstance(phot, PhotometryTable):
                 raise TypeError(
                     f"'phot' must be a PhotometryTable instance, got {type(phot).__name__} instead."
                 )
-            if len(phot.data) == 1: run.obj_id = next(iter(phot.data))
-            # More than one object → obj_id is mandatory
-            else:
-                if  obj_id is None:
-                    raise ValueError(
-                        f"PhotometryTable contains multiple objects ({len(phot.data)}). "
-                        f"An obj_id must be provided."
-                    )
-                elif  obj_id is not None and obj_id not in phot.data.keys():
-                    raise ValueError(
-                        f"obj_id '{obj_id}' not found in photometry table."
-                    )
-                else: 
-                    run.obj_id = obj_id
         if spec is not None:
             if not isinstance(spec, Spectrum):
                 raise TypeError(
@@ -169,6 +145,24 @@ class PFitter():
             )
 
 
+
+        # ------- safe copies for mutable inputs -------
+        fix_pars = {} if fix_pars is None else dict(fix_pars)
+        custom_priors = {} if custom_priors is None else dict(custom_priors)
+        
+        run = Run()     # new Run container
+
+        # store user inputs
+        run.pfitter = self
+        run.model_file = self.model_file
+        run.model_pars = self.model_pars
+        run.spectral_range = spectral_range
+        run.nlive = nlive
+        run.dlogz = dlogz
+        run.polydeg = polydeg
+        run.custom_priors = custom_priors
+        run.fix_pars = dict(fix_pars) 
+        
         # --- bands selection ---
         if phot is not None:
             if bands:
@@ -177,23 +171,30 @@ class PFitter():
                         raise ValueError(f'Unrecognized filter: {b}. Abort')
                 run.bands = list(bands)
             else:
-                run.bands = [b for b in phot.data[run.obj_id].keys() if b in map_filter_names.keys()]
+                run.bands = [b for b in phot.data.keys() if b in map_filter_names.keys()]
 
             print(f"Using the following photometric filters: {', '.join(run.bands)}")
 
+            run.phot = phot
+
+
         # --- preprocess observed spectrum once (done here) ---
         if spec:
-            run.obs_spec_wl, run.obs_spec_flux, run.obs_spec_flux_err = self._preprocess_observed_spectrum(spec, spectral_range,atmospheric_lines)
+            run.spec = spec
+            obs_spec_wl, obs_spec_flux, obs_spec_flux_err = self._preprocess_observed_spectrum(spec, spectral_range,atmospheric_lines)
+            run.spec_crop = Spectrum(wl=obs_spec_wl,flux=obs_spec_wl,flux_err=obs_spec_flux_err,resolution=spec.resolution,header=spec.header)
+
 
         # If there is no spectrum, treat vel params as fixed/unavailable
         if spec is None:
             # do not mutate caller dict (we already copied)
             run.fix_pars.setdefault("vel_sys", None)
             run.fix_pars.setdefault("sigma_vel", None)
-            for par in ("vel_sys", "sigma_vel"):
+            run.fix_pars.setdefault("ln_spec_noise_scale", None)
+            for par in ("vel_sys", "sigma_vel", "ln_spec_noise_scale"):
                 if par in run.custom_priors:
                     run.custom_priors.pop(par)
-                    print(f"Warning: Removed prior for '{par}' because no spectrum is provided.")
+                print(f"Warning: Removed prior for '{par}' because no spectrum is provided.")
 
 
 
@@ -201,7 +202,7 @@ class PFitter():
         run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
 
         global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                    "alpha", "m_star", "vel_sys", "sigma_vel", "luminosity_distance", "redshift"]
+                    "alpha", "m_star", "vel_sys", "sigma_vel", "luminosity_distance", "redshift", "ln_spec_noise_scale"]
         run.free_global_pars = [p for p in global_pars if p not in run.fix_pars]
 
         run.free_pars = run.free_model_pars + run.free_global_pars
@@ -223,37 +224,30 @@ class PFitter():
 
 
 
-
-
-
     def make_log_likelihood(self, run, spec, phot, free_pars,):
-   
-        # --- photometric precomputations ---
-        if phot is not None:
-            phot_points = np.array([phot.data[run.obj_id][b][0] for b in run.bands])
-            phot_errors = np.array([phot.data[run.obj_id][b][1] for b in run.bands])
-            upper_lims = (phot_points / phot_errors < 5).astype(int)
 
-            run.trans_mask = {}
-            run.trans_arrays = {}
-            run.pivot_wls = {}
+        if phot: 
+            phot_fluxes = np.array([run.phot.data[b][0] for b in run.bands])
+            phot_errors = np.array([run.phot.data[b][1] for b in run.bands])
+            upper_limits = (phot_fluxes / phot_errors < 5).astype(int)
+            phot_units = phot.header["UNITS"]
+            
+            trans_mask = {}
+            trans_arrays = {}
+            pivot_wls = {}
             for b in run.bands:
                 F = Filter(b)
                 lmin, lmax = F.wavelength_range
                 mask_b = (self.model_wl >= lmin) & (self.model_wl <= lmax)
-                run.trans_mask[b] = mask_b
-                run.trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
-                run.pivot_wls[b] = F.pivot_wavelength
-
-        # --- resolution interpolation for model grid (if spectrum provided) ---
-        # ADD TO run??
-        if spec is not None:
-            obs_resolution_on_model_grid = interp1d( 
-                spec.wl, spec.resolution, kind="linear",
-                bounds_error=False, fill_value="extrapolate"
-            )(self.model_wl)
-        else:
-            obs_resolution_on_model_grid = None
+                trans_mask[b] = mask_b
+                trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
+                pivot_wls[b] = F.pivot_wavelength
+        
+        if spec: 
+                obs_resolution_on_model_grid = interp1d( 
+                    run.spec_crop.wl, run.spec_crop.resolution, kind="linear",
+                    bounds_error=False, fill_value="extrapolate"
+                )(self.model_wl)
 
 
         # --- closure used by the sampler ---
@@ -280,30 +274,31 @@ class PFitter():
                     model_kwargs[name] = model_free_values[pos]
 
             # ---- GLOBAL / NAMED PARAMETERS ----
-            named_order = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                        "alpha", "m_star", "vel_sys", "sigma_vel","luminosity_distance","redshift"]
-            named_values = {}
-            for name in named_order:
+            names = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
+                        "alpha", "m_star", "vel_sys", "sigma_vel","luminosity_distance","redshift","ln_spec_noise_scale"]
+            val = {}
+            for name in names:
                 if name in run.fix_pars:
-                    named_values[name] = run.fix_pars[name]
+                    val[name] = run.fix_pars[name]
                 else:
-                    named_values[name] = pars[idx]
+                    val[name] = pars[idx]
                     idx += 1
 
             # unpack named params for readability
-            fesc = named_values["fesc"]
-            ion_gas = named_values["ion_gas"]
-            age_gas = named_values["age_gas"]
-            av = named_values["av"]
-            av_ext = named_values["av_ext"]
-            alpha = named_values["alpha"]
-            m_star = named_values["m_star"]
-            vel_sys = named_values["vel_sys"]
-            sigma_vel = named_values["sigma_vel"]
-            luminosity_distance = named_values["luminosity_distance"]
-            redshift = named_values["redshift"]
+            fesc = val["fesc"]
+            ion_gas = val["ion_gas"]
+            age_gas = val["age_gas"]
+            av = val["av"]
+            av_ext = val["av_ext"]
+            alpha = val["alpha"]
+            m_star = val["m_star"]
+            vel_sys = val["vel_sys"]
+            sigma_vel = val["sigma_vel"]
+            luminosity_distance = val["luminosity_distance"]
+            redshift = val["redshift"]
+            ln_spec_noise_scale = val["ln_spec_noise_scale"]
 
-            # --- Build synthetic spectrum (pass run.obs_resolution_on_model_grid) ---
+            # --- Build synthetic spectrum (pass obs_resolution_on_model_grid) ---
             synth_spec = self.synthetic_spectrum(**model_kwargs,
                                                 fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
                                                 av=av, av_ext=av_ext, alpha=alpha,
@@ -317,18 +312,18 @@ class PFitter():
             # ----------------- Photometric likelihood -----------------
             if phot is not None:
 
-                model_phot_array = synth_spec.get_phot(for_likelihood=True, run=run)
+                model_phot_array = synth_spec.get_phot(bands=run.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
 
                 if not np.all(np.isfinite(model_phot_array)):
                     return -1e100
                 
-                for i in range(len(phot_points)):
-                    if upper_lims[i] == 0:
+                for i in range(len(phot_fluxes)):
+                    if upper_limits[i] == 0:
                         var = phot_errors[i]**2
-                        residual = (phot_points[i] - model_phot_array[i]) / phot_errors[i]
+                        residual = (phot_fluxes[i] - model_phot_array[i]) / phot_errors[i]
                         phot_lhood += -0.5 * (residual**2 + np.log(2*np.pi*var))
                     else:
-                        terf = 0.5 * (1 + erf((phot_points[i] - model_phot_array[i]) / 
+                        terf = 0.5 * (1 + erf((phot_fluxes[i] - model_phot_array[i]) / 
                                             (np.sqrt(2.) * phot_errors[i])))
                         if terf <= 0:
                             return -1e100
@@ -351,13 +346,15 @@ class PFitter():
                 flux_err = run.obs_spec_flux_err[mask_like]
                 model = model[mask_like]
 
-                if phot is not None:
-                    s = np.sqrt(len(flux_obs)/ len(run.bands))
-                else:
-                    s = 1
 
-                residuals = (flux_obs - model) / (s*flux_err)
-                spec_lhood = -0.5 * np.sum(residuals**2 + np.log(2 * np.pi * (s*flux_err)**2))
+                # Free nuisance parameter: This is not arbitrary — it is equivalent to marginalizing over unknown variance.
+                # Spectroscopy → many points (hundreds–thousands), often correlated, continuum-dominated
+                # Photometry → few points (∼5–30), independent, broadband
+
+                flux_err_true = flux_err * np.exp(ln_spec_noise_scale)
+
+                residuals = (flux_obs - model) / (flux_err_true)
+                spec_lhood = -0.5 * np.sum(residuals**2 + np.log(2 * np.pi * (flux_err_true)**2))
 
             
             return spec_lhood + phot_lhood
@@ -390,7 +387,8 @@ class PFitter():
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
             'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
-            'redshift': {'type': 'uniform', 'low': 0, 'high': 6},               
+            'redshift': {'type': 'uniform', 'low': 0, 'high': 6},    
+            'ln_spec_noise_scale': {'type': 'gaussian', 'mean': 0, 'sigma': 4}           
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
@@ -606,8 +604,8 @@ class PFitter():
         m_star,
         redshift,
         luminosity_distance,
-        vel_sys=None,                        # systemic velocity [km/s]
-        sigma_vel=None,                      # LOS velocity dispersion [km/s]
+        vel_sys=None,                         # systemic velocity [km/s]
+        sigma_vel=None,                       # LOS velocity dispersion [km/s]
         observed_spectrum_resolution=None,   # If provided (it's an array) builds the model spectrum to the required resolution
         multi_component=False,               # OTHERWISE THE RESOLUTION IS THE ONE OF THE INITAL MODELS
         likelihood_call=False,
@@ -880,4 +878,5 @@ class PFitter():
 
         # trim to original size
         return spec_conv[:npix]
+
 
