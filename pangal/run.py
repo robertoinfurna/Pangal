@@ -17,7 +17,7 @@ import corner
 from .photometry_table import PhotometryTable
 from .spectrum import Spectrum
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
-
+from .data.spectral_lines import spectral_lines, UBGVRI_filters, atmospheric_lines
 from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator, load_spectrum_models_from_fits
 
 
@@ -248,6 +248,7 @@ class Run:
                         models=[],
 
                         method='MAP',
+                        cumulative=True,
                     
                         # plotting window
                         winf=None,
@@ -292,6 +293,8 @@ class Run:
         if self.spec:
         
             wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
+            N_spec_eff = np.sum(self.spec_crop.resolution / wl * np.gradient(wl))
+
             header = fits.Header()
             header["WUNITS"]  = "A"
             header["FUNITS"]  = "erg/s/cm2/A"
@@ -342,6 +345,8 @@ class Run:
 
             #for later
             chi2_models_spec = []
+            if cumulative:
+                chi2_cumulative = []
                 
             for j,model in enumerate(model_spectra):
             
@@ -354,18 +359,26 @@ class Run:
                     c = color
             
                 # --- Label ---
+                # --- Label ---
+                label = None
+
                 if isinstance(spec_legend_pars, str):
-                    label = model.header[spec_legend_pars]
-            
+                    label = str(model.header.get(spec_legend_pars))
+
                 elif isinstance(spec_legend_pars, dict):
-                    label = ", ".join(
-                        f"{spec_legend_pars[k][0]}={model.header[k]:.2f} {spec_legend_pars[k][1]}"
-                        for k in spec_legend_pars
-                        if k in model.header
-                    )   
+                    parts = []
+                    for k, p in spec_legend_pars.items():
+                        if k in model.header:
+                            parts.append(
+                                f"{p['label']}={model.header[k]:{p['fmt']}} {p['unit']}"
+                            )
+                    label = ", ".join(parts) if parts else None
+
                 else:
-                    label = model.header.get("ID", getattr(model, "id", None)) or f"Spectrum {i + 1}"
-            
+                    label = model.header.get("ID", getattr(model, "id", None))
+
+                #if not label:
+                #    label = "observed spectrum"
                 
                 ax[0].plot(model.wl,model.flux,color=c,label=label)
             
@@ -382,14 +395,48 @@ class Run:
                 ax[2].plot(wl,models_comparable_to_obs[j],color=c)
             
 
-                chi2 = -0.5  * np.nansum((residuals[j]**2 + np.log(flux_err**2) + np.log(2. * np.pi)))
-                
+                chi2 = -0.5  * np.nansum((residuals[j]**2 + np.log(flux_err**2) + np.log(2. * np.pi))) #/ N_spec_eff
                 chi2_models_spec.append(chi2)
-                ax[3].scatter(wl,residuals[j],s=10,alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
-                #ax[3].plot(wl,residuals[j],alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
+
+                if cumulative:
+
+                    res = residuals[j]
+                    chi2_cumulative = []
+                    for k in range(len(res)):
+                        contribution = -0.5  * (res[k]**2 + np.log(flux_err[k]**2) + np.log(2. * np.pi)) #/ N_spec_eff
+
+                        if not np.isfinite(contribution):
+                            contribution = 0.0
+                        if k == 0:
+                            chi2_cumulative.append(contribution)
+                        else: 
+                            chi2_cumulative.append(chi2_cumulative[-1]+contribution)
+         
+                    chi2_cumulative = np.array(chi2_cumulative)
+                    ax[3].plot(wl,chi2_cumulative,alpha=1,color=c,)
+                    
+                    ax[3].set_title('Cumulative $\chi_2$')
+                    ax[3].set_ylabel('Cumulative')
                 
-                global_res_max = max(np.nanmax(residuals[j][mask]),global_res_max)
-                global_res_min = min(np.nanmin(residuals[j][mask]),global_res_min)
+                    global_res_max = max(np.nanmax(chi2_cumulative[mask]),global_res_max)
+                    global_res_min = min(np.nanmin(chi2_cumulative[mask]),global_res_min)
+
+                    ax[3].set_ylim(0.8*global_res_min,1.2*global_res_max)
+
+
+                else:
+                
+                    ax[3].scatter(wl,residuals[j],s=10,alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
+                    
+                    #ax[3].plot(wl,residuals[j],alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
+                    ax[3].set_title('Residuals')
+                    ax[3].set_ylabel('$(f_\\text{obs}-f_\\text{model})/\sigma_f$')
+                
+                    global_res_max = max(np.nanmax(residuals[j][mask]),global_res_max)
+                    global_res_min = min(np.nanmin(residuals[j][mask]),global_res_min)
+
+                    ax[3].set_ylim(0.8*global_res_min,1.2*global_res_max)
+                    ax[3].axhline(y=0,color='black',lw=1)
                 
             
             for i in range(4):
@@ -399,9 +446,7 @@ class Run:
                 ax[i].set_ylim(0.8*global_fmin,1.2*global_fmax)
             
             ax[1].set_ylim(0.8*global_norm_min,1.2*global_norm_max)
-            ax[3].set_ylim(0.8*global_res_min,1.2*global_res_max)
-            
-            ax[3].axhline(y=0,color='black',lw=1)
+
             
             ax[0].legend() #title=spec_legend_pars
             #ax[2].legend() #title=spec_legend_pars
@@ -412,8 +457,46 @@ class Run:
             ax[2].set_title('Raw spectrum and model fitted to observed spectrum continuum')
             ax[1].set_title('Polynomial multiplicative factor')
             ax[1].set_ylabel('$f_\\text{obs}/f_\\text{model}$')
-            ax[3].set_title('Residuals')
-            ax[3].set_ylabel('$(f_\\text{obs}-f_\\text{model})/\sigma_f$')
+
+
+
+            # Lines
+            x_u = 'A'
+            z = model_spectra[0].header['REDSHIFT'] if redshift is None else redshift
+
+            for i in range(4):
+                if show_H_lines:
+                    for name in ['Lya','Ha','Hb','Hg','Hd']:
+                        wavelength = spectral_lines[name]
+                        wl_shift = model_spectra[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
+                        if wl_shift > winf and wl_shift < wsup:
+                            ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
+                            name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
+                            ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
+                                    rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
+                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
+                if show_all_spectral_lines:
+                    for name, wavelength in spectral_lines.items():
+                        wavelength = spectral_lines[name]
+                        wl_shift = model_spectra[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
+                        if wl_shift > winf and wl_shift < wsup:
+                            ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
+                            name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
+                            ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
+                                    rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
+                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
+
+                if show_atmospheric_lines:
+                    for name, wavelength in atmospheric_lines.items():
+                        wl_plot = model_spectra[0]._angstrom_to_wl(wavelength, x_u)
+                        if wl_plot > winf and wl_plot < wsup:
+                            ax[i].axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
+                            ax[i].text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
+                                    va="bottom", fontsize=9, ha='center', clip_on=True,
+                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
+
             
             plt.show()
 
@@ -478,11 +561,12 @@ class Run:
                     return -1e100
                 
                 phot_lhood = 0
-                for i in range(len(phot_fluxes)):
+                N_phot = len(phot_fluxes)
+                for i in range(N_phot):
                     if upper_limits[i] == 0:
                         var = phot_errors[i]**2
                         residual = (phot_fluxes[i] - model_phot_array[i]) / phot_errors[i]
-                        contribution = -0.5 * (residual**2 + np.log(2*np.pi*var)) 
+                        contribution = -0.5 * (residual**2 + np.log(2*np.pi*var)) #/ N_phot
                         print(nice_filter_names[self.bands[i]],": ",contribution)
                         phot_lhood += contribution
                     else:
@@ -490,7 +574,7 @@ class Run:
                                             (np.sqrt(2.) * phot_errors[i])))
                         if terf <= 0:
                             return -1e100
-                        contribution = np.log(terf) 
+                        contribution = np.log(terf) #/ N_phot
                         print(nice_filter_names[self.bands[i]]," upper limit: ",contribution)
                         phot_lhood += contribution
 

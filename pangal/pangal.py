@@ -51,7 +51,7 @@ from .cube import Cube
 from .region import Region
 from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
 
-from .plot import plot, Point, Contours
+from .plot import plot, make_false_color, plot_false_color, Point, Contours
 from .photometry import photometry, surface_brightness_profile, inspect_photometry
 
 from .pangal_utils import area_pixel, dtheta_pixel, cut_and_rotate, correct_coords_offset, mosaic, MW_extinction
@@ -128,6 +128,8 @@ class PanGal:
               
     # methods
     plot = plot
+    make_false_color = make_false_color
+    plot_false_color = plot_false_color
     photometry = photometry
     inspect_photometry = inspect_photometry
     surface_brightness_profile = surface_brightness_profile
@@ -410,7 +412,7 @@ class PanGal:
                 ii += 1
         
             self.images[image_name] = Image(
-                image=image,
+                data=image,
                 wcs=wcs,
                 dtheta_pix_deg=dtheta_pix_deg,
                 area_pix_arcsec2=area_pix_arcsec2,
@@ -556,7 +558,7 @@ class PanGal:
                             ii += 1
 
                         self.images[image_name] = Image(
-                            image=image,
+                            data=image,
                             wcs=wcs,
                             dtheta_pix_deg=dtheta_pix_deg,
                             area_pix_arcsec2=area_pix_arcsec2,

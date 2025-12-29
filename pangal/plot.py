@@ -181,6 +181,7 @@ def plot(self,
         legend_fontsize = 14,
         show_region_captions = True, 
         
+        
     ):
 
     # Bands 
@@ -298,15 +299,6 @@ def plot(self,
             ax[j].contour(X_low,Y_low,Reg.mask,levels=[0.5],
                 colors=Reg.color,linestyles=Reg.linestyle,linewidths=Reg.linewidth,alpha=Reg.alpha) 
             
-            """
-                dx = (x_max - x_min) / nx
-    dy = (y_max - y_min) / ny
-
-    X_low = np.linspace(x_min + dx/2, x_max - dx/2, nx)
-    Y_low = np.linspace(y_min + dy/2, y_max - dy/2, ny)
-    X_low, Y_low = np.meshgrid(X_low, Y_low)
-            """
-
             if Reg.caption_coords and (Reg.id or 'id' in Reg.header.keys() or 'ID' in Reg.header.keys()) and show_region_captions:
                 x, y = target_wcs.all_world2pix([[Reg.caption_coords[0], Reg.caption_coords[1]]], 0)[0]
                 ax[j].text(x, y, Reg.id, color='white',fontsize=Reg.caption_fontsize, ha='center', va='center', fontweight='bold',
@@ -404,6 +396,206 @@ def plot(self,
 
     plt.tight_layout()
     plt.show()
+
+
+
+
+from reproject import reproject_interp
+
+def make_false_color(
+    self,
+    bands: list[str],                 # band names or image_ids
+    colors: dict,                     # band -> RGB tuple OR colormap
+    reference_band: str | None = None,
+
+    stretch: dict | None = None,       # band -> 'linear' | 'log' | 'asinh'
+    scale_lims: dict | None = None,    # band -> (vmin, vmax)
+    gamma: float = 1.0,
+):
+
+    if reference_band is None:
+        reference_band = bands[0]
+
+    ref_img = self.images[reference_band]
+    ref_wcs = ref_img.wcs
+    ref_shape = ref_img.data.shape
+
+
+    rgb = np.zeros((*ref_shape, 3), dtype=float)
+
+    for band in bands:
+
+        img = self.images[band]
+        data = img.data.astype(float)
+
+        # Reproject
+        data_r, _ = reproject_interp(
+            (data, img.wcs),
+            ref_wcs,
+            shape_out=ref_shape
+        )
+
+        # Mask invalid
+        data_r[~np.isfinite(data_r)] = 0.0
+
+        # Scaling limits
+        if scale_lims and band in scale_lims:
+            vmin, vmax = scale_lims[band]
+        else:
+            vmin, vmax = 1, 99.99
+            
+        vmin, vmax = np.nanpercentile(data_r[data_r > 0], (vmin, vmax))
+
+        data_r = np.clip(data_r, vmin, vmax)
+        data_r = (data_r - vmin) / (vmax - vmin)
+
+        # Stretch
+        mode = stretch.get(band, 'linear') if stretch else 'linear'
+        if mode == 'log':
+            data_r = np.log10(1 + 9 * data_r)
+        elif mode == 'asinh':
+            data_r = np.arcsinh(10 * data_r) / np.arcsinh(10)
+
+        # Color mapping
+        col = colors[band]
+
+        if isinstance(col, tuple):
+            for c in range(3):
+                rgb[..., c] += data_r * col[c]
+        else:
+            cmap = plt.get_cmap(col)
+            rgb += cmap(data_r)[..., :3]
+
+
+    rgb = np.clip(rgb, 0, None)
+    rgb /= np.nanmax(rgb)
+    rgb = rgb ** (1 / gamma)
+
+    rgb_image = Image(data=rgb,wcs=ref_wcs,)
+
+    self.images['rgb'] = rgb_image
+
+    
+
+
+
+def plot_false_color(self,
+                    rgb_image,
+                    regions=[],                              # List of Region objects
+                    contours=[],                             # List of Contour objects
+                    points=[],                               # List of Point objects
+                            
+                    # --- Coordinate cuts (world coordinates)
+                    ra_min=None, ra_max=None,             # RA limits (deg or sexagesimal string, e.g., '12:59:00.6')
+                    dec_min=None, dec_max=None,           # Dec limits (deg or sexagesimal string, e.g., '28:07:35.0')
+                
+                    # --- Display options
+                    figsize=(10,10),                          # Overall figure size (width, height) in inches
+                
+                    # --- Axis ticks
+                    n_xticks=5, n_yticks=5,                 # Number of ticks along x and y axes
+                    axis_label_fontsize=12,                      # Font size for axis labels
+                    axis_ticks_fontsize=10,                      # Font size for tick labels
+                    show_region_captions = True, 
+
+                    title = False,
+                    title_fontsize = 10,
+                    title_loc = (0.5,0.96),
+                    title_color = 'white',
+                    legend = False,
+                    legend_loc = 'upper left',
+                    legend_fontsize=10,
+                    ):
+    
+    image = self.images[rgb_image].data
+    wcs = self.images[rgb_image].wcs
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.imshow(image,origin='lower')
+
+    # ---- Ticks and Labels ----
+    add_ra_dec_ticks(ax, image, wcs, n_xticks, n_yticks,axis_ticks_fontsize, axis_label_fontsize,ra_min, ra_max, dec_min, dec_max)
+        
+    
+    legend_handles = []
+    
+    # ---- Regions ----
+    # This works for masks 
+    for Reg in regions:
+
+        ny, nx = Reg.mask.shape
+        ra_max_reg, dec_min_reg = Reg.wcs.all_pix2world([[0, 0]], 0)[0]
+        ra_min_reg, dec_max_reg = Reg.wcs.all_pix2world([[nx, ny]], 0)[0]
+        x_min, y_min = wcs.all_world2pix([[ra_max_reg, dec_min_reg]], 0)[0]
+        x_max, y_max = wcs.all_world2pix([[ra_min_reg, dec_max_reg]], 0)[0]
+        
+        X_low = np.linspace(x_min, x_max, Reg.mask.shape[1])
+        Y_low = np.linspace(y_min, y_max, Reg.mask.shape[0])
+        X_low, Y_low = np.meshgrid(X_low, Y_low)
+        ax.contour(X_low,Y_low,Reg.mask,levels=[0.5],
+            colors=Reg.color,linestyles=Reg.linestyle,linewidths=Reg.linewidth,alpha=Reg.alpha) 
+        
+        if Reg.caption_coords and (Reg.id or 'id' in Reg.header.keys() or 'ID' in Reg.header.keys()) and show_region_captions:
+            x, y = wcs.all_world2pix([[Reg.caption_coords[0], Reg.caption_coords[1]]], 0)[0]
+            ax.text(x, y, Reg.id, color='white',fontsize=Reg.caption_fontsize, ha='center', va='center', fontweight='bold',
+                        bbox=dict(facecolor='black', alpha=0.5, edgecolor='none'))
+
+        if Reg.label:
+            handle = Line2D([0], [0], color=Reg.color, linestyle=Reg.linestyle, linewidth = Reg.linewidth, alpha=Reg.alpha, label=Reg.label)
+            legend_handles.append(handle)
+
+
+    # ---- Contours -----
+    for Con in contours:
+
+        image = gaussian_filter(Con.image, sigma=2.5)
+        (ra1, dec0), (ra0, dec1) = Con.wcs.all_pix2world([[0, 0], [image.shape[1], image.shape[0]]], 0)
+
+        (x0, y0), (x1, y1) = wcs.all_world2pix([[ra1, dec0], [ra0, dec1]], 0)
+
+        X = np.linspace(x0, x1, image.shape[1])
+        Y = np.linspace(y0, y1, image.shape[0])
+        X, Y = np.meshgrid(X, Y)
+
+        cs = ax.contour(X, Y, image, levels=Con.levels, colors=Con.color, linewidths=Con.linewidth, alpha=Con.alpha)
+                
+        if Con.clabel_fmt:
+            ax.clabel(cs, inline=True, fontsize=Con.clabel_fontsize, fmt=Con.clabel_fmt, colors=Con.color)
+
+        if Con.label:
+                handle = Line2D([0], [0], color=Con.color, linestyle=Con.linestyle, linewidth=Con.linewidth, alpha=Con.alpha, label=Con.label)
+                legend_handles.append(handle)
+
+    # ---- Scatter points (RA/Dec to pixels) ----
+    for P in points:
+        coords = P.coords
+        x, y = wcs.all_world2pix([[coords[0], coords[1]]], 0)[0]
+
+        ax.scatter(x, y, c=P.color, marker=P.m, s=P.s)
+        if P.caption:
+            x_ax, y_ax = ax.transData.transform((x, y))  # pixels in figure
+            x_ax, y_ax = ax.transAxes.inverted().transform((x_ax, y_ax))  # 0-1 in axes
+            ax.text(x_ax+P.caption_offset[0], y_ax+P.caption_offset[1], P.caption,color=P.color, fontsize=P.caption_fontsize,
+                        ha='center', va='center', fontweight='bold',transform=ax.transAxes)
+
+    # ---- Legend ----
+    if legend:
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc=legend_loc, fontsize=legend_fontsize)
+
+
+    if title:
+        ax.text(
+            title_loc[0],title_loc[1],
+            title,
+            color=title_color,
+            fontsize=title_fontsize,
+            ha='center',       # orizzontale: left, center, right
+            va='bottom',       # verticale: bottom, center, top
+            transform=ax.transAxes  # usa coordinate relative all'axes
+        )
+
 
 
 
