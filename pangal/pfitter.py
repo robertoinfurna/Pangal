@@ -346,6 +346,7 @@ class PFitter():
         fscale = 10**m_star / (luminosity_distance * 1e5)**2
         total_spec *= fscale
 
+
         if not likelihood_call:
             # --- Build FITS header ---
             header = fits.Header()
@@ -374,18 +375,51 @@ class PFitter():
             # --- Create Spectrum object ---
             spec = Spectrum(wl=model_red_wl, resolution=self.model_res, flux=total_spec, header=header)
 
+            
             if multi_component:
-                # Save components (rescaled to observed frame)
-                for s in [young_stellar_nebular_spec, old_stellar_nebular_spec,
-                        att_young_stellar_nebular_spec, att_old_stellar_nebular_spec, dust_spec]:
-                    s /= (1 + redshift)
-                    s *= fscale
-                spec.young_stellar_nebular = young_stellar_nebular_spec
-                spec.old_stellar_nebular   = old_stellar_nebular_spec
-                spec.att_young_stellar_nebular = att_young_stellar_nebular_spec
-                spec.att_old_stellar_nebular   = att_old_stellar_nebular_spec
-                spec.dust = dust_spec
+                # --- Rescale fluxes to observed frame ---
+                # Avoid modifying the original arrays if needed later
+                young_stellar_nebular_flux = young_stellar_nebular_spec / (1 + redshift) * fscale
+                old_stellar_nebular_flux   = old_stellar_nebular_spec   / (1 + redshift) * fscale
+                att_young_stellar_nebular_flux = att_young_stellar_nebular_spec / (1 + redshift) * fscale
+                att_old_stellar_nebular_flux   = att_old_stellar_nebular_spec   / (1 + redshift) * fscale
+                dust_flux = dust_spec * fscale / (1 + redshift)
 
+                # --- Save main components ---
+                spec.young_stellar_nebular = Spectrum(
+                    wl=model_red_wl,
+                    resolution=self.model_res,
+                    flux=young_stellar_nebular_flux,
+                    header={**header, "COMPONENT": "young stellar and nebular spectrum, not attenuated by dust"}
+                )
+
+                spec.old_stellar_nebular = Spectrum(
+                    wl=model_red_wl,
+                    resolution=self.model_res,
+                    flux=old_stellar_nebular_flux,
+                    header={**header, "COMPONENT": "old stellar and nebular spectrum, not attenuated by dust"}
+                )
+
+                spec.att_young_stellar_nebular = Spectrum(
+                    wl=model_red_wl,
+                    resolution=self.model_res,
+                    flux=att_young_stellar_nebular_flux,
+                    header={**header, "COMPONENT": "young stellar and nebular spectrum, attenuated by dust"}
+                )
+
+                spec.att_old_stellar_nebular = Spectrum(
+                    wl=model_red_wl,
+                    resolution=self.model_res,
+                    flux=att_old_stellar_nebular_flux,
+                    header={**header, "COMPONENT": "old stellar and nebular spectrum, attenuated by dust"}
+                )
+
+                spec.dust = Spectrum(
+                    wl=model_red_wl,
+                    resolution=self.model_res,
+                    flux=dust_flux,
+                    header={**header, "COMPONENT": "dust emission spectrum"}
+                )
 
             return spec
         
@@ -681,7 +715,6 @@ class PFitter():
                             return -1e100
                         phot_lhood += np.log(terf)
 
-                #phot_lhood /= N_phot
 
 
             # ----------------- Spectral likelihood (features only) -------------
@@ -705,12 +738,17 @@ class PFitter():
                 # Spectroscopy → many points (hundreds–thousands), often correlated, continuum-dominated
                 # Photometry → few points (∼5–30), independent, broadband
 
-                flux_err_true = flux_err * np.exp(spec_noise_scale)
+
+                # Fractional calibration uncertainty, e.g., 5%
+                epsilon_calib = 0.05
+                flux_err_true = np.sqrt(flux_err**2 + (model * epsilon_calib)**2)
+
+                #flux_err_true = flux_err * np.exp(spec_noise_scale)
 
                 residuals = (flux_obs - model) / (flux_err_true)
                 spec_lhood = -0.5 * np.sum(residuals**2 + np.log(2 * np.pi * (flux_err_true)**2)) 
                 
-                #spec_lhood /= N_spec_eff
+  
 
             
             return spec_lhood + phot_lhood
@@ -871,9 +909,8 @@ class PFitter():
                                 kind='linear', bounds_error=False, fill_value=np.nan)(wl_obs) 
 
         # --- User-selected wavelength range for continuum fit ---
-        sr = spectral_range
-        wl_fit_min = sr[0][0] if isinstance(sr[0], (list, tuple)) else sr[0]
-        wl_fit_max = sr[-1][1] if isinstance(sr[-1], (list, tuple)) else sr[1]
+        wl_fit_min = spectral_range[0][0] if isinstance(spectral_range[0], (list, tuple)) else spectral_range[0]
+        wl_fit_max = spectral_range[-1][1] if isinstance(spectral_range[-1], (list, tuple)) else spectral_range[1]
 
 
         # ---------------- 1) Build a safe mask for continuum fitting ----------------

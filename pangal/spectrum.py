@@ -20,7 +20,7 @@ from matplotlib.lines import Line2D
 
 from .photometry_table import PhotometryTable
 from .filter import Filter, map_filter_names, nice_filter_names
-from .data.spectral_lines import spectral_lines, UBGVRI_filters, atmospheric_lines
+from .data.spectral_lines import spectral_lines, top_galaxy_lines, UBGVRI_filters, atmospheric_lines
 
 
 @dataclass
@@ -123,7 +123,7 @@ class Spectrum:
             header = fits.Header()
             header['units'] = units
 
-            return PhotometryTable(data={"0":data}, header=header)
+            return PhotometryTable(data=data, header=header)
         
 
         # FOR LIKELIHOOD! self is the synthetic spectrum!
@@ -156,7 +156,6 @@ class Spectrum:
         self,
         spectra=None,
 
-
         # main
         log=True,
         normalized=False,
@@ -187,11 +186,13 @@ class Spectrum:
         
         # optionals
         redshift=None,
-        show_H_lines=False,
+        show_top_spectral_lines=False,
         show_all_spectral_lines=False,
         show_atmospheric_lines=False,
         show_filters=False,
         
+        equivalent_widths=False,
+        ew_window=5,
 
         phot=None,
         synth_phot=None,
@@ -201,7 +202,17 @@ class Spectrum:
         show_spec_legend=True,
         spec_legend_loc="upper left",
         spec_legend_title=None,
+        spec_legend_fontsize=10,
     ):
+
+
+        if normalized or remove_continuum or zoom_on_line:
+            phot_points = False
+            synth_phot_points = False
+
+        if equivalent_widths:
+            remove_continuum = True
+
 
         # --- Prepare spectra list ---
         if spectra is None:
@@ -220,10 +231,6 @@ class Spectrum:
 
         cols = zoom_on_line if zoom_on_line else [None]
 
-
-        if normalized or remove_continuum or zoom_on_line:
-            phot_points = False
-            synth_phot_points = False
 
 
 
@@ -291,17 +298,22 @@ class Spectrum:
 
                 # --- Label ---
                 label = None
+
                 if isinstance(spec_legend_pars, str):
-                    label = spec.header.get(spec_legend_pars)
+                    label = str(spec.header.get(spec_legend_pars))
+
                 elif isinstance(spec_legend_pars, dict):
-                    parts = [
-                        f"{spec_legend_pars[k][0]}={spec.header[k]} {spec_legend_pars[k][1]}"
-                        for k in spec_legend_pars
-                        if k in spec.header
-                    ]
+                    parts = []
+                    for k, p in spec_legend_pars.items():
+                        if k in spec.header:
+                            parts.append(
+                                f"{p['label']}={spec.header[k]:{p['fmt']}} {p['unit']}"
+                            )
                     label = ", ".join(parts) if parts else None
+
                 else:
                     label = spec.header.get("ID", getattr(spec, "id", None))
+
                 if not label:
                     label = "observed spectrum"
 
@@ -312,7 +324,6 @@ class Spectrum:
                 # optional normalizations
 
                 if normalized:
-                    
                     normalization = np.median(flux) #### FIX HERE!!!
 
                 elif remove_continuum:
@@ -322,10 +333,8 @@ class Spectrum:
 
                     # Fit continuum only inside the plotting window (x0, x1)
                     # Use deg=3 (or 1-4 depending on shape); sigma-clipping iter=6 recommended
-                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6,
-                                                    method='poly', fit_region=(x0, x1))
+                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6, method='poly', fit_region=(x0, x1))
                     normalization = continuum
-
                 else:
                     normalization = 1
 
@@ -354,12 +363,36 @@ class Spectrum:
 
 
                 if draw_continuum:
-                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6,
-                                method='poly', fit_region=(x0, x1))
-                    ax.plot(wl,continuum,color='black',label='continuum deg 7')
+                    continuum = self._fit_continuum(wl, flux, deg=7, sigma=2.0, iters=6, method='poly', fit_region=(x0, x1))
+                    ax.plot(wl,continuum,color=c,linestyle=':',label='continuum')
 
                 spec_handles.append(handle)
                 spec_labels.append(label)
+
+                # --- Equivalent widths --- #
+                if equivalent_widths:
+                    for name, wavelength in spectral_lines.items():
+
+                        # observed-frame wavelength
+                        wl_shift = self._angstrom_to_wl(wavelength * (1 + z), x_u)
+
+                        if x0 < wl_shift < x1:
+
+                            # define integration window around the line (example: ±5 Å)
+                            lmin = wl_shift - ew_window
+                            lmax = wl_shift + ew_window
+
+                            # restrict to plotting range
+                            lmin = max(lmin, x0)
+                            lmax = min(lmax, x1)
+
+                            # interpolated normalized flux function
+                            spec_func = lambda l: np.interp(l, wl, flux)
+
+                            # EW for continuum-normalized flux
+                            EW, _ = quad(lambda l: 1.0 - spec_func(l), lmin, lmax)
+
+                            print(f"Line {name} EW: {EW:.2f} Å")
 
 
 
@@ -378,15 +411,16 @@ class Spectrum:
                         marker = next(markers)
                         h = ax.scatter(
                             wl_plot, flux_val/normalization,
-                            s=200,               # bigger marker size
+                            s=100,               # bigger marker size
                             facecolors='white',  # hollow center
-                            edgecolors='black',  # black edge
+                            edgecolors=c,  # black edge
                             marker=marker,
                             zorder=3,
                             label=None           # optional: don't add to legend to avoid duplicates
                         )
                         band_handles[band] = h
                         band_labels[band] = nice_filter_names.get(band, band)
+
 
 
             # --- Photometric points ---
@@ -425,6 +459,8 @@ class Spectrum:
 
             y0 = ymin if ymin is not None else (0.8 * global_fmin if global_fmin > 0 else 1e-3 * global_fmax)
             y1 = ymax if ymax is not None else (1.4 * global_fmax if log is False else 10 * global_fmax)
+            if ymin is None and y0 < 1e-4 * y1:
+                y0 = 1e-4 * y1
             ax.set_xlim(x0, x1)
             ax.set_ylim(y0, y1)
 
@@ -435,8 +471,11 @@ class Spectrum:
                 unit_label = x_u 
             ax.set_xlabel(f"Wavelength ({unit_label})")
             ylabel = r"$\lambda \times F_\lambda$" if per_wavelength else "Flux"
+           
             if y_u == 'erg/s/cm2/A':
                 unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
+            if y_u == 'erg/s/A':
+                unit_label = 'erg/s/Å$' if per_wavelength == False else 'erg/s'
             else: unit_label = y_u
             ax.set_ylabel(f"{ylabel} ({unit_label})")
             if normalized or remove_continuum:
@@ -450,6 +489,7 @@ class Spectrum:
                 spec_legend = ax.legend(
                     spec_handles,
                     spec_labels,
+                    fontsize=spec_legend_fontsize,
                     title=spec_legend_title,
                     loc=spec_legend_loc,
                     frameon=False
@@ -478,25 +518,27 @@ class Spectrum:
 
 
             # --- Optionals ---
+            name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$',
+                'Lya': 'Ly$\\alpha$','Lyb': 'Ly$\\beta$','Lyg': 'Ly$\\gamma$',}
+            top_galaxy_lines = ["Lya","Lyb","Lyman break","Ha","Hb","Hg","Hd","[O III] 5007","[O II] 3727","[S II] 6716","He II 4686"]
 
-            if show_H_lines:
-                for name in ['Lya','Ha','Hb','Hg','Hd']:
+
+            if show_top_spectral_lines:
+                for name in top_galaxy_lines:
                     wavelength = spectral_lines[name]
                     wl_shift = self._angstrom_to_wl(wavelength * (1 + z), x_u)
                     if wl_shift > x0 and wl_shift < x1:
                         ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
                         ax.text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
                                 rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
+
             if show_all_spectral_lines:
                 for name, wavelength in spectral_lines.items():
-                    wavelength = spectral_lines[name]
                     wl_shift = self._angstrom_to_wl(wavelength * (1 + z), x_u)
                     if wl_shift > x0 and wl_shift < x1:
                         ax.axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
                         ax.text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
                                 rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
@@ -510,7 +552,6 @@ class Spectrum:
                         ax.text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
                                 va="bottom", fontsize=9, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-
 
 
         plt.tight_layout(rect=[0,0,0.85,1])
