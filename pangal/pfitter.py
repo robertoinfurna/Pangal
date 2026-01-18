@@ -20,7 +20,7 @@ from .run import Run
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 from .data.spectral_lines import atmospheric_lines
 
-from .pfitter_utils import load_nebular_tables, load_dust_emission_models, dust_attenuation_curve, model_grid_interpolator, load_spectrum_models_from_fits
+from .pfitter_utils import load_nebular_tables, load_dust_emission_models, model_grid_interpolator, load_spectrum_models_from_fits
 
 """
 PFitter
@@ -59,16 +59,16 @@ class PFitter():
         print("Loading models from ",model_file)
         model_list = load_spectrum_models_from_fits(model_file)
 
+        ### ADDED LATER!! JUST DIAGNOSTICS
+        self.model_list = model_list
+
         # Menages model grid
         if not isinstance(model_list, list):
             raise ValueError("Error: model_grid is not a numpy array.")
 
-        self.interp_young_flux, self.interp_old_flux, self.model_pars_arr, self.short_model_wl  = self.model_grid_interpolator(model_list, self.model_pars)
 
-        print(f" Pre-computed model grid:")
-        for name, arr in zip(self.model_pars, self.model_pars_arr):
-            print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")
-        print("\n")
+        # Model wavelength
+        sps_models_wl = model_list[0].wl
         
         #get the wavelength information for the dust templates to stitch it to the stellar model wl 
         #this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,25 +78,37 @@ class PFitter():
 
         #expand wavelength grid to include range covered by dust templates
         # Find the extended part of dust_wl
-        extra_wl_mask = dust_wl > self.short_model_wl.max()
+        extra_wl_mask = dust_wl > sps_models_wl.max()
         extra_wl = dust_wl[extra_wl_mask]
 
         # Extend wavelength grid
-        self.model_wl = np.r_[self.short_model_wl, extra_wl]
+        self.model_wl = np.r_[sps_models_wl, extra_wl]
 
         # Extend resolution array with constant value matching the number of extra wavelengths
         last_res = model_list[0].resolution[-1]
         extra_res = np.full(extra_wl.size, last_res)
 
         # Concatenate the original model resolution with the extended constant resolution
-        self.model_res = np.r_[model_list[0].resolution, extra_res]
+        self.model_resolution = np.r_[model_list[0].resolution, extra_res]
+
+
+        # INTERPOLATION!
+        self.interp_young_flux, self.interp_old_flux, self.model_pars_arr, _ = self.model_grid_interpolator(model_list, self.model_pars)
+
+        print(f" Pre-computed model grid:")
+        for name, arr in zip(self.model_pars, self.model_pars_arr):
+            print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")
+        print("\n")
+        
+
+
 
         # PRECOMPUTES DUST ATTENUATION CURVE (Calzetti, 2000 + optional Leitherer+2002 + optional UV bump)
         self.k_cal = self.dust_attenuation_curve(self.model_wl, leitatt, uv_bump)
         print('Dust attenuation curve from Calzetti 2000.')
 
         # LOADS NEBULAR LINE TABLES
-        self.nebular_func, self.nebular_ions, self.nebular_ages = self.load_nebular_tables(self.model_wl,self.model_res, emimetal,emimodel)
+        self.nebular_func, self.nebular_ions, self.nebular_ages = self.load_nebular_tables(self.model_wl,self.model_resolution, emimetal,emimodel)
 
         # LOADS DUST EMISSION SPECTRA
         # This can be moved above for computing dust_wl only once?
@@ -109,48 +121,6 @@ class PFitter():
     load_dust_emission_models = load_dust_emission_models
     model_grid_interpolator = model_grid_interpolator
 
-
-
-
-
-    # Dust attenuation curve based on Calzetti et al. (2000) law
-    # wl must be in Angstrom
-    # Takes in imput an array of wavelengths and returns the attenuation function
-
-    def dust_attenuation_curve(self, wl, leitatt, uv_bump):
-        
-        k_cal = np.zeros(len(wl), dtype=float)  # cal for Calzetti
-
-        #compute attenuation assuming Calzetti+ 2000 law
-        #single component 
-
-        R = 4.05
-        div = wl.searchsorted(6300., side='left')
-        
-        #Longer than 6300
-        k_cal[div:] = 2.659*( -1.857 + 1.04*(1e4/wl[div:])) + R
-        #Shorter than 6300
-        k_cal[:div] = 2.659*(-2.156 + 1.509*(1e4/wl[:div]) - 0.198*(1e4/wl[:div])**2 + 0.011*(1e4/wl[:div])**3) + R
-        
-
-        #IF REQUESTED Use leitherer 2002 formula below 1500A
-        if leitatt:
-            div = wl.searchsorted(1500., side='left')
-            #Shorter than 1500
-            k_cal[:div] = (5.472 + 0.671e4 / wl[:div] - 9.218e5 / wl[:div] ** 2 + 2.620e9 / wl[:div] ** 3)
-
-        #Prevents negative attenuation, which can arise from extrapolation or math artifacts
-        zero = bisect_left(-k_cal, 0.)
-        k_cal[zero:] = 0.
-
-        #2175A bump
-        if uv_bump:
-            eb = 1.0
-            k_bump = np.zeros(len(wl), dtype=float)
-            k_bump[:] = eb*(wl*350)**2 / ((wl**2 - 2175.**2)**2 + (wl*350)**2)
-            k_cal += k_bump
-
-        return 0.4 * k_cal / R
 
 
 
@@ -219,8 +189,8 @@ class PFitter():
         old_stellar_spec   = self.interp_old_flux(**kwargs)
 
         # Resample to model wavelength grid
-        young_stellar_spec = np.interp(self.model_wl, self.short_model_wl, young_stellar_spec)
-        old_stellar_spec   = np.interp(self.model_wl, self.short_model_wl, old_stellar_spec)
+        #young_stellar_spec = np.interp(self.model_wl, self.short_model_wl, young_stellar_spec)
+        #old_stellar_spec   = np.interp(self.model_wl, self.short_model_wl, old_stellar_spec)
 
         # --- Ionizing photons and nebular emission ---
         index_lyman = np.searchsorted(self.model_wl, 912, side="left")
@@ -288,7 +258,7 @@ class PFitter():
         if vel_sys and sigma_vel:
             
             # --- Estimate internal broadening (model resolution) ---
-            sigma_v_internal = c / (self.model_res * 2.355)  # per-pixel σ_v array
+            sigma_v_internal = c / (self.model_resolution * 2.355)  # per-pixel σ_v array
             sigma_v_internal_med = np.median(sigma_v_internal)
 
             # --- Compute net broadening to apply ---
@@ -318,7 +288,7 @@ class PFitter():
             sigma_obs_kms = (fwhm_obs / 2.355) * (c / model_red_wl)
 
             # Convert model intrinsic R to σ_v
-            fwhm_model = model_red_wl / self.model_res
+            fwhm_model = model_red_wl / self.model_resolution
             sigma_model_kms = (fwhm_model / 2.355) * (c / model_red_wl)
 
             # σ to apply
@@ -373,7 +343,7 @@ class PFitter():
                     header[key] = str(v)
 
             # --- Create Spectrum object ---
-            spec = Spectrum(wl=model_red_wl, resolution=self.model_res, flux=total_spec, header=header)
+            spec = Spectrum(wl=model_red_wl, resolution=self.model_resolution, flux=total_spec, header=header)
 
             
             if multi_component:
@@ -388,35 +358,35 @@ class PFitter():
                 # --- Save main components ---
                 spec.young_stellar_nebular = Spectrum(
                     wl=model_red_wl,
-                    resolution=self.model_res,
+                    resolution=self.model_resolution,
                     flux=young_stellar_nebular_flux,
                     header={**header, "COMPONENT": "young stellar and nebular spectrum, not attenuated by dust"}
                 )
 
                 spec.old_stellar_nebular = Spectrum(
                     wl=model_red_wl,
-                    resolution=self.model_res,
+                    resolution=self.model_resolution,
                     flux=old_stellar_nebular_flux,
                     header={**header, "COMPONENT": "old stellar and nebular spectrum, not attenuated by dust"}
                 )
 
                 spec.att_young_stellar_nebular = Spectrum(
                     wl=model_red_wl,
-                    resolution=self.model_res,
+                    resolution=self.model_resolution,
                     flux=att_young_stellar_nebular_flux,
                     header={**header, "COMPONENT": "young stellar and nebular spectrum, attenuated by dust"}
                 )
 
                 spec.att_old_stellar_nebular = Spectrum(
                     wl=model_red_wl,
-                    resolution=self.model_res,
+                    resolution=self.model_resolution,
                     flux=att_old_stellar_nebular_flux,
                     header={**header, "COMPONENT": "old stellar and nebular spectrum, attenuated by dust"}
                 )
 
                 spec.dust = Spectrum(
                     wl=model_red_wl,
-                    resolution=self.model_res,
+                    resolution=self.model_resolution,
                     flux=dust_flux,
                     header={**header, "COMPONENT": "dust emission spectrum"}
                 )
@@ -486,6 +456,46 @@ class PFitter():
 
 
 
+    # Dust attenuation curve based on Calzetti et al. (2000) law
+    # wl must be in Angstrom
+    # Takes in imput an array of wavelengths and returns the attenuation function
+
+    def dust_attenuation_curve(self, wl, leitatt, uv_bump):
+        
+        k_cal = np.zeros(len(wl), dtype=float)  # cal for Calzetti
+
+        #compute attenuation assuming Calzetti+ 2000 law
+        #single component 
+
+        R = 4.05
+        div = wl.searchsorted(6300., side='left')
+        
+        #Longer than 6300
+        k_cal[div:] = 2.659*( -1.857 + 1.04*(1e4/wl[div:])) + R
+        #Shorter than 6300
+        k_cal[:div] = 2.659*(-2.156 + 1.509*(1e4/wl[:div]) - 0.198*(1e4/wl[:div])**2 + 0.011*(1e4/wl[:div])**3) + R
+        
+
+        #IF REQUESTED Use leitherer 2002 formula below 1500A
+        if leitatt:
+            div = wl.searchsorted(1500., side='left')
+            #Shorter than 1500
+            k_cal[:div] = (5.472 + 0.671e4 / wl[:div] - 9.218e5 / wl[:div] ** 2 + 2.620e9 / wl[:div] ** 3)
+
+        #Prevents negative attenuation, which can arise from extrapolation or math artifacts
+        zero = bisect_left(-k_cal, 0.)
+        k_cal[zero:] = 0.
+
+        #2175A bump
+        if uv_bump:
+            eb = 1.0
+            k_bump = np.zeros(len(wl), dtype=float)
+            k_bump[:] = eb*(wl*350)**2 / ((wl**2 - 2175.**2)**2 + (wl*350)**2)
+            k_cal += k_bump
+
+        return 0.4 * k_cal / R
+
+
 
     ###################################################### --- FIT --- #################################################################
 
@@ -544,6 +554,7 @@ class PFitter():
         run.custom_priors = custom_priors
         run.fix_pars = dict(fix_pars) 
         
+
         # --- bands selection ---
         if phot is not None:
             if bands:
@@ -557,7 +568,7 @@ class PFitter():
             print(f"Using the following photometric filters: {', '.join(run.bands)}")
 
             run.phot = phot
-
+            
 
         # --- preprocess observed spectrum once (done here) ---
         if spec:
@@ -634,7 +645,7 @@ class PFitter():
                 )(self.model_wl)
 
                 # Autocorrelation of spectral pixels. Information is not independent
-                N_spec_eff = np.sum(run.spec_crop.resolution / run.spec_crop.wl * np.gradient(run.spec_crop.wl))
+                #N_spec_eff = np.sum(run.spec_crop.resolution / run.spec_crop.wl * np.gradient(run.spec_crop.wl))
 
         # --- closure used by the sampler ---
         def log_likelihood(pars):
@@ -695,6 +706,8 @@ class PFitter():
                                                 observed_spectrum_resolution=obs_resolution_on_model_grid,
                                                 likelihood_call=True,)
 
+
+
             # ----------------- Photometric likelihood -----------------
             if phot is not None:
 
@@ -737,20 +750,15 @@ class PFitter():
                 # Free nuisance parameter: This is not arbitrary — it is equivalent to marginalizing over unknown variance.
                 # Spectroscopy → many points (hundreds–thousands), often correlated, continuum-dominated
                 # Photometry → few points (∼5–30), independent, broadband
+                                
+                flux_err_corr = flux_err * np.exp(spec_noise_scale)
 
-
-                # Fractional calibration uncertainty, e.g., 5%
-                epsilon_calib = 0.05
-                flux_err_true = np.sqrt(flux_err**2 + (model * epsilon_calib)**2)
-
-                #flux_err_true = flux_err * np.exp(spec_noise_scale)
-
-                residuals = (flux_obs - model) / (flux_err_true)
-                spec_lhood = -0.5 * np.sum(residuals**2 + np.log(2 * np.pi * (flux_err_true)**2)) 
+                residuals = (flux_obs - model) / (flux_err_corr)
                 
-  
-
-            
+                chi2 = np.sum(residuals**2)
+                
+                spec_lhood = - 0.5 * chi2  - np.sum (np.log( np.sqrt(2 * np.pi) * flux_err_corr))
+                            
             return spec_lhood + phot_lhood
 
         return log_likelihood
@@ -782,7 +790,7 @@ class PFitter():
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
             'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
             'redshift': {'type': 'uniform', 'low': 0, 'high': 6},    
-            'spec_noise_scale': {'type': 'gaussian', 'mean': 0, 'sigma': 4}           
+            'spec_noise_scale': {'type': 'uniform', 'low': -2, 'high': 2}        
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]

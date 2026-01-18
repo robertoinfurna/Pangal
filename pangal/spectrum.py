@@ -106,8 +106,8 @@ class Spectrum:
                 trans_curve = filter.transmission_curve
                 lmin, lmax = filter.wavelength_range
 
-                num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l), lmin, lmax)
-                norm_int, _ = quad(lambda l: trans_curve(l), lmin, lmax)
+                num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l) * l, lmin, lmax)
+                norm_int, _ = quad(lambda l: trans_curve(l) * l, lmin, lmax)
 
                 phot_point = num_int / norm_int
                 pivot_w = filter.pivot_wavelength  # in Å
@@ -127,17 +127,19 @@ class Spectrum:
         
 
         # FOR LIKELIHOOD! self is the synthetic spectrum!
+        # Authomatically set to mJy!
         else: 
 
             model_phot = []
             for b in bands:
                 mask_b = trans_mask[b]
                 spec_array = self.flux[mask_b]
+                wl_b = self.wl[mask_b] 
                 if len(spec_array) == 0:
                     model_phot.append(np.nan)
                     continue
-                num_int = np.trapz(trans_arrays[b] * spec_array, self.wl[mask_b])
-                den = np.trapz(trans_arrays[b], self.wl[mask_b])
+                num_int = np.trapz(trans_arrays[b] * spec_array * wl_b, wl_b)
+                den = np.trapz(trans_arrays[b] * wl_b, wl_b)
                 if den == 0:
                     model_phot.append(np.nan)
                     continue
@@ -146,9 +148,50 @@ class Spectrum:
                 c = 2.99792458e18  # Å/s
                 phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
                 model_phot.append(phot_point)
-
+                
             return np.array(model_phot)
 
+
+# -------------------------------------------------------------------------
+# SYNTHETIC PHOTOMETRY WEIGHTING
+#
+# There are two commonly used ways to compute synthetic photometric fluxes:
+#
+# (1) ENERGY-WEIGHTED PHOTOMETRY
+#
+#     F_band = ∫ T(λ) · f_λ(λ) dλ  /  ∫ T(λ) dλ
+#
+#     This treats the detector as measuring *energy*.
+#     It is mathematically simple but NOT how real broadband detectors work.
+#
+#
+# (2) PHOTON-WEIGHTED PHOTOMETRY  (USED BY mcspf / FSPS / SVO)
+#
+#     F_band = ∫ T(λ) · f_λ(λ) · λ dλ  /  ∫ T(λ) · λ dλ
+#
+#     Real detectors count photons, not energy.
+#     Since photon number ∝ f_λ(λ) · λ,
+#     the extra factor of λ must be included.
+#
+#
+# IMPORTANT:
+# - mcspf normalizes each filter such that:
+#       ∫ T_norm(λ) · λ dλ = 1
+#
+# - The final band flux is then computed as:
+#       F_band = ∫ T_norm(λ) · f_λ(λ) · λ dλ
+#
+# - This yields a band-averaged f_λ directly comparable to observed fluxes.
+#
+#
+# CONSEQUENCE:
+# Using energy-weighted integration (missing the λ factor)
+# typically produces systematic offsets of ~1–5% relative to mcspf,
+# even if the model spectrum itself is identical.
+#
+# Therefore, to remain fully consistent with mcspf photometry,
+# ALL synthetic photometry must be photon-weighted.
+# -------------------------------------------------------------------------
         
    
 
@@ -442,6 +485,7 @@ class Spectrum:
                     h = ax.errorbar(
                         wl_plot, flux_val_conv, yerr=flux_err_conv,
                         fmt=marker, color='black', ecolor='black', capsize=2, markersize=6,
+                        zorder=4,
                         label=f"{nice_filter_names.get(band, band)} phot"
                     )
                     if x0 <= wl_plot <= x1:
@@ -509,7 +553,7 @@ class Spectrum:
                 labels = list(band_labels.values())
                 ax.legend(
                     handles, labels,
-                    title=f"Photometry",
+                    #title=f"Photometry",
                     loc="center left",
                     bbox_to_anchor=(1.02, 0.5),
                     frameon=False

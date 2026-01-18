@@ -28,6 +28,7 @@ data_dir = os.path.join(this_dir, ".", "data")
 data_dir = os.path.normpath(data_dir)
 
 
+
 def load_spectrum_models_from_fits(filename):
     with fits.open(filename) as hdul:
         # Wavelength array from primary HDU
@@ -40,7 +41,7 @@ def load_spectrum_models_from_fits(filename):
             header = hdul[i].header
 
 
-            spec = Spectrum(wl=wl,resolution=resolution,flux=data["FLUX"])
+            spec = Spectrum(wl=wl,resolution=resolution,) #flux=data["FLUX"])
 
             spec.flux_young = data["FLUX_YOUNG"]
             spec.flux_old   = data["FLUX_OLD"]
@@ -232,148 +233,218 @@ def load_dust_emission_models(self, wl, dustemimodel):
 
 
 
-def model_grid_interpolator(self, model_list, param_names, extra_pars_to_interpolate=None):
+def model_grid_interpolator(self, model_list, param_names):
     """
-    Build N-dimensional interpolators for young and old fluxes.
-
-    Parameters:
-        model_list (list): Flat list of Spectrum models, each with `.flux_young`, `.flux_old`, `.header`
-        param_names (list of str): Names of parameters to define the grid (e.g. ['age', 'tau'])
-
-    Returns:
-        interp_flux_young: Callable f(**params) -> flux_young (shape: n_wl)
-        interp_flux_old: Callable f(**params) -> flux_old (shape: n_wl)
-        grid_axes: List of sorted arrays for each parameter axis
-        wl: Wavelength array (from first model)
+    Build N-dimensional interpolators for young and old fluxes on the model grid,
+    and return callables that output spectra resampled onto self.model_wl.
     """
 
-    # Step 1: Build param space
+    # Native (short) wavelength grid from SPS models
+    short_wl = np.array(model_list[0].wl, dtype=float)
+
+    # --- Step 1: Build param space ---
     param_tuples = []
     param_to_model = {}
     for model in model_list:
         try:
-            values = tuple(model.header[k] for k in param_names)
+            values = tuple(float(model.header[k]) for k in param_names)
         except KeyError as e:
             raise KeyError(f"Model is missing parameter {e} in header.")
         param_tuples.append(values)
         param_to_model[values] = model
 
-    # Step 2: Build grid axes
-    grid_axes = [np.array(sorted(set(p[i] for p in param_tuples))) for i in range(len(param_names))]
+    # --- Step 2: Build grid axes ---
+    grid_axes = [np.array(sorted(set(p[i] for p in param_tuples)), dtype=float)
+                 for i in range(len(param_names))]
 
-    # Step 3: Allocate grids for young and old fluxes
+    # --- Step 3: Allocate grids ---
     grid_shape = tuple(len(ax) for ax in grid_axes)
-    n_wl = model_list[0].flux_young.size
+    n_wl = np.asarray(model_list[0].flux_young).size
 
-    flux_young_grid = np.zeros(grid_shape + (n_wl,))
-    flux_old_grid = np.zeros(grid_shape + (n_wl,))
+    flux_young_grid = np.zeros(grid_shape + (n_wl,), dtype=float)
+    flux_old_grid   = np.zeros(grid_shape + (n_wl,), dtype=float)
 
-    # Step 4: Fill the grids
+    # --- Step 4: Fill the grids (store flux per unit mass, like mcspf) ---
     for idxs in np.ndindex(*grid_shape):
         key = tuple(grid_axes[i][idxs[i]] for i in range(len(grid_axes)))
         model = param_to_model[key]
-        flux_young_grid[idxs] = model.flux_young
-        flux_old_grid[idxs] = model.flux_old
+        mstar = float(model.header["MSTAR"])  # you said: linear in FITS
+        flux_young_grid[idxs] = np.asarray(model.flux_young, dtype=float) / mstar
+        flux_old_grid[idxs]   = np.asarray(model.flux_old,   dtype=float) / mstar
 
-    # Step 5: Build interpolators
-    interp_young = RegularGridInterpolator(points=grid_axes, values=flux_young_grid, bounds_error=False, fill_value=None)
-    interp_old = RegularGridInterpolator(points=grid_axes, values=flux_old_grid, bounds_error=False, fill_value=None)
+    # --- Step 5: Build interpolators on the native wavelength grid ---
+    interp_young = RegularGridInterpolator(
+        points=grid_axes, values=flux_young_grid,
+        bounds_error=True, fill_value=None
+    )
+    interp_old = RegularGridInterpolator(
+        points=grid_axes, values=flux_old_grid,
+        bounds_error=True, fill_value=None
+    )
+
+    # --- Wrappers: interpolate in parameter space, then resample in wavelength to self.model_wl ---
+    def _check_bounds(x):
+        for i, val in enumerate(x):
+            if val < grid_axes[i][0] or val > grid_axes[i][-1]:
+                raise ValueError(
+                    f"Parameter '{param_names[i]}'={val} is outside grid range "
+                    f"[{grid_axes[i][0]}, {grid_axes[i][-1]}]"
+                )
 
     def interp_flux_young(**kwargs):
-        x = [kwargs[name] for name in param_names]
-        return interp_young(x)[0]
+        x = [float(kwargs[name]) for name in param_names]
+        _check_bounds(x)
+
+        # RGI wants (n_points, ndim)
+        spec_short = interp_young(np.array([x], dtype=float))[0]  # (n_wl,)
+
+        # Resample to the extended wavelength grid, matching mcspf left/right=0 behavior
+        return np.interp(self.model_wl, short_wl, spec_short, left=0.0, right=0.0)
 
     def interp_flux_old(**kwargs):
-        x = [kwargs[name] for name in param_names]
-        return interp_old(x)[0]
+        x = [float(kwargs[name]) for name in param_names]
+        _check_bounds(x)
+
+        spec_short = interp_old(np.array([x], dtype=float))[0]
+        return np.interp(self.model_wl, short_wl, spec_short, left=0.0, right=0.0)
+
+    return interp_flux_young, interp_flux_old, grid_axes, short_wl
+
+
+
+"""
+
+def model_grid_interpolator(self, model_list, param_names,):
+
+    n_wl = len(model_list[0].wl)
+
+    #Generate output grid and define interpolation routine to be used
+    if len(param_names)==1:
+        young_grid = np.zeros((len(self.model_pars_arr[0]), n_wl), dtype=float)
+        old_grid = np.zeros((len(self.model_pars_arr[0]), n_wl), dtype=float)
+        age_grid = np.zeros((len(self.model_pars_arr[0]), 2),         dtype=float)
+        interp = _interp
+    elif len(param_names)==2:
+        young_grid = np.zeros((len(self.model_pars_arr[0]),len(self.model_pars_arr[1]), n_wl), dtype=float)
+        old_grid = np.zeros((len(self.model_pars_arr[0]), n_wl), dtype=float)
+        age_grid = np.zeros((len(self.model_pars_arr[0]),len(self.model_pars_arr[1]), 2),         dtype=float)
+        interp = _bi_interp
+    #elif len(param_names)==3:
+    #    self.mod_grid = np.zeros((self.par_len[0], self.par_len[1], self.par_len[2], self.n_wl), dtype=float)
+    #    self.age_grid = np.zeros((self.par_len[0], self.par_len[1], self.par_len[2], 2),         dtype=float)
+    #    self.phy_grid = np.zeros((self.par_len[0], self.par_len[1], self.par_len[2], 2),         dtype=float)
+    #    interp = _tri_interp
+    else:
+        print('ERROR: We cannot handle SFH grids with more than 3 dimensions. Abort')
+        exit()
     
-    return interp_flux_young, interp_flux_old, grid_axes, model_list[0].wl
+    #Grid where the fractional flux from young populations is stored
+    #self.fym_grid = np.zeros_like(self.mod_grid)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Dust attenuation curve based on Calzetti et al. (2000) law
-# Takes in imput an array of wavelengths and returns the attenuation function
-
-def dust_attenuation_curve(wl, leitatt, uv_bump):
-    
-    k_cal = np.zeros(len(wl), dtype=float)  # cal for Calzetti
-
-    #compute attenuation assuming Calzetti+ 2000 law
-    #single component 
-
-    R = 4.05
-    div = wl.searchsorted(6300., side='left')
-    
-    #Longer than 6300
-    k_cal[div:] = 2.659*( -1.857 + 1.04*(1e4/wl[div:])) + R
-    #Shorter than 6300
-    k_cal[:div] = 2.659*(-2.156 + 1.509*(1e4/wl[:div]) - 0.198*(1e4/wl[:div])**2 + 0.011*(1e4/wl[:div])**3) + R
-    
-
-    #IF REQUESTED Use leitherer 2002 formula below 1500A
-    if leitatt:
-        div = wl.searchsorted(1500., side='left')
-        #Shorter than 1500
-        k_cal[:div] = (5.472 + 0.671e4 / wl[:div] - 9.218e5 / wl[:div] ** 2 + 2.620e9 / wl[:div] ** 3)
-
-    #Prevents negative attenuation, which can arise from extrapolation or math artifacts
-    zero = bisect_left(-k_cal, 0.)
-    k_cal[zero:] = 0.
-
-    #2175A bump
-    if uv_bump:
-        eb = 1.0
-        k_bump = np.zeros(len(wl), dtype=float)
-        k_bump[:] = eb*(wl*350)**2 / ((wl**2 - 2175.**2)**2 + (wl*350)**2)
-        k_cal += k_bump
-
+    for i, model in enumerate(model_list):            
+        
+        mmass  = model.header['MSTAR']
+        mmetal = model.header['METAL']
+        
+        #This should be cleaned up
+        #if sfh_age_par == -1:
+        #   mage = mfile[ii].header['AGE']
+        #elif sfh_age_par >=0 and sfh_age_par<=10:
+        #   mage = mfile[ii].header[sfh_pars[sfh_age_par]]
+        #else:
+        #   mage = sfh_age_par      
+        
+        pos_tuple = []
+        for j,param in enumerate(param_names):
+            tmppar = model.header[param]
+            pos_tuple.append(np.where(tmppar == self.model_pars_arr[0])[0])
+        
+        pos_tuple.append(Ellipsis)
+        pos_tuple = tuple(pos_tuple)
             
-    return 0.4 * k_cal / R
+        #self.mod_grid[pos_tuple] = np.interp(self.wl, twl, mdata[:, 0]/mmass, left=0, right=0)
+        #self.fym_grid[pos_tuple] = np.interp(self.wl, twl, mdata[:, 1], left=0, right=0)
+        #self.age_grid[pos_tuple] = mage
+        #self.phy_grid[pos_tuple] = mmass 
 
-
-
-
-
-def vactoair(wl):
-    """Convert vacuum wavelengths to air wavelengths using the conversion
-    given by Morton (1991, ApJS, 77, 119).
-
-    """
-    wave2 = np.asarray(wl, dtype=float)**2
-    fact = 1. + 2.735182e-4 + 131.4182/wave2 + 2.76249e8/(wave2*wave2)
-    return wl/fact
-
-
-def airtovac(wl):
-    """Convert air wavelengths to vacuum wavelengths using the conversion
-    given by Morton (1991, ApJS, 77, 119).
-
-    """
-    sigma2 = np.asarray(1E4/wl, dtype=float)**2
     
-    fact = 1. + 6.4328e-5 + 2.949281e-2/(146.-sigma2) + 2.5540e-4/(41.-sigma2)
-    fact[wl < 2000] = 1.0
+    self.age_max = int(np.nanmax(self.age_grid))
+    self.sfh_array = np.ones((self.age_max), dtype=float)
+    if self.sfh_npars==1:
+        self.sfh_grid = np.zeros((self.par_len[0], self.age_max), dtype=float)
+    elif self.sfh_npars==2:
+        self.sfh_grid = np.zeros((self.par_len[0], self.par_len[1], self.age_max), dtype=float)
+    elif self.sfh_npars==3:
+        self.sfh_grid = np.zeros((self.par_len[0], self.par_len[1], self.par_len[2], self.age_max), dtype=float)
+        
+
+
+
+        
+        #Grid where the fractional flux from young populations is stored
+        #self.fym_grid = np.zeros_like(self.mod_grid)
     
-    return wl*fact
+
+
+
+
+
+
+
+
+
+
+
+def _tri_interp(data_cube, valuetpl, arraytpl):
+    #locate vertices
+    ilo = bisect_left(arraytpl[0], valuetpl[0])-1
+    jlo = bisect_left(arraytpl[1], valuetpl[1])-1
+    klo = bisect_left(arraytpl[2], valuetpl[2])-1
+    
+    di = (valuetpl[0] - arraytpl[0][ilo])/(arraytpl[0][ilo+1]-arraytpl[0][ilo])
+    dj = (valuetpl[1] - arraytpl[1][jlo])/(arraytpl[1][jlo+1]-arraytpl[1][jlo])
+    dk = (valuetpl[2] - arraytpl[2][klo])/(arraytpl[2][klo+1]-arraytpl[2][klo])
+
+    interp_out = data_cube[ilo,jlo,klo,:]       * (1.-di)*(1.-dj)*(1.-dk) + \
+                 data_cube[ilo,jlo,klo+1,:]     * (1.-di)*(1.-dj)*dk + \
+                 data_cube[ilo,jlo+1,klo,:]     * (1.-di)*dj*(1.-dk) + \
+                 data_cube[ilo,jlo+1,klo+1,:]   * (1.-di)*dj*dk + \
+                 data_cube[ilo+1,jlo,klo,:]     * di*(1.-dj)*(1.-dk) + \
+                 data_cube[ilo+1,jlo,klo+1,:]   * di*(1.-dj)*dk + \
+                 data_cube[ilo+1,jlo+1,klo,:]   * di*dj*(1.-dk) + \
+                 data_cube[ilo+1,jlo+1,klo+1,:] * di*dj*dk
+
+    return interp_out
+
+def _bi_interp(data_cube, valuetpl, arraytpl):
+    #locate vertices
+    ilo = bisect_left(arraytpl[0], valuetpl[0])-1
+    jlo = bisect_left(arraytpl[1], valuetpl[1])-1
+       
+    di = (valuetpl[0] - arraytpl[0][ilo])/(arraytpl[0][ilo+1]-arraytpl[0][ilo])
+    dj = (valuetpl[1] - arraytpl[1][jlo])/(arraytpl[1][jlo+1]-arraytpl[1][jlo])
+
+    interp_out = data_cube[ilo,jlo,:]     * (1.-di)*(1.-dj) + \
+                 data_cube[ilo,jlo+1,:]   * (1.-di)*dj + \
+                 data_cube[ilo+1,jlo,:]   * di*(1.-dj) + \
+                 data_cube[ilo+1,jlo+1,:] * di*dj
+
+    return interp_out
+
+def _interp(data_cube, valuetpl, arraytpl):
+    #locate vertices
+    ilo = bisect_left(arraytpl[0], valuetpl[0])-1
+    
+    di = (valuetpl[0] - arraytpl[0][ilo])/(arraytpl[0][ilo+1]-arraytpl[0][ilo])
+
+    interp_out = data_cube[ilo,:]   * (1.-di) + \
+                 data_cube[ilo+1,:] * di
+
+    return interp_out
+
+"""
+
 
 
     
