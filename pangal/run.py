@@ -268,7 +268,7 @@ class Run:
 
 
 
-    def fit_diagnostic(self,
+    def fit_diagnostic_plot(self,
                         models=[],
 
                         method='MAP',
@@ -289,7 +289,7 @@ class Run:
                         show_atmospheric_lines=False,
                         
                         spec_legend_pars=None,
-                        spec_legend_loc="upper left",
+                        spec_legend_loc="upper right",
                         spec_legend_title=None,
 
                         winf_phot=1e2,
@@ -301,6 +301,8 @@ class Run:
 
         ### --- Loading PFitter --- ###
         if self.pfitter is None: 
+
+            # FIX THIS!
 
             print('No PFitter object detected, missing the model grid. Loading models and initialising PFitter')
                     
@@ -522,30 +524,55 @@ class Run:
                 spec_legend_title=None,
             )
 
-            phot_fluxes = np.array([self.phot.data[b][0] for b in self.bands])
-            phot_errors = np.array([self.phot.data[b][1] for b in self.bands])
-            upper_limits = (phot_fluxes / phot_errors < 5).astype(int)
-            phot_units = self.phot.header["UNITS"]
-        
-            trans_mask = {}
-            trans_arrays = {}
-            pivot_wls = {}
-            for b in self.bands:
-                F = Filter(b)
-                lmin, lmax = F.wavelength_range
-                mask_b = (models[0].wl >= lmin) & (models[0].wl <= lmax)
-                trans_mask[b] = mask_b
-                trans_arrays[b] = F.transmission_curve(models[0].wl[mask_b])
-                pivot_wls[b] = F.pivot_wavelength
 
+    #############################################
+
+
+
+
+    def fit_diagnostic_likelihoods(self,
+                        models=[],
+                        method='MAP',
+                        spec_noise_scale = 0,):
+        
+        if self.spec:
+        
+            wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
+            flux_err_corr = flux_err * np.exp(spec_noise_scale)
+
+            header = fits.Header()
+            header["WUNITS"]  = "A"
+            header["FUNITS"]  = "erg/s/cm2/A"
+            spectrum_obs = Spectrum(wl=wl,flux=flux_obs,flux_err=flux_err_corr,header=header)
+            
+            
+            normalization_factor_list = []
+            normalization_factor_smoothed_list = []
+            models_comparable_to_obs = []
+            residuals = []
+            
+            for model in models:
+            
+                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,self.polydeg)
+            
+                normalization_factor_list.append(normalization_factor)
+                normalization_factor_smoothed_list.append(normalization_factor_smoothed)
+            
+                models_comparable_to_obs.append(model)
+
+                res = (flux_obs - model) / flux_err_corr
+                residuals.append(res)
 
 
         ### --- Print likelihoods --- ###
         print('LIKELIHOODS')
-        print(f'Spectral nuisance scale parameter: {spec_noise_scale:.2f} (log). Spectral errors multiplied by {np.exp(spec_noise_scale):.2f}','\n')
-        print(f'spectral likelihood weight (N_corr/N_pix) is: {self.w_spec}')
+        if self.spec:
+            print(f'Spectral nuisance scale parameter: {spec_noise_scale:.2f} (log). Spectral errors multiplied by {np.exp(spec_noise_scale):.2f}','\n')
+            print(f'spectral likelihood weight (N_corr/N_pix) is: {self.w_spec}')
+            print('\n')
 
         for j in range(len(models)):
+            print('###########################')
             print('For model number: ',j+1,'\n')
             
             #if spec_legend_pars: print(spec_legend_pars)
@@ -559,13 +586,29 @@ class Run:
 
                 print(f'Spectral reduced chi2: {chi2/len(flux_obs)}')
 
-                logL = - 0.5 * chi2  - np.nansum (np.log( np.sqrt(2 * np.pi) * flux_err_corr ))
-                print(f'Spectral log-likelihood {logL:.2f}')
+                logL_spec = - 0.5 * chi2  - np.nansum (np.log( np.sqrt(2 * np.pi) * flux_err_corr ))
+                print(f'Spectral log-likelihood {logL_spec:.2f}')
 
                 print('\n')
             
 
             if self.phot:
+
+                phot_fluxes = np.array([self.phot.data[b][0] for b in self.bands])
+                phot_errors = np.array([self.phot.data[b][1] for b in self.bands])
+                upper_limits = (phot_fluxes / phot_errors < 5).astype(int)
+                phot_units = self.phot.header["UNITS"]
+            
+                trans_mask = {}
+                trans_arrays = {}
+                pivot_wls = {}
+                for b in self.bands:
+                    F = Filter(b)
+                    lmin, lmax = F.wavelength_range
+                    mask_b = (models[0].wl >= lmin) & (models[0].wl <= lmax)
+                    trans_mask[b] = mask_b
+                    trans_arrays[b] = F.transmission_curve(models[0].wl[mask_b])
+                    pivot_wls[b] = F.pivot_wavelength
 
                 model_phot_array = models[j].get_phot(bands=self.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
                 
@@ -573,7 +616,7 @@ class Run:
                     raise ValueError(f"Model spectrum {j:.0f} gives invalid photometry")
                                 
                 chi2 = 0.0
-                logL = 0.0
+                logL_phot = 0.0
 
                 residuals_per_band = []
 
@@ -606,7 +649,7 @@ class Run:
                         #    logL = -1e100
                         #    break
 
-                        logL += np.log(cdf)
+                        logL_phot += np.log(cdf)
 
                         residuals_per_band.append(
                             (nice_filter_names[self.bands[i]], arg,)
@@ -615,10 +658,11 @@ class Run:
 
                 print(f"Photometric chi2           = {chi2:.2f}")
                 print(f"Photometric reduced chi2   = {chi2/N_phot:.2f}")
-                print(f"Photometric log-likelihood  = {logL:.2f}")
+                print(f"Photometric log-likelihood  = {logL_phot:.2f}")
 
                 print('\n')
-                                            
+                if self.spec and self.phot:
+                    print(f"TOTAL LIKELIHOOD = {self.w_spec * logL_spec+logL_phot}")                
 
                 print(f"{'Band':<15} {'Residual':>12}")
                 print("-" * 40)
@@ -683,6 +727,7 @@ class Run:
                     obs_spec_res=self.spec.resolution,
                     obs_spec_wl_units=self.spec.header["WUNITS"],
                     obs_spec_flux_units=self.spec.header["FUNITS"],
+                    w_spec=self.w_spec
                 )
             )
 
@@ -790,6 +835,7 @@ class Run:
                     resolution=data["obs_spec_res"],
                     header=hdr,
                 )
+                self.w_spec=data["w_spec"]
 
             # -------------------------------------------------
             # Restore cropped observed spectrum
