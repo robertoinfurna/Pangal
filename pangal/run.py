@@ -662,7 +662,8 @@ class Run:
 
                 print('\n')
                 if self.spec and self.phot:
-                    print(f"TOTAL LIKELIHOOD = {self.w_spec * logL_spec+logL_phot}")                
+                    print(f"TOTAL LIKELIHOOD: {float(self.w_spec):.4f} x logL_spec +  logL_phot = {self.w_spec * logL_spec+logL_phot}") 
+                    print('\n')                 
 
                 print(f"{'Band':<15} {'Residual':>12}")
                 print("-" * 40)
