@@ -536,7 +536,6 @@ class PFitter():
             )
 
 
-
         # ------- safe copies for mutable inputs -------
         fix_pars = {} if fix_pars is None else dict(fix_pars)
         custom_priors = {} if custom_priors is None else dict(custom_priors)
@@ -595,9 +594,15 @@ class PFitter():
 
         global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
                     "alpha", "m_star", "vel_sys", "sigma_vel", "luminosity_distance", "redshift", "spec_noise_scale"]
+        
         run.free_global_pars = [p for p in global_pars if p not in run.fix_pars]
 
         run.free_pars = run.free_model_pars + run.free_global_pars
+
+        for p in run.fix_pars.keys():
+            if p in global_pars: print(f'Fixed parameter: {p} = {run.fix_pars[p]}')
+        for p in run.free_pars: 
+            print('Fitting: ',p)
 
         # --- build likelihood and prior ---
         run.log_likelihood = self.make_log_likelihood(run, spec, phot, run.free_pars)
@@ -635,23 +640,44 @@ class PFitter():
                 trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
                 pivot_wls[b] = F.pivot_wavelength
 
-            N_phot = len(phot_fluxes)
+        if spec is None: 
             obs_resolution_on_model_grid = None
-        
+            w_spec = 0 
+            run.w_spec = None
+
         if spec: 
+                
                 obs_resolution_on_model_grid = interp1d( 
                     run.spec_crop.wl, run.spec_crop.resolution, kind="linear",
                     bounds_error=False, fill_value="extrapolate"
                 )(self.model_wl)
 
+
                 # Autocorrelation of spectral pixels. Information is not independent
-                #N_spec_eff = np.sum(run.spec_crop.resolution / run.spec_crop.wl * np.gradient(run.spec_crop.wl))
+                # Use the same pixels that enter the spectral likelihood
+                wl_obs = run.spec_crop.wl
+                R_obs  = run.spec_crop.resolution  # this should be R(λ)
+                
+                mask_like = (np.isfinite(run.spec_crop.flux)& np.isfinite(run.spec_crop.flux_err)& (run.spec_crop.flux_err > 0)& np.isfinite(R_obs))
+
+                # If you use spectral_range windows, apply them here too (important)
+                # mask_like &= ...
+
+                dlam_obs = np.gradient(wl_obs)
+
+                N_eff = np.sum(R_obs[mask_like] * dlam_obs[mask_like] / wl_obs[mask_like])
+                N_pix = mask_like.sum()
+                w_spec = N_eff / N_pix
+
+                run.w_spec = float(w_spec)
+
 
         # --- closure used by the sampler ---
         def log_likelihood(pars):
+            
             spec_lhood = 0.0
             phot_lhood = 0.0
-
+            
             idx = 0
 
             # ---- MODEL PARAMETERS: only read the *free* model params from pars ----
@@ -759,12 +785,10 @@ class PFitter():
                 
                 spec_lhood = - 0.5 * chi2  - np.sum (np.log( np.sqrt(2 * np.pi) * flux_err_corr))
                             
-            return spec_lhood + phot_lhood
+            return w_spec * spec_lhood + phot_lhood
 
         return log_likelihood
     
-
-
 
 
 
@@ -779,18 +803,22 @@ class PFitter():
 
         # default priors
         priors = {
-            'fesc':    {'type': 'uniform', 'low': 0.0, 'high': 1.0},
+            'fesc':    {'type': 'uniform', 'low': -1.0, 'high': 1.0},
             'ion_gas': {'type': 'uniform', 'low': self.nebular_ions[0], 'high': self.nebular_ions[-1]},
             'age_gas': {'type': 'uniform', 'low': self.nebular_ages[0], 'high': self.nebular_ages[-1] + 1},
             'av':      {'type': 'uniform', 'low': 0.0, 'high': 1.0},
-            'av_ext':  {'type': 'uniform', 'low': 0.0, 'high': 1.0},
+
+            # MATCHES sps_spec_fitter: Av_ext ~ Normal(coef * Av, sigma)
+            'av_ext':  {'type': 'gaussian_conditional', 'depends_on': 'av', 'coef': 1.17, 'sigma': 0.01,
+                        'low': 0.0, 'high': 1.0},
+
             'alpha':   {'type': 'uniform', 'low': self.dustem_alpha[0], 'high': self.dustem_alpha[-1]},
-            'm_star':  {'type': 'uniform', 'low': 7.0, 'high': 11.0},
+            'm_star':  {'type': 'uniform', 'low': 4.0, 'high': 12.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
             'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
-            'redshift': {'type': 'uniform', 'low': 0, 'high': 6},    
-            'spec_noise_scale': {'type': 'uniform', 'low': -2, 'high': 2}        
+            'redshift': {'type': 'uniform', 'low': 0, 'high': 6},
+            'spec_noise_scale': {'type': 'uniform', 'low': -2, 'high': 2}
         }
         for i, p in enumerate(self.model_pars):
             lo, hi = self.model_pars_arr[i][0], self.model_pars_arr[i][-1]
@@ -808,20 +836,76 @@ class PFitter():
                 print(f"  - {p}: Uniform({pr['low']}, {pr['high']})")
             elif pr['type'] == 'gaussian':
                 print(f"  - {p}: Gaussian(mean={pr['mean']}, sigma={pr['sigma']})")
+            elif pr['type'] == 'gaussian_conditional':
+                lo = pr.get('low', None)
+                hi = pr.get('high', None)
+                clip = ""
+                if lo is not None or hi is not None:
+                    clip = f", truncated to [{lo}, {hi}]"
+                print(f"  - {p}: Gaussian(mean={pr['coef']}*{pr['depends_on']}, sigma={pr['sigma']}){clip}")
             else:
                 print(f"  - {p}: {pr}")
 
         # transform from unit cube to physical space
         def prior_transform(u):
             x = np.zeros_like(u)
-            for i, name in enumerate(run.free_pars):
-                prior = priors[name]
-                if prior['type'] == 'uniform':
-                    x[i] = prior['low'] + u[i] * (prior['high'] - prior['low'])
-                elif prior['type'] == 'gaussian':
-                    x[i] = prior['mean'] + prior['sigma'] * np.sqrt(2) * erfinv(2 * u[i] - 1)
-                else:
-                    raise ValueError(f"Unsupported prior type {prior['type']} for {name}")
+            done = np.zeros(len(run.free_pars), dtype=bool)
+
+            name_to_idx = {name: i for i, name in enumerate(run.free_pars)}
+
+            # keep looping until everything is resolved (handles dependencies)
+            progress = True
+            while not np.all(done) and progress:
+                progress = False
+
+                for i, name in enumerate(run.free_pars):
+                    if done[i]:
+                        continue
+
+                    prior = priors[name]
+
+                    if prior['type'] == 'uniform':
+                        x[i] = prior['low'] + u[i] * (prior['high'] - prior['low'])
+                        done[i] = True
+                        progress = True
+
+                    elif prior['type'] == 'gaussian':
+                        x[i] = prior['mean'] + prior['sigma'] * np.sqrt(2) * erfinv(2 * u[i] - 1)
+                        done[i] = True
+                        progress = True
+
+                    elif prior['type'] == 'gaussian_conditional':
+                        dep = prior['depends_on']
+                        if dep not in name_to_idx:
+                            raise ValueError(f"{name}: depends_on='{dep}' not in run.free_pars")
+
+                        j = name_to_idx[dep]
+                        if not done[j]:
+                            continue  # wait until dependency is sampled
+
+                        mu = prior['coef'] * x[j]
+                        sig = prior['sigma']
+                        val = mu + sig * np.sqrt(2) * erfinv(2 * u[i] - 1)
+
+                        # optional truncation to match your old bounds behavior
+                        lo = prior.get('low', None)
+                        hi = prior.get('high', None)
+                        if lo is not None:
+                            val = max(lo, val)
+                        if hi is not None:
+                            val = min(hi, val)
+
+                        x[i] = val
+                        done[i] = True
+                        progress = True
+
+                    else:
+                        raise ValueError(f"Unsupported prior type {prior['type']} for {name}")
+
+            if not np.all(done):
+                unresolved = [run.free_pars[i] for i in range(len(run.free_pars)) if not done[i]]
+                raise ValueError(f"Could not resolve dependent priors for: {unresolved}")
+
             return x
 
         return prior_transform
