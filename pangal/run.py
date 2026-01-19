@@ -634,7 +634,7 @@ class Run:
                         resid = (obs - mod) / err
 
                         chi2 += resid**2
-                        logL += -0.5 * (resid**2 + np.log(2 * np.pi * var))
+                        logL_phot += -0.5 * (resid**2 + np.log(2 * np.pi * var))
 
                         residuals_per_band.append(
                             (nice_filter_names[self.bands[i]], resid,)
