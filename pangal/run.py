@@ -203,84 +203,29 @@ class Run:
         return synth_spec
         
             
-    def sample_acceptable_models(self, n_models=1000, method='posterior'):
-        """
-        Extract many acceptable parameter sets from the posterior.
-
-        Parameters
-        ----------
-        n_models : int
-            Number of parameter sets to return
-        method : str
-            'posterior'  : weighted resampling from posterior (recommended)
-            'likelihood' : likelihood threshold cut
-
-        Returns
-        -------
-        params_list : list of dict
-            List of parameter dictionaries
-        """
-
-        if not hasattr(self, 'result'):
-            raise ValueError("No fit results found.")
-
-        samples = self.result.samples
-        logl = self.result.logl
-        logwt = self.result.logwt
-        logz = self.result.logz[-1]
-
-        weights = np.exp(logwt - logz)
-        weights /= np.sum(weights)
-
-        spectra = []
-
-        if method == 'posterior':
-            idx = np.random.choice(
-                len(samples),
-                size=n_models,
-                replace=True,
-                p=weights
-            )
-
-        elif method == 'likelihood':
-            logl_max = np.max(logl)
-            good = logl > (logl_max - 2.0)   # ~2σ
-            idx = np.random.choice(
-                np.where(good)[0],
-                size=n_models,
-                replace=True
-            )
-        else:
-            raise ValueError("Unknown method")
-
-        for i in idx:
-            pars = {}
-            for name, val in zip(self.free_pars, samples[i]):
-                pars[name] = val
-            for name, val in self.fix_pars.items():
-                pars[name] = val
-            params_list.append(pars)
-
-        spectra = [
-            self.pfitter.synthetic_spectrum(**p)
-            for p in params_list
-        ]
-
 
 
     def fit_diagnostic_plot(self,
                         models=[],
 
                         method='MAP',
-                        spec_noise_scale = 0,
+
+                        spec_noise_scale = None,
+                        polydeg = None,
                     
                         # plotting window
-                        winf=None,
-                        wsup=None,
+                        winf_spec=None,
+                        wsup_spec=None,
+
+                        winf_phot=1e2,
+                        wsup_phot=1e7,
+                        ymin=None,
+                        ymax=None,
 
                         # aestethics
                         figsize=(10,10),
                         color=None,
+                        show_errorbars=True,
                         
                         # optionals
                         redshift=None,
@@ -290,12 +235,10 @@ class Run:
                         
                         spec_legend_pars=None,
                         spec_legend_loc="upper right",
+                        phot_legend_loc="upper right",
                         spec_legend_title=None,
+                        phot_legend_title=None,
 
-                        winf_phot=1e2,
-                        wsup_phot=1e7,
-                        ymin=None,
-                        ymax=None,
                     ):
         
 
@@ -326,6 +269,12 @@ class Run:
 
         if self.spec:
         
+            if polydeg is None: 
+                polydeg = self.polydeg 
+            if spec_noise_scale is None:
+                spec_noise_scale = self.best_model(method='MAP').header['SPEC_NOI']
+            
+
             wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
             flux_err_corr = flux_err * np.exp(spec_noise_scale)
 
@@ -339,10 +288,11 @@ class Run:
             normalization_factor_smoothed_list = []
             models_comparable_to_obs = []
             residuals = []
-            
+
+
             for model in models:
-            
-                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,self.polydeg)
+
+                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,polydeg)
             
                 normalization_factor_list.append(normalization_factor)
                 normalization_factor_smoothed_list.append(normalization_factor_smoothed)
@@ -364,7 +314,9 @@ class Run:
             
             global_fmax = -np.inf
             global_fmin = +np.inf
-            mask = (wl>winf) & (wl<wsup)
+            if winf_spec is None: winf_spec = wl[0]
+            if winf_spec is None: wsup_spec = wl[-1]
+            mask = (wl>winf_spec) & (wl<wsup_spec)
             
             global_norm_max = -np.inf
             global_norm_min = +np.inf
@@ -372,11 +324,14 @@ class Run:
             global_res_min = +np.inf
             
             for i in [0,2]:
-                ax[i].errorbar(wl, flux_obs, yerr=flux_err_corr, fmt='o', markersize=2,
-                                color='black', ecolor='gray', elinewidth=1.0,
-                                capsize=2, capthick=1.0, linestyle=' ', lw=0.5,
-                                label='observed')
-            
+                if show_errorbars:
+                    ax[i].errorbar(wl, flux_obs, yerr=flux_err_corr, fmt='o', markersize=2,
+                                    color='black', ecolor='gray', elinewidth=1.0,
+                                    capsize=2, capthick=1.0, linestyle=' ', lw=0.5,
+                                    label='observed')
+                else:
+                    ax[i].plot(wl, flux_obs, color='black', lw=0.5, label='observed')
+                
                 global_fmax = max(np.nanmax(flux_obs[mask]),global_fmax)
                 global_fmin = min(np.nanmin(flux_obs[mask]),global_fmin)
             
@@ -413,7 +368,7 @@ class Run:
                 
                 ax[0].plot(model.wl,model.flux,color=c,label=label)
             
-                mask_m = (model.wl > winf) & (model.wl < wsup)
+                mask_m = (model.wl > winf_spec) & (model.wl < wsup_spec)
                 global_fmax = max(global_fmax, np.nanmax(model.flux[mask_m]))
                 global_fmin = min(global_fmin, np.nanmin(model.flux[mask_m]))
             
@@ -435,7 +390,7 @@ class Run:
             
             
             for i in range(4):
-                ax[i].set_xlim(winf,wsup)
+                ax[i].set_xlim(winf_spec,wsup_spec)
             
             for i in [0,2]:
                 ax[i].set_ylim(0.8*global_fmin,1.2*global_fmax)
@@ -446,7 +401,7 @@ class Run:
 
             ax[0].set_title('Raw observed spectrum and model')
             ax[2].set_title('Raw spectrum and model fitted to observed spectrum continuum')
-            ax[1].set_title(f'Polynomial multiplicative factor. Polynomial degree {self.polydeg:.0f}')
+            ax[1].set_title(f'Polynomial multiplicative factor. Polynomial degree {polydeg:.0f}')
             ax[1].set_ylabel('$f_\\text{obs}/f_\\text{model}$')
 
             ax[3].set_title('Residuals')
@@ -464,7 +419,7 @@ class Run:
                     for name in ['Lya','Ha','Hb','Hg','Hd']:
                         wavelength = spectral_lines[name]
                         wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                        if wl_shift > winf and wl_shift < wsup:
+                        if wl_shift > winf_spec and wl_shift < wsup_spec:
                             ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
                             name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
                             ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
@@ -475,7 +430,7 @@ class Run:
                     for name, wavelength in spectral_lines.items():
                         wavelength = spectral_lines[name]
                         wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                        if wl_shift > winf and wl_shift < wsup:
+                        if wl_shift > winf_spec and wl_shift < wsup_spec:
                             ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
                             name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
                             ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
@@ -485,7 +440,7 @@ class Run:
                 if show_atmospheric_lines:
                     for name, wavelength in atmospheric_lines.items():
                         wl_plot = models[0]._angstrom_to_wl(wavelength, x_u)
-                        if wl_plot > winf and wl_plot < wsup:
+                        if wl_plot > winf_spec and wl_plot < wsup_spec:
                             ax[i].axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
                             ax[i].text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
                                     va="bottom", fontsize=9, ha='center', clip_on=True,
@@ -520,7 +475,7 @@ class Run:
                 spec_legend_pars=spec_legend_pars,
                 show_phot_legend=True,
                 show_spec_legend=True,
-                spec_legend_loc="upper left",
+                spec_legend_loc="upper right",
                 spec_legend_title=None,
             )
 
@@ -533,10 +488,21 @@ class Run:
     def fit_diagnostic_likelihoods(self,
                         models=[],
                         method='MAP',
-                        spec_noise_scale = 0,):
+                        polydeg = None,
+                        spec_noise_scale = None,
+                        w_spec = None,
+                        ):
         
         if self.spec:
-        
+
+            if polydeg is None: 
+                polydeg = self.polydeg 
+            if spec_noise_scale is None:
+                spec_noise_scale = self.best_model(method='MAP').header['SPEC_NOI']
+            if w_spec is None:
+                w_spec = self.w_spec
+            
+
             wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
             flux_err_corr = flux_err * np.exp(spec_noise_scale)
 

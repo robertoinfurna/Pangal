@@ -88,7 +88,7 @@ class PanGal:
                  EBmV=0,
                  EBmV_err=0,
                  spectral_range_muse=None,
-                 correct_dust_muse=True,
+                 z=0,
                  ): 
 
         self.images = DotDict()
@@ -99,7 +99,7 @@ class PanGal:
         self.fov = fov
         self.EBmV = EBmV
         self.EBmV_err = EBmV_err
-              
+        self.z = z
 
         # --- resolve input files ---
         if fits_files is None and directory is not None:
@@ -111,7 +111,7 @@ class PanGal:
         # --- upload data ---
         for file in fits_files:        
             self.add_image(file)
-            self.add_cube(file, spectral_range=spectral_range_muse, correct_for_dust=correct_dust_muse)
+            self.add_cube(file, spectral_range=spectral_range_muse,)
             # self.add_spectrum(file)
 
 
@@ -119,12 +119,48 @@ class PanGal:
 
     # METHODS
 
+    from IPython.display import display
+
     @property
     def overview(self):
-        print('Images: \n')  
-        print(list(self.images.keys()))
-        print('\nCubes: \n')  
-        print(list(self.cubes.keys()))
+        import pandas as pd
+        from IPython.display import display
+
+        rows = []
+        for name, img in self.images.items():
+
+
+            # choose display name safely
+            if name in nice_filter_names:
+                filter_name = nice_filter_names[name]
+            else:
+                filter_name = name
+            
+            rows.append(
+                dict(
+                    filter=filter_name,
+                    internal_filter_name=name,
+                    exptime=img.exptime,
+                )
+            )
+    
+        images_df = pd.DataFrame(rows)
+
+
+        cubes_df = pd.DataFrame([
+            dict(
+                cube=name,
+                wl_min=cube.wl[0],
+                wl_max=cube.wl[-1]
+            )
+            for name, cube in self.cubes.items()
+        ])
+
+        print("Images")
+        display(images_df.style.hide(axis="index"))
+
+        print("Cubes")
+        display(cubes_df.style.hide(axis="index"))
               
     # methods
     plot = plot
@@ -425,14 +461,211 @@ class PanGal:
             )
 
 
-
-    def add_cube(self,file,spectral_range,correct_for_dust):
+    def add_cube(self, file, spectral_range=None,):
         """
+        Adds Cube observations to the PangalObject given a fits file.
+
+        spectral_range : (wl_min, wl_max) to crop spectra and save RAM
+        """
+
+        if 'muse' in file.lower():
+                
+
+            print('Processing MUSE:', file)
+
+            # ------------------------------------------------------------
+            # OPEN FITS ONCE — WITH MEMMAP (huge speedup)
+            # ------------------------------------------------------------
+            with fits.open(file, memmap=True) as hdul:
+
+                # Merge headers
+                header = fits.Header()
+                header.update(hdul[0].header)
+                header.update(hdul[1].header)
+
+                # --------------------------------------------------------
+                # WAVELENGTH AXIS
+                # --------------------------------------------------------
+                crval3 = header['CRVAL3']
+                dw     = header['CD3_3']
+                nchan  = header['NAXIS3']
+
+                channels = np.arange(nchan)
+                wl = crval3 + channels * dw
+
+                # --------------------------------------------------------
+                # SPECTRAL CROPPING
+                # --------------------------------------------------------
+                if spectral_range:
+                    wl_min, wl_max = spectral_range
+                    wl_min = max(wl_min, wl[0])
+                    wl_max = min(wl_max, wl[-1])
+
+                    mask = (wl >= wl_min) & (wl <= wl_max)
+                    idx = np.where(mask)[0]
+
+                    if len(idx) == 0:
+                        raise ValueError(
+                            f"No overlap with cube spectral range "
+                            f"({wl[0]:.1f}–{wl[-1]:.1f} Å)"
+                        )
+
+                    i_min, i_max = idx[0], idx[-1] + 1
+                else:
+                    i_min, i_max = 0, nchan
+
+                # --------------------------------------------------------
+                # LOAD ONLY REQUIRED SPECTRAL SLAB
+                # --------------------------------------------------------
+                cube = hdul[1].data[i_min:i_max, :, :]
+                var  = hdul[2].data[i_min:i_max, :, :]
+                wl   = wl[i_min:i_max]
+
+                # --------------------------------------------------------
+                # CONVERT UNITS (in-place)
+                # --------------------------------------------------------
+                cube *= 1e-20
+                var  *= 1e-40
+
+                header['FUNITS'] = 'erg/s/cm2/A'
+                header['WUNITS'] = 'A'
+                header['CRVAL3'] = wl[0]
+                header['NAXIS3'] = len(wl)
+
+                # --------------------------------------------------------
+                # OPTIONAL DUST CORRECTION
+                # --------------------------------------------------------
+                if self.EBmV != 0:
+                    print(' Correcting for dust attenuation')
+
+                    ext = self.MW_extinction(wl) * self.EBmV
+                    AG  = 10 ** (ext / 2.5)
+
+                    # fast, no temporary arrays
+                    np.multiply(cube, AG[:, None, None], out=cube)
+
+                # --------------------------------------------------------
+                # MUSE SPECTRAL RESOLUTION (cached recommended)
+                # --------------------------------------------------------
+                module_dir = os.path.dirname(os.path.abspath(__file__))
+                res_file = os.path.join(
+                    module_dir, 'data', 'Extracted_resolution_muse.fits'
+                )
+
+                with fits.open(res_file, memmap=True) as hres:
+                    w_r = (
+                        np.arange(hres[0].header['NAXIS1'])
+                        * hres[0].header['CD1_1']
+                        + hres[0].header['CRVAL1']
+                    )
+                    r = hres[0].data
+
+                r_fun = interp1d(
+                    w_r, r, kind='linear',
+                    bounds_error=False, fill_value='extrapolate'
+                )
+
+                resolution = r_fun(wl)
+
+                # --------------------------------------------------------
+                # WCS + PIXEL GEOMETRY
+                # --------------------------------------------------------
+                dtheta_pix_deg = abs(header['CD1_1'])
+                area_pix_arcsec2 = (dtheta_pix_deg * 3600) ** 2
+                wcs = WCS(header).celestial
+
+                # --------------------------------------------------------
+                # REGISTER CUBE
+                # --------------------------------------------------------
+                cube_name = 'muse'
+                ii = 1
+                while cube_name in self.cubes:
+                    cube_name = f"muse({ii})"
+                    ii += 1
+
+                self.cubes[cube_name] = Cube(
+                    cube=cube,
+                    var=var,
+                    wl=wl,
+                    dw=dw,
+                    resolution=resolution,
+                    wcs=wcs,
+                    dtheta_pix_deg=dtheta_pix_deg,
+                    area_pix_arcsec2=area_pix_arcsec2,
+                    header=header,
+                    id='muse'
+                )
+
+                
+                for band in [key for key in map_filter_names if key.startswith('muse')]:
+                    print(f' Building {band} image')
+
+                    filter = Filter(band)
+            
+                    w_inf = max(wl[0],filter.wavelength_range[0])
+                    w_sup = filter.wavelength_range[1]
+                    channel_inf = np.digitize(w_inf, wl) - 1
+                    channel_sup = np.digitize(w_sup, wl) - 1
+                    bandwidth = w_sup - w_inf
+                    pivot_wavelength = filter.pivot_wavelength
+
+                    integrated_band = np.nansum(cube[channel_inf:channel_sup, :, :], axis=0)
+                    
+                    image = integrated_band * dw / bandwidth 
+
+                    ZP =  - 2.5 * np.log10(pivot_wavelength**2/2.998e18) - 48.60
+                    ZP_err = 0
+                    exptime = None
+
+                    image_name = f"{band}"  # e.g., muse_red
+                    ii = 1
+                    while image_name in self.images:
+                        image_name = f"{band}({ii})"
+                        ii += 1
+
+                    self.images[image_name] = Image(
+                        data=image,
+                        wcs=wcs,
+                        dtheta_pix_deg=dtheta_pix_deg,
+                        area_pix_arcsec2=area_pix_arcsec2,
+                        pivot_wavelength=pivot_wavelength,
+                        ZP=ZP,
+                        ZP_err=ZP_err,
+                        exptime=exptime,
+                        header=header,
+                        filter=filter
+                        )
+                    
+
+                # --------------------------------------------------------
+                # EXTRACT LINE MAPS
+                # --------------------------------------------------------
+                top_galaxy_lines = ["Ha","Hb","[O III] 5007","[S II] 6716","He II 4686"]
+
+                for line in top_galaxy_lines:
+                    print(f' Building {line} image')
+                    base_name = f"{self.cubes.muse.id}_{line}"
+                    image_name = base_name
+                    i = 1
+                    while image_name in self.images:
+                        image_name = f"{base_name}({i})"
+                        i += 1
+    
+                    self.images[image_name] = self.cubes.muse.line_map(line=line, width=10, continuum_offset_1=50, continuum_offset_2=50, z=self.z)
+                
+
+
+
+
+
+    """
+    def add_cube(self,file,spectral_range,correct_for_dust):
+        
         Adds Cube observations to the PangalObject given a fits file
         fits file must be named using a particular convention
 
         spectral_range : saves RAM space cropping the spectra
-        """
+        
             
         with fits.open(file) as hdul:   
 
@@ -490,6 +723,7 @@ class PanGal:
                             
                     # Compute dust attenuation
                     if self.EBmV != 0:
+                        print('Correcting for dust attenuation')
                         # 1D extinction curve
                         ext = self.MW_extinction(wl) * self.EBmV
                         AG = 10 ** (ext / 2.5)
@@ -570,7 +804,7 @@ class PanGal:
                             filter=filter
                             )
                         
-                        
+    """  
 
                 
      

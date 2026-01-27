@@ -66,11 +66,9 @@ class Spectrum:
 
     # Given a spectrum and a set of filters, it does the convolution with the transmission curve 
     def get_phot(self, 
-                bands=None,
+                bands,
                 units='erg/s/cm2/A',
-                trans_arrays=None,
-                trans_mask=None,
-                pivot_wls=None,
+                method="trapz",
                 ):
         """
         Computes synthetic photometric points from a spectrum and a list of bands.
@@ -87,69 +85,64 @@ class Spectrum:
         The internal integration is always done in erg/s/cm²/Å and Å.
         The output is then converted to the requested `units`.
         """
-        if not trans_arrays:
-
-            invalid = [b for b in bands if b not in map_filter_names]
-            if invalid:
-                raise ValueError(f"Unrecognized filters: {', '.join(invalid)}")
-
-            # Normalize units before interpolation
-            self.convert_units(new_wl_units='A', new_flux_units='erg/s/cm2/A')
 
 
+        invalid = [b for b in bands if b not in map_filter_names]
+        if invalid:
+            raise ValueError(f"Unrecognized filters: {', '.join(invalid)}")
 
-            spec_func = interp1d(self.wl, self.flux, bounds_error=False, fill_value=0.0)
-            data = {}
+        # Normalize units before interpolation
+        self.convert_units(new_wl_units='A', new_flux_units='erg/s/cm2/A')
 
-            for b in bands:
-                filter = Filter(b) 
-                trans_curve = filter.transmission_curve
-                lmin, lmax = filter.wavelength_range
 
+
+        spec_func = interp1d(self.wl, self.flux, bounds_error=False, fill_value=0.0)
+        data = {}
+
+        for b in bands:
+            filter = Filter(b) 
+            trans_curve = filter.transmission_curve
+            lmin, lmax = filter.wavelength_range
+            
+            mask_b = (self.wl >= lmin) & (self.wl <= lmax)
+            
+            #trans_mask[b] = mask_b
+            #trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
+            #    pivot_wls[b] = F.pivot_wavelength
+
+            if method == 'quad':
                 num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l) * l, lmin, lmax)
-                norm_int, _ = quad(lambda l: trans_curve(l) * l, lmin, lmax)
+                den, _ = quad(lambda l: trans_curve(l) * l, lmin, lmax)
+            
+            elif method == 'trapz': 
+                
+                spec_array = self.flux[mask_b]
+                trans_array = trans_curve(self.wl)[mask_b]
+                wl_b = self.wl[mask_b] 
+                num_int = np.trapz(trans_array * spec_array * wl_b, wl_b)
+                den = np.trapz(trans_array * wl_b, wl_b)
+            else:
+                raise ValueError('method must be either quad or trapz')
 
-                phot_point = num_int / norm_int
-                pivot_w = filter.pivot_wavelength  # in Å
+            phot_point = num_int / den
 
-                # Convert to requested output units if needed
-                if units == 'mJy':
-                    # Convert erg/s/cm²/Å → mJy using Fν = Fλ * λ² / c
-                    c = 2.99792458e18  # Å/s
-                    phot_point = phot_point * pivot_w**2 / c / 1e-26
+            pivot_w = filter.pivot_wavelength  # in Å
 
-                data[b] = (phot_point, np.nan)
+            # Convert to requested output units if needed
+            if units == 'mJy':
+                # Convert erg/s/cm²/Å → mJy using Fν = Fλ * λ² / c
+                c = 2.99792458e18  # Å/s
+                phot_point = phot_point * pivot_w**2 / c / 1e-26
 
-            header = fits.Header()
-            header['units'] = units
+            data[b] = (phot_point, np.nan)
 
-            return PhotometryTable(data=data, header=header)
+        header = fits.Header()
+        header['units'] = units
+
+        return PhotometryTable(data=data, header=header)
         
 
-        # FOR LIKELIHOOD! self is the synthetic spectrum!
-        # Authomatically set to mJy!
-        else: 
 
-            model_phot = []
-            for b in bands:
-                mask_b = trans_mask[b]
-                spec_array = self.flux[mask_b]
-                wl_b = self.wl[mask_b] 
-                if len(spec_array) == 0:
-                    model_phot.append(np.nan)
-                    continue
-                num_int = np.trapz(trans_arrays[b] * spec_array * wl_b, wl_b)
-                den = np.trapz(trans_arrays[b] * wl_b, wl_b)
-                if den == 0:
-                    model_phot.append(np.nan)
-                    continue
-                phot_point = num_int / den
-                # convert to mJy if needed
-                c = 2.99792458e18  # Å/s
-                phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
-                model_phot.append(phot_point)
-                
-            return np.array(model_phot)
 
 
 # -------------------------------------------------------------------------
