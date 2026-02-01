@@ -47,7 +47,7 @@ class PFitter():
     
     # Parametric fitter: this first block loads a grid of models
 
-    def __init__(self, model_file, model_pars, cosmo=None, dustemimodel='dh02', leitatt=False, uv_bump=False, emimetal=0.0017, emimodel='2018'):
+    def __init__(self, model_file, model_pars, cosmo=None, dustemimodel='dh02', leitatt=False, uv_bump=False, emimetal=0.017, emimodel='nebular_Byler_mist_2018.lines'):
 
         print(f"Initializing PFitter object")
         self.model_file = model_file
@@ -104,14 +104,13 @@ class PFitter():
         print("\n")
         
 
-
-
         # PRECOMPUTES DUST ATTENUATION CURVE (Calzetti, 2000 + optional Leitherer+2002 + optional UV bump)
-        self.k_cal = self.dust_attenuation_curve(self.model_wl, leitatt, uv_bump)
+        self.k_calzetti = self.dust_attenuation_curve(leitatt, uv_bump)
         print('Dust attenuation curve from Calzetti 2000.')
 
         # LOADS NEBULAR LINE TABLES
-        self.nebular_func, self.nebular_ions, self.nebular_ages = self.load_nebular_tables(self.model_wl,self.model_resolution, emimetal,emimodel)
+        self.nebular_func, self.nebular_scales, self.nebular_wls, self.nebular_ions, self.nebular_ages  = self.load_nebular_tables(self.model_wl,self.model_resolution, emimetal,emimodel)
+
 
         # LOADS DUST EMISSION SPECTRA
         # This can be moved above for computing dust_wl only once?
@@ -127,8 +126,6 @@ class PFitter():
 
 
 
-
-
     def synthetic_spectrum(
         self,
         fesc,
@@ -140,10 +137,7 @@ class PFitter():
         m_star,
         redshift,
         luminosity_distance,
-        vel_sys=None,                         # systemic velocity [km/s]
-        sigma_vel=None,                       # LOS velocity dispersion [km/s]
-        observed_spectrum_resolution=None,   # If provided (it's an array) builds the model spectrum to the required resolution
-        multi_component=False,               # OTHERWISE THE RESOLUTION IS THE ONE OF THE INITAL MODELS
+        multi_component=False,              
         likelihood_call=False,
         bands=None,
         trans_arrays=None,
@@ -195,10 +189,6 @@ class PFitter():
         young_stellar_spec = self.interp_young_flux(**kwargs)
         old_stellar_spec   = self.interp_old_flux(**kwargs)
 
-        # Resample to model wavelength grid
-        #young_stellar_spec = np.interp(self.model_wl, self.short_model_wl, young_stellar_spec)
-        #old_stellar_spec   = np.interp(self.model_wl, self.short_model_wl, old_stellar_spec)
-
         # --- Ionizing photons and nebular emission ---
         index_lyman = np.searchsorted(self.model_wl, 912, side="left")
         lycont_wls = np.r_[self.model_wl[:index_lyman], np.array([912])]
@@ -226,8 +216,8 @@ class PFitter():
         stellar_nebular_spec       = young_stellar_nebular_spec + old_stellar_nebular_spec
 
         # --- Dust attenuation ---
-        att_young_stellar_nebular_spec = (10 ** (-(av + av_ext) * self.k_cal)) * young_stellar_nebular_spec
-        att_old_stellar_nebular_spec   = (10 ** (-av * self.k_cal)) * old_stellar_nebular_spec
+        att_young_stellar_nebular_spec = (10 ** (-(av + av_ext) * self.k_calzetti_array)) * young_stellar_nebular_spec
+        att_old_stellar_nebular_spec   = (10 ** (-av * self.k_calzetti_array)) * old_stellar_nebular_spec
         att_stellar_nebular_spec       = att_young_stellar_nebular_spec + att_old_stellar_nebular_spec
 
         # --- Thermal dust re-emission ---
@@ -251,73 +241,9 @@ class PFitter():
         # --- Total rest-frame spectrum ---
         total_spec = att_stellar_nebular_spec + dust_spec
 
-
-
-        # BROADENING
-        # --- Apply LOS velocity broadening (in log λ space) ---
-        # --- Shift using systemic velocity
-
-        #wl_shifted = self.model_wl
-        c = 2.99792458e5  # km/s
-        wl_shifted = self.model_wl.copy()
-
-
-        if vel_sys and sigma_vel:
-            
-            # --- Estimate internal broadening (model resolution) ---
-            sigma_v_internal = c / (self.model_resolution * 2.355)  # per-pixel σ_v array
-            sigma_v_internal_med = np.median(sigma_v_internal)
-
-            # --- Compute net broadening to apply ---
-            if sigma_vel > sigma_v_internal_med:
-                sigma_v_apply = np.sqrt(sigma_vel**2 - sigma_v_internal_med**2)
-            else:
-                sigma_v_apply = 0.0
-
-
-            if sigma_v_apply > 0:
-                total_spec = self._vel_convolve_fft(total_spec, self.model_wl, sigma_v_apply)
-
-            wl_shifted *= (1 + vel_sys / c)
-
-
-
         # --- Redshift to observed frame ---
-        model_red_wl = wl_shifted * (1 + redshift)
+        model_red_wl = self.model_wl * (1 + redshift)
         total_spec /= (1 + redshift)
-
-
-        # --- Match model resolution to observed resolution R(λ) ---
-        if observed_spectrum_resolution is not None:
-          
-            # Convert observed R to σ_v(λ)
-            fwhm_obs = model_red_wl / observed_spectrum_resolution
-            sigma_obs_kms = (fwhm_obs / 2.355) * (c / model_red_wl)
-
-            # Convert model intrinsic R to σ_v
-            fwhm_model = model_red_wl / self.model_resolution
-            sigma_model_kms = (fwhm_model / 2.355) * (c / model_red_wl)
-
-            # σ to apply
-            sigma_apply = np.sqrt(np.maximum(0, sigma_obs_kms**2 - sigma_model_kms**2))
-
-            # Perform convolution in chunks. FFT convolution assumes a constant σ over the whole array.
-            # Split the spectrum into chunks. Convolve each chunk with a constant σ (≈ the median in that chunk)
-            N_chunks = 12
-            idxs = np.array_split(np.arange(len(total_spec)), N_chunks)
-            model_conv = np.empty_like(total_spec)
-
-            for idx in idxs:
-                sigma_local = np.median(sigma_apply[idx])
-                wl_local    = model_red_wl[idx]
-                spec_local  = total_spec[idx]
-
-                model_conv[idx] = self._vel_convolve_fft(
-                    spec_local, wl_local, sigma_local, vel=0.0
-                )
-
-            total_spec = model_conv
-
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
         fscale = 10**m_star / (luminosity_distance * 1e5)**2
@@ -325,14 +251,13 @@ class PFitter():
 
 
         if not likelihood_call:
+
             # --- Build FITS header ---
             header = fits.Header()
             header["MODFILE"]    = (self.model_file, "fits files of models")
             header["WUNITS"]  = "A"
             header["FUNITS"]  = "erg/s/cm2/A"
             header["REDSHIFT"] = (redshift, "Cosmological redshift")
-            header["VEL_SYS"]  = (vel_sys, "Systemic velocity [km/s]")
-            header["SIGMA_V"]  = (sigma_vel, "LOS velocity dispersion [km/s]")
             header["AV"]       = (av, "V-band attenuation (old stars)")
             header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
             header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
@@ -425,99 +350,299 @@ class PFitter():
                 phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
                 model_phot.append(phot_point)
                 
-            return model_red_wl, total_spec, np.array(model_phot)
+            return np.array(model_phot)
+
+       
+    def synthetic_spectrum_for_fitting(
+        self,
+        obs_spec,
+        polydeg,
+        spec_noise_scale,
+        
+        fesc,
+        ion_gas,
+        age_gas,
+        
+        av,
+        av_ext,
+        alpha,
+        redshift,
+        vel_sys,                         # systemic velocity [km/s]
+        sigma_vel,                         # LOS velocity dispersion [km/s]
+        sigma_gas,
+        
+        likelihood_call=False,
+        **kwargs,
+    ):
+
+        """
+        mcspf-matched dust-emission handling:
+        (1) Stellar-leakage subtraction in the DH02 templates uses the *continuum-only* spectrum
+            (mcspf uses spec_model), not stellar+nebular.
+        (2) Dust emission is attenuated by 10^(-Av*k_cal) and iterated to conserve energy,
+            as in mcspf reconstruct_phot().
+        """
+
+        c_kms = 2.99792458e5  # km/s
+
+        # --- Stellar population spectra (rest-frame, on self.model_wl) ---
+        young_stellar = self.interp_young_flux(**kwargs)
+        old_stellar   = self.interp_old_flux(**kwargs)
+        
+        # Number of ionizing photons for later nebular spectrum
+        index_lyman = np.searchsorted(self.model_wl, 912, side="left")
+        lycont_wls = np.r_[self.model_wl[:index_lyman], np.array([912])]
+        lycont_young_spec = np.interp(lycont_wls, self.model_wl, young_stellar)
+        nlyman_young = np.trapz(lycont_young_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
+        lycont_old_spec = np.interp(lycont_wls, self.model_wl, old_stellar)
+        nlyman_old = np.trapz(lycont_old_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
+
+        # Remove escaped photons
+        young_stellar[:index_lyman] *= fesc
+        old_stellar[:index_lyman]   *= fesc
+
+        # --- Dust attenuation of stellar spectrum (rest-frame) ---
+        att_young = (10.0 ** (-(av + av_ext) * self.k_calzetti_array)) * young_stellar
+        att_old   = (10.0 ** (-av * self.k_calzetti_array))           * old_stellar
+        att_stellar = att_young + att_old
+
+
 
         
-
-
-
-
-    def _losvd_rfft(self, vel, sigma, wl, npad=None, c=2.99792458e5):
-        """
-        Analytic Fourier transform of a Gaussian LOSVD, following Cappellari et al. (2016).
-        """
-        npix = len(wl)
-        if npad is None:
-            npad = 2 * npix
-
-        nl = npad // 2 + 1  # size of RFFT array
-
-        # log-lambda grid properties
-        loglam = np.log(wl)
-        dloglam = np.median(np.diff(loglam))
-        kms_per_pix = c * dloglam
-
-        # convert to pixel units
-        vel_pix = vel / kms_per_pix
-        sigma_pix = sigma / kms_per_pix
-
-        # frequency vector for RFFT
-        w = np.linspace(0, np.pi, nl)
-
-        if sigma_pix == 0:
-            losvd_rfft = np.ones_like(w, dtype=complex)
-        else:
-            a = vel_pix / sigma_pix
-            losvd_rfft = np.exp(1j * a * w - 0.5 * (sigma_pix * w)**2)
-
-        return np.conj(losvd_rfft)
+        # --- Kinematics of stellar spectrum: LOSVD + systemic shift ---
         
-    def _vel_convolve_fft(self, spec, wl, sigma, vel=0.0):
-        """Velocity-space convolution using analytic LOSVD in Fourier domain."""
-        npix = len(spec)
+        wl_obs = self.model_wl * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
+        att_stellar /= (1.0 + redshift)
+        
+        mask = (wl_obs > obs_spec.wl[0]) & (wl_obs < obs_spec.wl[-1])
+        wl_obs = wl_obs[mask]
+        att_stellar = att_stellar[mask]
+        model_resolution = self.model_resolution[mask]
+
+        sigma_model = c_kms / (model_resolution * 2.355)
+        sigma_obs = c_kms / (obs_spec.resolution * 2.355)
+        
+        sigma_int = max(max(sigma_model),max(sigma_obs))
+
+        # Final broadening to apply to the stellar spectrum
+        sigma_tot = np.sqrt(sigma_int**2 + sigma_vel**2 - max(sigma_model)**2)
+
+        # CONVOLVE MODEL SPECTRUM WITH LOSVD GAUSSIAN FUNCTION WITH SIGMA_TOT
+        
+        # Build a uniform log lambda grid
+        loglam = np.log(wl_obs)
+        loglam_unif = np.linspace(loglam[0],loglam[-1],len(loglam))
+
+        # interpolate spectrum on new lambda grid
+        logspec = np.interp(loglam_unif, loglam, att_stellar)
+
+        # velocity in pixel space
+        dloglam = np.median(np.diff(loglam_unif))
+        kms_per_pix = 2.99792458e5 * dloglam
+        vel_pix = vel_sys / kms_per_pix
+        sigma_pix = sigma_tot / kms_per_pix    
+
+        
+        # Velocity-space convolution using analytic LOSVD in Fourier domain    
+        
+        npix = len(loglam_unif)
         npad = 2 * npix  # zero-padding to avoid wrap-around
 
         # make LOSVD kernel for same npad length
-        fft_losvd = self._losvd_rfft(vel, sigma, wl, npad=npad)
+        
+        nl = npad // 2 + 1                # size of RFFT array
+        w = np.linspace(0, np.pi, nl)     # frequency vector for RFFT
 
+        if sigma_pix == 0:
+            losvd_rfft = np.ones_like(w, dtype=complex)
+        else:   
+            #a = v_pix / sigma_pix 
+            # velocity shift already considered when shifting wl_obs
+            a = 0
+            losvd_rfft = np.exp(1j * a * w - 0.5 * (sigma_pix * w)**2)
+
+        fft_losvd = np.conj(losvd_rfft)
+
+
+        
         # FFT of the input spectrum
-        fft_spec = np.fft.rfft(spec, n=npad)
+        fft_spec = np.fft.rfft(logspec, n=npad)
 
         # multiply in Fourier space (convolution)
         spec_conv = np.fft.irfft(fft_spec * fft_losvd, n=npad)
 
         # trim to original size
-        return spec_conv[:npix]
+        stellar_conv = spec_conv[:npix]
+        
+
+        # Nebular emission lines kinematics
+        nebular_scales = self.nebular_scales(age = age_gas, ion = ion_gas)
+        nebular_wls = self.nebular_wls * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
+        
+        # remove emission lines out of range interest
+        mask_nebular = (nebular_wls > obs_spec.wl[0]) & (nebular_wls < obs_spec.wl[-1])
+        nebular_wls = nebular_wls[mask_nebular] 
+        nebular_scales = nebular_scales[mask_nebular]
+
+        # sigma to apply
+        # changes with changing instrumental spectral resolution
+        # interpolate instrumental resolution from obs_spec grid onto wl_unif
+        R_unif = np.interp(np.exp(loglam_unif), obs_spec.wl, obs_spec.resolution)
+
+        sigma_obs = c_kms / (R_unif * 2.355)
+        sigma_gas_tot = np.sqrt(sigma_obs**2 + sigma_gas**2)
+        sigma_gas_pix = sigma_gas_tot / kms_per_pix 
+            
+        # Build pixel edges
+        pixels_left_borders = loglam_unif - dloglam/2
+        pixels_right_borders = loglam_unif + dloglam/2
+
+
+        nebular_conv = np.zeros_like(loglam_unif, dtype=float)
+        delta_lambda = np.exp(pixels_right_borders) - np.exp(pixels_left_borders)
+        sqrt2 = np.sqrt(2.0)
+
+        # use a typical sigma in pixel space to set a window
+        sig_med = np.median(sigma_gas_pix)
+        win = int(np.ceil(6.0 * sig_med))  # +/- 6σ is plenty
+
+        for w_line, scale in zip(nebular_wls, nebular_scales):
+            mu = np.log(w_line)
+            j0 = np.searchsorted(loglam_unif, mu)
+            j1 = max(0, j0 - win)
+            j2 = min(len(loglam_unif), j0 + win + 1)
+
+            d_left  = (pixels_left_borders[j1:j2]  - mu) / dloglam
+            d_right = (pixels_right_borders[j1:j2] - mu) / dloglam
+
+            sig = sigma_gas_pix[j1:j2]
+
+            frac = 0.5 * (
+                erf(d_right / (sqrt2 * sig)) -
+                erf(d_left  / (sqrt2 * sig))
+            )
+
+            nebular_conv[j1:j2] += scale * frac / delta_lambda[j1:j2]
+
+
+        """
+        # i runs over emission lines
+        # j runs over pixels
+        for i in range(len(nebular_wls)):
+            for j in range(len(loglam_unif)):
+                # The fraction of line i’s total flux landing in pixel j is:
+                
+                d_ij_left = (pixels_left_borders[j] - np.log(nebular_wls[i]))/ dloglam
+                d_ij_right = (pixels_right_borders[j] - np.log(nebular_wls[i]))/ dloglam
+                fraction_flux_ij = 0.5 * (erf(d_ij_right /(np.sqrt(2)*sigma_gas_pix[j])) - erf(d_ij_left /(np.sqrt(2)*sigma_gas_pix[j])))
+                # convert to flux_density
+                delta_lambda_j = np.exp(pixels_right_borders[j]) - np.exp(pixels_left_borders[j])
+                nebular_conv[j] += nebular_scales[i] * fraction_flux_ij / delta_lambda_j
+        """
+
+        # restore wavelengths
+        wl = np.exp(loglam_unif)
+        
+        # finally multiply for number of lyman photons and apply reddening
+        young_nebular_conv = nebular_conv * nlyman_young *  (10.0 ** (-(av + av_ext) * self.k_calzetti(wl))) 
+        old_nebular_conv = nebular_conv * nlyman_old * (10.0 ** (-av * self.k_calzetti(wl)))
+
+        nebular_conv = young_nebular_conv + old_nebular_conv
+
+        edge = int(np.ceil(4.0 * sigma_pix))
+        wl = wl[edge:-edge]
+        stellar_conv = stellar_conv[edge:-edge]
+        nebular_conv = nebular_conv[edge:-edge]
+
+        total_spec = stellar_conv+nebular_conv
+
+        # Re sample on observed spectrum grid
+        model_spec = np.interp(obs_spec.wl, wl, total_spec)
+
+
+
+        #remove shape differences between spectrum and model
+        eps = 1e-30  # choose for your flux units
+        
+        x = obs_spec.wl
+        y = obs_spec.flux / model_spec
+        
+        # uncertainty on ratio (assuming model_spec exact)
+        sigma_y = (obs_spec.flux_err * np.exp(spec_noise_scale)) / np.maximum(np.abs(model_spec), eps)
+        
+        good = np.isfinite(x) & np.isfinite(y) & np.isfinite(sigma_y)
+        good &= (np.abs(model_spec) > eps) & (sigma_y > 0)
+
+        # Need enough points
+        if good.sum() < (polydeg + 1):
+            raise ValueError(f"Not enough valid points for deg={polydeg}: {good.sum()} points")
+        
+        # Weights for polyfit are ~ 1/sigma (not sigma)
+        w = 1.0 / sigma_y[good]
+        
+        coeff = np.polyfit(x[good], y[good], deg=polydeg, w=w)
+        cont_poly = np.polyval(coeff, x)
+
+
+        return model_spec*cont_poly
+
+
+
 
 
     # Dust attenuation curve based on Calzetti et al. (2000) law
     # wl must be in Angstrom
     # Takes in imput an array of wavelengths and returns the attenuation function
 
-    def dust_attenuation_curve(self, wl, leitatt, uv_bump):
-        
-        k_cal = np.zeros(len(wl), dtype=float)  # cal for Calzetti
+    def dust_attenuation_curve(self, leitatt: bool = False, uv_bump: bool = False):
+        """
+        return 0.4 * k_cal / R_V
+        k_cal is the Calzetti (2000) selective attenuation curve with:
+        - optional Leitherer (2002) replacement below 1500 Å
+        - optional 2175 Å bump (Drude profile)
+        The returned function accepts scalar or array wavelengths in Angstrom.
+        """
 
-        #compute attenuation assuming Calzetti+ 2000 law
-        #single component 
+        R_V = 4.05
 
-        R = 4.05
-        div = wl.searchsorted(6300., side='left')
-        
-        #Longer than 6300
-        k_cal[div:] = 2.659*( -1.857 + 1.04*(1e4/wl[div:])) + R
-        #Shorter than 6300
-        k_cal[:div] = 2.659*(-2.156 + 1.509*(1e4/wl[:div]) - 0.198*(1e4/wl[:div])**2 + 0.011*(1e4/wl[:div])**3) + R
-        
+        def k_lambda(wl):
+            wl = np.asarray(wl, dtype=float)
 
-        #IF REQUESTED Use leitherer 2002 formula below 1500A
-        if leitatt:
-            div = wl.searchsorted(1500., side='left')
-            #Shorter than 1500
-            k_cal[:div] = (5.472 + 0.671e4 / wl[:div] - 9.218e5 / wl[:div] ** 2 + 2.620e9 / wl[:div] ** 3)
+            k_cal = np.zeros_like(wl, dtype=float)
 
-        #Prevents negative attenuation, which can arise from extrapolation or math artifacts
-        zero = bisect_left(-k_cal, 0.)
-        k_cal[zero:] = 0.
+            # Calzetti+ 2000: piecewise at 6300 Å
+            m_long = wl >= 6300.0
+            m_short = ~m_long
 
-        #2175A bump
-        if uv_bump:
-            eb = 1.0
-            k_bump = np.zeros(len(wl), dtype=float)
-            k_bump[:] = eb*(wl*350)**2 / ((wl**2 - 2175.**2)**2 + (wl*350)**2)
-            k_cal += k_bump
+            # Longer than 6300 Å
+            if np.any(m_long):
+                k_cal[m_long] = 2.659 * (-1.857 + 1.04 * (1e4 / wl[m_long])) + R_V
 
-        return 0.4 * k_cal / R
+            # Shorter than 6300 Å
+            if np.any(m_short):
+                x = 1e4 / wl[m_short]
+                k_cal[m_short] = 2.659 * (-2.156 + 1.509 * x - 0.198 * x**2 + 0.011 * x**3) + R_V
+
+            # Optional Leitherer (2002) below 1500 Å
+            if leitatt:
+                m_uv = wl < 1500.0
+                if np.any(m_uv):
+                    w = wl[m_uv]
+                    k_cal[m_uv] = (5.472 + 0.671e4 / w - 9.218e5 / w**2 + 2.620e9 / w**3)
+
+            # Enforce non-negative attenuation pointwise
+            k_cal = np.maximum(k_cal, 0.0)
+
+            # Optional 2175 Å bump (Drude-like profile)
+            if uv_bump:
+                eb = 1.0
+                bump = eb * (wl * 350.0) ** 2 / ((wl**2 - 2175.0**2) ** 2 + (wl * 350.0) ** 2)
+                k_cal = k_cal + bump
+
+            # Return 0.4 * A(lam)/A(V)
+            return 0.4 * k_cal / R_V
+
+        return k_lambda
 
 
 
@@ -579,7 +704,7 @@ class PFitter():
         
 
         # --- bands selection ---
-        if phot is not None:
+        if phot:
             if bands:
                 for b in bands:
                     if b not in map_filter_names.keys():
@@ -598,21 +723,8 @@ class PFitter():
 
         # --- preprocess observed spectrum once (done here) ---
         if spec:
-            run.spec = spec
-            obs_spec_wl, obs_spec_flux, obs_spec_flux_err = _preprocess_observed_spectrum(spec, spectral_range,atmospheric_lines)
-            run.spec_crop = Spectrum(wl=obs_spec_wl,flux=obs_spec_flux,flux_err=obs_spec_flux_err,resolution=spec.resolution,header=spec.header)
+            run.spec_crop = self._preprocess_observed_spectrum(spec, run.spectral_range, atmospheric_lines)
 
-
-        # If there is no spectrum, treat vel params as fixed/unavailable
-        if spec is None:
-            # do not mutate caller dict (we already copied)
-            run.fix_pars.setdefault("vel_sys", None)
-            run.fix_pars.setdefault("sigma_vel", None)
-            run.fix_pars.setdefault("spec_noise_scale", None)
-            for par in ("vel_sys", "sigma_vel", "spec_noise_scale"):
-                if par in run.custom_priors:
-                    run.custom_priors.pop(par)
-                print(f"Warning: Removed prior for '{par}' because no spectrum is provided.")
 
 
 
@@ -620,16 +732,30 @@ class PFitter():
         run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
 
         global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                    "alpha", "m_star", "vel_sys", "sigma_vel", "luminosity_distance", "redshift", "spec_noise_scale"]
-        
-        run.free_global_pars = [p for p in global_pars if p not in run.fix_pars]
+                    "alpha", "m_star", "vel_sys", "sigma_vel", "sigma_gas", "luminosity_distance", "redshift", "spec_noise_scale"]
 
-        run.free_pars = run.free_model_pars + run.free_global_pars
+        if not spec:
+            print("No spectral data. Neglecting kinematics")
+            run.fix_pars["vel_sys"] = 0
+            run.fix_pars["sigma_vel"] = 0
+            run.fix_pars["sigma_gas"] = 0
+            run.fix_pars["spec_noise_scale"] = 0
 
+        if not phot:
+            print("No photometric data. Neglecting scaling")
+            run.fix_pars["m_star"] = 1
+            run.fix_pars["luminosity_distance"] = 1
+            run.fix_pars["alpha"] = 1
+
+        run.free_pars = run.free_model_pars + [p for p in global_pars if p not in run.fix_pars]
+
+        # Printing
         for p in run.fix_pars.keys():
             if p in global_pars: print(f'Fixed parameter: {p} = {run.fix_pars[p]}')
         for p in run.free_pars: 
             print('Fitting: ',p)
+
+
 
 
         # --- build likelihood and prior ---
@@ -639,17 +765,6 @@ class PFitter():
         print("Initializing live points")
         run.sampler = NestedSampler(run.log_likelihood, run.prior_transform, ndim=len(run.free_pars), nlive=nlive)
         
-        """
-        run.sampler = DynamicNestedSampler(
-            run.log_likelihood,
-            run.prior_transform,
-            ndim=len(run.free_pars),
-            bound='multi',
-            sample='rslice',
-            nlive=nlive,
-        )
-        """
-
         # --- run sampler ---
         run.sampler.run_nested(dlogz=dlogz, print_progress=True)
         run.result = run.sampler.results
@@ -681,7 +796,6 @@ class PFitter():
             phot_fluxes[mask_ul] = 0.0
 
             # Set filter trasmission curves
-            
             trans_mask = {}
             trans_arrays = {}
             pivot_wls = {}
@@ -693,46 +807,10 @@ class PFitter():
                 trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
                 pivot_wls[b] = F.pivot_wavelength
 
-        if spec is None: 
-            obs_resolution_on_model_grid = None
-            w_spec = 0 
-            run.w_spec = None
 
-        if spec: 
-                
-                obs_resolution_on_model_grid = interp1d( 
-                    run.spec_crop.wl, run.spec_crop.resolution, kind="linear",
-                    bounds_error=False, fill_value="extrapolate"
-                )(self.model_wl)
-
-                wl_obs, flux_obs, err_obs = run.spec_crop.wl, run.spec_crop.flux, run.spec_crop.flux_err
-
-
-                # Autocorrelation of spectral pixels. Information is not independent
-                # Use the same pixels that enter the spectral likelihood
-                R_obs  = run.spec_crop.resolution  # this should be R(λ)
-                
-                mask_like = (np.isfinite(flux_obs)& np.isfinite(err_obs)& (err_obs > 0)& np.isfinite(R_obs))
-
-                # If you use spectral_range windows, apply them here too (important)
-                # mask_like &= ...
-
-                dlam_obs = np.gradient(wl_obs)
-
-                N_eff = np.sum(R_obs[mask_like] * dlam_obs[mask_like] / wl_obs[mask_like])
-                N_pix = mask_like.sum()
-                w_spec = N_eff / N_pix
-
-                run.w_spec = float(w_spec)
-
-        # --- precompute index maps / fixed dicts (done once) ---
-        free_model_pos = {n: i for i, n in enumerate(run.free_model_pars)}  # O(1) lookup
-
-        model_names = list(self.model_pars)
-        fixed_model_kwargs = {n: run.fix_pars[n] for n in model_names if n in run.fix_pars}
-
-
-
+            # other very usefull stuff
+            self.k_calzetti_array = self.k_calzetti(self.model_wl)
+          
         # --- closure used by the sampler ---
         def log_likelihood(pars):
             
@@ -741,59 +819,41 @@ class PFitter():
             
             idx = 0
 
-
             # ---- MODEL PARAMETERS: only read the *free* model params from pars ----
-            n_free_model = len(run.free_model_pars)
-            model_free_values = np.array([]) if n_free_model == 0 else pars[idx: idx + n_free_model]
-            idx += n_free_model
-
-            # ---- BUILD MODEL KWARGS ----
-            model_kwargs = dict(fixed_model_kwargs)
-            for name in model_names:
-                if name not in fixed_model_kwargs:
-                    model_kwargs[name] = model_free_values[free_model_pos[name]]
-
-            # ---- GLOBAL / NAMED PARAMETERS ----
-            names = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                        "alpha", "m_star", "vel_sys", "sigma_vel","luminosity_distance","redshift","spec_noise_scale"]
-            val = {}
-            for name in names:
-                if name in run.fix_pars:
-                    val[name] = run.fix_pars[name]
-                else:
-                    val[name] = pars[idx]
-                    idx += 1
+            # map vector → named parameters
+            p = dict(zip(run.free_pars, pars))
+            # inject fixed parameters
+            p.update(run.fix_pars)
+            model_kwargs = {k: p[k] for k in self.model_pars}
 
             # unpack named params for readability
-            fesc = val["fesc"]
-            ion_gas = val["ion_gas"]
-            age_gas = val["age_gas"]
-            av = val["av"]
-            av_ext = val["av_ext"]
-            alpha = val["alpha"]
-            m_star = val["m_star"]
-            vel_sys = val["vel_sys"]
-            sigma_vel = val["sigma_vel"]
-            luminosity_distance = val["luminosity_distance"]
-            redshift = val["redshift"]
-            spec_noise_scale = val["spec_noise_scale"]
-
-            # --- Build synthetic spectrum (pass obs_resolution_on_model_grid) ---
-            model_red_wl, synth_flux, model_phot_array = self.synthetic_spectrum(**model_kwargs,
-                                                fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
-                                                av=av, av_ext=av_ext, alpha=alpha,
-                                                m_star=m_star,
-                                                vel_sys=vel_sys, sigma_vel=sigma_vel,
-                                                luminosity_distance=luminosity_distance,
-                                                redshift=redshift,
-                                                observed_spectrum_resolution=obs_resolution_on_model_grid,
-                                                likelihood_call=True,
-                                                bands=run.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
+            fesc = p["fesc"]
+            ion_gas = p["ion_gas"]
+            age_gas = p["age_gas"]
+            av = p["av"]
+            av_ext = p["av_ext"]
+            alpha = p["alpha"]
+            m_star = p["m_star"]
+            vel_sys = p["vel_sys"]
+            sigma_vel = p["sigma_vel"]
+            sigma_gas = p["sigma_gas"]
+            luminosity_distance = p["luminosity_distance"]
+            redshift = p["redshift"]
+            spec_noise_scale = p["spec_noise_scale"]
 
 
 
             # ----------------- Photometric likelihood -----------------
             if phot is not None:
+
+                model_phot_array = self.synthetic_spectrum(**model_kwargs,
+                                        fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
+                                        av=av, av_ext=av_ext, alpha=alpha,
+                                        m_star=m_star,
+                                        luminosity_distance=luminosity_distance,
+                                        redshift=redshift,
+                                        likelihood_call=True,
+                                        bands=run.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
 
                 if not np.all(np.isfinite(model_phot_array)):
                     return -1e100
@@ -811,22 +871,26 @@ class PFitter():
                         phot_lhood += np.log(terf)
 
 
-
             # ----------------- Spectral likelihood (features only) -------------
             if spec is not None:
-                
-                # Returns the model spectrum ready to be compared with the observed spectrum!
-                normalization_factor, normalization_factor_smoothed, synth_flux = _adapt_model_spectrum_to_observed_spectrum(wl_obs, flux_obs, err_obs,model_red_wl, synth_flux, run.spectral_range,run.polydeg)
-                
+
+                model_spec_array = self.synthetic_spectrum_for_fitting(**model_kwargs,
+                                        fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
+                                        av=av, av_ext=av_ext, alpha=alpha,
+                                        m_star=m_star,
+                                        vel_sys=vel_sys, sigma_vel = sigma_vel, sigma_gas = sigma_gas,
+                                        luminosity_distance=luminosity_distance,redshift=redshift,
+                                        obs_spec=run.spec_crop,polydeg=run.polydeg,spec_noise_scale=spec_noise_scale)
+
                 # Likelihood mask 
                 mask_like = (
-                    np.isfinite(model)
+                    np.isfinite(model_spec_array)
                     & np.isfinite(run.spec_crop.flux)
                     & (run.spec_crop.flux_err > 0)
                 )
                 flux_obs = run.spec_crop.flux[mask_like]
                 flux_err = run.spec_crop.flux_err[mask_like]
-                model = model[mask_like]
+                model = model_spec_array[mask_like]
 
 
                 # Free nuisance parameter: This is not arbitrary — it is equivalent to marginalizing over unknown variance.
@@ -835,16 +899,20 @@ class PFitter():
                                 
                 flux_err_corr = flux_err * np.exp(spec_noise_scale)
 
-                residuals = (flux_obs - synth_flux) / (flux_err_corr)
+                residuals = (flux_obs - model) / (flux_err_corr)
                 
                 chi2 = np.sum(residuals**2)
                 
                 spec_lhood = - 0.5 * chi2  - np.sum (np.log( np.sqrt(2 * np.pi) * flux_err_corr))
-                            
-            return w_spec * spec_lhood + phot_lhood
+
+            return spec_lhood + phot_lhood
 
         return log_likelihood
     
+
+
+
+
 
 
 
@@ -872,6 +940,7 @@ class PFitter():
             'm_star':  {'type': 'uniform', 'low': 4.0, 'high': 12.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
+            'sigma_gas': {'type': 'uniform', 'low': 1.0, 'high': 500.0},
             'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
             'redshift': {'type': 'uniform', 'low': 0, 'high': 6},
             'spec_noise_scale': {'type': 'uniform', 'low': -2, 'high': 2}
@@ -969,80 +1038,85 @@ class PFitter():
 
 
 
+    def _preprocess_observed_spectrum(self, spec, spectral_range, atmospheric_lines):
+        """
+        Preprocess observed spectrum:
+        - Accepts one range [wl1, wl2] or multiple ranges [[wl1, wl2], [wl3, wl4], ...]
+        - Zeroes out flux and err outside allowed ranges
+        - Removes ±25 Å around each atmospheric line
+        """
 
+        wl = spec.wl.copy()
+        flux = spec.flux.copy()
+        err = spec.flux_err.copy()
+        resolution = spec.resolution.copy()
 
+        # ------------------------------
+        # 1. Normalize spectral_range to list of intervals
+        # ------------------------------
+        if isinstance(spectral_range[0], (int, float)):
+            # Single range -> wrap it
+            ranges = [spectral_range]
+        else:
+            # Already list of lists
+            ranges = spectral_range
 
+        # ------------------------------
+        # 2. Build mask for inside ANY allowed spectral window
+        # ------------------------------
+        mask_ranges = np.zeros_like(wl, dtype=bool)
+        for r in ranges:
+            wl1, wl2 = r
+            mask_ranges |= (wl >= wl1) & (wl <= wl2)
 
+        # ------------------------------
+        # 3. Remove atmospheric lines ±25 Å
+        # ------------------------------
+        mask_atm = np.ones_like(wl, dtype=bool)
+        for line in atmospheric_lines:
+            lam = atmospheric_lines[line]
+            bad = (wl >= lam - 25) & (wl <= lam + 25)
+            mask_atm &= ~bad  # remove these pixels
 
+        # ------------------------------
+        # 4. Combined mask for valid pixels
+        # ------------------------------
+        mask_valid = mask_ranges & mask_atm
 
+        # ------------------------------
+        # 5. Zero out invalid pixels (requested behavior)
+        # ------------------------------
+        flux[~mask_valid] = 0.0
+        err[~mask_valid] = 0.0   # error=0 means "ignore these pixels"
 
+        # ------------------------------
+        # 6. Remove NaNs, infs, negative errors INSIDE valid regions
+        # ------------------------------
+        good = np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err >= 0)
+        # Keep invalid pixels zero, but we only mask bad valid ones:
+        mask_final = mask_valid & good
 
+        # Apply final mask:
+        flux[~mask_final] = np.nan
+        err[~mask_final] = np.nan
 
+        # ------------------------------
+        # 7. Trim spectrum to first/last valid pixel
+        # ------------------------------
+        valid = np.isfinite(flux) & (flux != 0)
 
+        if np.any(valid):
+            i0 = np.argmax(valid)                  # first True
+            i1 = len(valid) - np.argmax(valid[::-1])  # last True + 1
 
+            wl = wl[i0:i1]
+            flux = flux[i0:i1]
+            err = err[i0:i1]
+            resolution = resolution[i0:i1]
+        else:
+            raise ValueError("No valid spectral pixels remain after preprocessing.")
 
-def _preprocess_observed_spectrum(spec, spectral_range, atmospheric_lines):
-    """
-    Preprocess observed spectrum:
-    - Accepts one range [wl1, wl2] or multiple ranges [[wl1, wl2], [wl3, wl4], ...]
-    - Zeroes out flux and err outside allowed ranges
-    - Removes ±25 Å around each atmospheric line
-    """
-
-    wl = spec.wl.copy()
-    flux = spec.flux.copy()
-    err = spec.flux_err.copy()
-
-    # ------------------------------
-    # 1. Normalize spectral_range to list of intervals
-    # ------------------------------
-    if isinstance(spectral_range[0], (int, float)):
-        # Single range -> wrap it
-        ranges = [spectral_range]
-    else:
-        # Already list of lists
-        ranges = spectral_range
-
-    # ------------------------------
-    # 2. Build mask for inside ANY allowed spectral window
-    # ------------------------------
-    mask_ranges = np.zeros_like(wl, dtype=bool)
-    for r in ranges:
-        wl1, wl2 = r
-        mask_ranges |= (wl >= wl1) & (wl <= wl2)
-
-    # ------------------------------
-    # 3. Remove atmospheric lines ±25 Å
-    # ------------------------------
-    mask_atm = np.ones_like(wl, dtype=bool)
-    for line in atmospheric_lines:
-        lam = atmospheric_lines[line]
-        bad = (wl >= lam - 25) & (wl <= lam + 25)
-        mask_atm &= ~bad  # remove these pixels
-
-    # ------------------------------
-    # 4. Combined mask for valid pixels
-    # ------------------------------
-    mask_valid = mask_ranges & mask_atm
-
-    # ------------------------------
-    # 5. Zero out invalid pixels (requested behavior)
-    # ------------------------------
-    flux[~mask_valid] = 0.0
-    err[~mask_valid] = 0.0   # error=0 means "ignore these pixels"
-
-    # ------------------------------
-    # 6. Remove NaNs, infs, negative errors INSIDE valid regions
-    # ------------------------------
-    good = np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err >= 0)
-    # Keep invalid pixels zero, but we only mask bad valid ones:
-    mask_final = mask_valid & good
-
-    # Apply final mask:
-    flux[~mask_final] = np.nan
-    err[~mask_final] = np.nan
-
-    return wl, flux, err
+        return Spectrum(wl=wl, flux=flux, flux_err=err, resolution=resolution, header=spec.header)
 
 
 
@@ -1108,401 +1182,6 @@ def _adapt_model_spectrum_to_observed_spectrum(wl_obs, flux_obs, err_obs, model_
     
     return normalization_factor, normalization_factor_smoothed, model_scaled
 
-
-
-
-
-def fit_diagnostic(
-    spec,
-    spectral_range,
-    phot,
-    
-    models,
-    polydeg = 7,
-    spec_noise_scale = 0,
-    w_spec = None,
-    
-    bands = None,
-    treat_as_upper_limits = [],
-
-    # plotting window
-    winf_spec=None,
-    wsup_spec=None,
-
-    winf_phot=1e2,
-    wsup_phot=1e7,
-    ymin=None,
-    ymax=None,
-
-    # aestethics
-    figsize=(10,10),
-    color=None,
-    show_errorbars=True,
-        
-    # optionals
-    redshift=None,
-    show_top_spectral_lines=False,
-    show_all_spectral_lines=False,
-    show_atmospheric_lines=False,
-        
-    spec_legend_pars=None,
-    observed_spec_label=None,
-    spec_legend_loc="upper right",
-    phot_legend_loc="upper right",
-    spec_legend_title=None,
-    phot_legend_title=None,
-
-    ):
-    
-    if phot is not None:
-        if not isinstance(phot, PhotometryTable):
-            raise TypeError(
-                f"'phot' must be a PhotometryTable instance, got {type(phot).__name__} instead."
-            )
-    if spec is not None:
-        if not isinstance(spec, Spectrum):
-            raise TypeError(
-                f"'spec' must be a Spectrum instance, got {type(spec).__name__} instead."
-            )
-        if not spectral_range:
-            spectral_range = [spec.wl[0],spec.wl[-1]]
-    if phot is None and spec is None:
-        raise ValueError(
-            "At least one of 'phot' or 'spec' must be provided."
-        )
-
-    if not isinstance(models, list):
-        raise TypeError(
-            f"'models' must be a list of Spectrum instances, got {type(spec).__name__} instead."
-        )
-
-
-    if spec:
-        
-        wl, flux_obs, flux_err = _preprocess_observed_spectrum(spec, spectral_range,atmospheric_lines)
-        
-        flux_err_corr = flux_err * np.exp(spec_noise_scale)
-        
-        spec_crop = Spectrum(wl=wl,flux=flux_obs,flux_err=flux_err,resolution=spec.resolution,header=spec.header)
-
-        
-        mask_like = (np.isfinite(flux_obs)& np.isfinite(flux_err_corr)& (flux_err_corr > 0)& np.isfinite(spec_crop.resolution))
-
-        dlam_obs = np.gradient(wl)
-        N_eff = np.sum(spec_crop.resolution[mask_like] * dlam_obs[mask_like] / wl[mask_like])
-        N_pix = mask_like.sum()
-        w_spec = N_eff / N_pix
-        
-        normalization_factor_list = []
-        normalization_factor_smoothed_list = []
-        models_comparable_to_obs = []
-        residuals = []
-        chi2_spec = []
-        logL_spec = []
-
-
-        for model in models:
-
-            model_red_wl = model.wl
-            synth_flux = model.flux
-
-            normalization_factor, normalization_factor_smoothed, model = _adapt_model_spectrum_to_observed_spectrum(wl, flux_obs, flux_err ,model_red_wl, synth_flux, spectral_range,polydeg)
-        
-            normalization_factor_list.append(normalization_factor)
-            normalization_factor_smoothed_list.append(normalization_factor_smoothed)
-        
-            models_comparable_to_obs.append(model)
-
-            res = (flux_obs - model) / flux_err_corr
-            residuals.append(res)
-
-            chi2 = np.nansum(res**2)
-            chi2_spec.append(chi2/len(wl))
-
-            logL = - 0.5 * chi2  - np.nansum (np.log( np.sqrt(2 * np.pi) * flux_err_corr ))
-            logL_spec.append(logL)
-
-        
-        ### --- Plotting --- ###
-
-        fig, ax = plt.subplots(2,2,figsize=figsize)
-        ax = ax.flatten()
-        
-        global_fmax = -np.inf
-        global_fmin = +np.inf
-        if winf_spec is None: winf_spec = wl[0]
-        if winf_spec is None: wsup_spec = wl[-1]
-        mask = (wl>winf_spec) & (wl<wsup_spec)
-        
-        global_norm_max = -np.inf
-        global_norm_min = +np.inf
-        global_res_max = -np.inf
-        global_res_min = +np.inf
-        
-        for i in [0,2]:
-            if show_errorbars:
-                ax[i].errorbar(wl, flux_obs, yerr=flux_err_corr, fmt='o', markersize=2,
-                                color='black', ecolor='gray', elinewidth=1.0,
-                                capsize=2, capthick=1.0, linestyle=' ', lw=0.5,
-                                label=observed_spec_label)
-            else:
-                ax[i].plot(wl, flux_obs, color='black', lw=0.5, label='observed')
-            
-            global_fmax = max(np.nanmax(flux_obs[mask]),global_fmax)
-            global_fmin = min(np.nanmin(flux_obs[mask]),global_fmin)
-        
-
-        for j,model in enumerate(models):
-        
-            # --- Color ---
-            if isinstance(color, (list, tuple)) and len(color) > 0:
-                c = color[j % len(color)]
-            elif color is None:
-                c = f"C{j % 10}" 
-            else:
-                c = color
-        
-
-            # --- Label ---
-            label = None
-
-            if isinstance(spec_legend_pars, str):
-                label = str(model.header.get(spec_legend_pars))
-
-            elif isinstance(spec_legend_pars, dict):
-                parts = []
-                for k, p in spec_legend_pars.items():
-                    if k in model.header:
-                        parts.append(
-                            f"{p['label']}={model.header[k]:{p['fmt']}} {p['unit']}"
-                        )
-                label = ", ".join(parts) if parts else None
-
-            else:
-                label = model.header.get("ID", getattr(model, "id", None))
-
-            
-            ax[0].plot(model.wl,model.flux,color=c,label=label)
-        
-            mask_m = (model.wl > winf_spec) & (model.wl < wsup_spec)
-            global_fmax = max(global_fmax, np.nanmax(model.flux[mask_m]))
-            global_fmin = min(global_fmin, np.nanmin(model.flux[mask_m]))
-        
-            ax[1].plot(wl,normalization_factor_list[j],color=c,alpha=0.3)
-            ax[1].plot(wl,normalization_factor_smoothed_list[j],color=c,)
-            
-            global_norm_max = max(np.nanmax(normalization_factor_list[j][mask]),global_norm_max)
-            global_norm_min = min(np.nanmin(normalization_factor_list[j][mask]),global_norm_min)
-            
-            ax[2].plot(wl,models_comparable_to_obs[j],color=c)
-            
-            global_res_max = max(np.nanmax(residuals[j][mask]),global_res_max)
-            global_res_min = min(np.nanmin(residuals[j][mask]),global_res_min)
-            #ax[3].plot(wl,residuals[j],alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
-            ax[3].scatter(wl,residuals[j],s=10,alpha=1,color=c,
-                        label = f"$\\tilde{{\chi}}_2=${chi2_spec[j]:.2f}, $\log L$ = {logL_spec[j]:.2f}")
-
-        
-        for i in range(4):
-            ax[i].set_xlim(winf_spec,wsup_spec)
-        
-        for i in [0,2]:
-            ax[i].set_ylim(0.8*global_fmin,1.2*global_fmax)
-        
-        ax[1].set_ylim(0.8*global_norm_min,1.2*global_norm_max)
-
-        ax[0].legend() 
-        ax[3].legend()
-
-        ax[0].set_title('Raw observed spectrum and model')
-        ax[2].set_title('Raw spectrum and model fitted to observed spectrum continuum')
-        ax[1].set_title(f'Polynomial multiplicative factor. Polynomial degree {polydeg:.0f}')
-        ax[1].set_ylabel('$f_\\text{obs}/f_\\text{model}$')
-
-        ax[3].set_title('Residuals')
-        ax[3].set_ylabel('$(f_\\text{obs}-f_\\text{model})/\sigma_f$')
-        ax[3].set_ylim(0.8*global_res_min,1.2*global_res_max)
-        ax[3].axhline(y=0,color='black',lw=1)
-
-        # Lines
-        x_u = 'A'
-        z = models[0].header['REDSHIFT'] if redshift is None else redshift
-
-        for i in range(4):
-            if show_top_spectral_lines:
-                for name in ['Lya','Ha','Hb','Hg','Hd']:
-                    wavelength = spectral_lines[name]
-                    wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                    if wl_shift > winf_spec and wl_shift < wsup_spec:
-                        ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                        ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
-                                rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
-                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-
-            if show_all_spectral_lines:
-                for name, wavelength in spectral_lines.items():
-                    wavelength = spectral_lines[name]
-                    wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                    if wl_shift > winf_spec and wl_shift < wsup_spec:
-                        ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                        name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                        ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
-                                rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
-                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-
-            if show_atmospheric_lines:
-                for name, wavelength in atmospheric_lines.items():
-                    wl_plot = models[0]._angstrom_to_wl(wavelength, x_u)
-                    if wl_plot > winf_spec and wl_plot < wsup_spec:
-                        ax[i].axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
-                        ax[i].text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
-                                va="bottom", fontsize=9, ha='center', clip_on=True,
-                                bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-        plt.show()
-
-
-        
-        ### --- Diagnostic for the photometric component --- ###
-
-        if phot:
-
-            if bands:
-                for b in bands:
-                    if b not in map_filter_names.keys():
-                        raise ValueError(f'Unrecognized filter: {b}. Abort')
-                bands = list(bands)
-            else:
-                bands = [b for b in phot.data.keys() if b in map_filter_names.keys()]
-
-        
-                        
-            phot_fluxes = np.array([phot.data[b][0] for b in bands])
-            phot_errors = np.array([phot.data[b][1] for b in bands])
-
-            # apply upper limits locally
-            bad = [b for b in treat_as_upper_limits if b not in map_filter_names]
-            if bad:
-                raise ValueError(f'Unrecognized filter(s): {bad}. Abort')
-            
-            mask_ul = np.array([b in treat_as_upper_limits for b in bands], dtype=bool)
-            
-            # for upper limits: flux -> 0, error -> original flux (your logic)
-            phot_errors[mask_ul] = phot_fluxes[mask_ul]
-            phot_fluxes[mask_ul] = 0.0
-
-            # Just for plot
-            phot_loc = copy.deepcopy(phot)
-            for b in treat_as_upper_limits:
-                appo = phot_loc.data[b][0] 
-                phot_loc.data[b] = (0,appo)
-            
-            phot_units = phot.header["UNITS"]
-
-
-            logL_phot = []
-            
-            for j in range(len(models)):
-                
-                model_phot = models[j].get_phot(bands=bands,method='trapz',units='erg/s/cm2/A')
-                model_phot_array = np.array([model_phot.data[b][0] for b in bands])
-                
-                if not np.all(np.isfinite(model_phot_array)):
-                    raise ValueError(f"Model spectrum {j:.0f} gives invalid photometry")
-                                
-                chi2 = 0.0
-                logL = 0.0
-                
-                residuals_per_band = []
-    
-                N_phot = len(phot_fluxes)
-    
-                for i in range(N_phot):
-    
-                    mod = model_phot_array[i]
-                    obs = phot_fluxes[i]
-                    err = phot_errors[i]
-                    var = err**2
-    
-                    if obs > 0:
-                        # Detection: Gaussian likelihood
-                        resid = (obs - mod) / err
-    
-                        chi2 += resid**2
-                        logL += -0.5 * (resid**2 + np.log(2 * np.pi * var))
-    
-                        residuals_per_band.append(
-                            (nice_filter_names[bands[i]], resid,)
-                        )
-    
-                    else:
-                        # Upper limit: one-sided Gaussian
-                        arg = (obs - mod) / (np.sqrt(2.0) * err)
-                        cdf = 0.5 * (1 + erf(arg))
-    
-                        #if cdf <= 0:
-                        #    logL = -1e100
-                        #    break
-    
-                        logL += np.log(cdf)
-    
-                        residuals_per_band.append(
-                            (nice_filter_names[bands[i]], arg,)
-                        )
-
-                print(chi2)
-                models[j].header['CHI2']   = chi2 / len(bands)
-                models[j].header['LOGLPHOT']  = logL
-                logL_phot.append(logL)
-
-            
-
-            if not spec_legend_pars: 
-                spec_legend_pars = {}
-            spec_legend_pars['CHI2'] = dict(label="$\\tilde{\chi}_2$", unit="", fmt=".2f")
-            spec_legend_pars['LOGLPHOT'] = dict(label="$\log L \\text{ phot}$", unit="", fmt=".2f")
-            if spec:
-                spec_legend_pars['LOGLTOT'] = dict(label="$\log L \\text{ tot}$", unit="", fmt=".2f")
-
-
-            models[0].plot(
-
-                spectra=models,
-                per_wavelength=True,
-                winf=winf_phot,
-                wsup=wsup_phot,
-                ymin=ymin,
-                ymax=ymax,
-
-                figsize=(20,7),
-                color=color,
-
-                redshift=None,
-                show_top_spectral_lines=False,
-                show_all_spectral_lines=False,
-                show_atmospheric_lines=False,
-                show_filters=False,
-            
-                phot=phot_loc,
-                synth_phot=bands,
-                spec_legend_pars=spec_legend_pars,
-                show_phot_legend=True,
-                show_spec_legend=True,
-                spec_legend_loc=phot_legend_loc,
-                spec_legend_title=None,
-                spec_legend_fontsize=14,
-            )
-
-        if spec:
-            print(f'Total likelihood, with spectral noise scale factor {spec_noise_scale:.2f} and spectral correlation parameter {w_spec:.2f} is:')
-            for j, model in enumerate(models):
-                logL_tot = logL_spec[j] * w_spec + logL_phot[j]
-                print(f"For model {j+1}: {logL_tot:.2f}")
-
-        for model in models:
-            for key in ['CHI2', 'LOGLPHOT']:
-                if key in model.header:
-                    del model.header[key]
 
 
 
