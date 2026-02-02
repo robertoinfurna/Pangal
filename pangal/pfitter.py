@@ -101,11 +101,11 @@ class PFitter():
         print(f" Pre-computed model grid:")
         for name, arr in zip(self.model_pars, self.model_pars_arr):
             print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")
-        print("\n")
         
 
         # PRECOMPUTES DUST ATTENUATION CURVE (Calzetti, 2000 + optional Leitherer+2002 + optional UV bump)
         self.k_calzetti = self.dust_attenuation_curve(leitatt, uv_bump)
+        self.k_calzetti_array = self.k_calzetti(self.model_wl)
         print('Dust attenuation curve from Calzetti 2000.')
 
         # LOADS NEBULAR LINE TABLES
@@ -125,7 +125,6 @@ class PFitter():
 
 
 
-
     def synthetic_spectrum(
         self,
         fesc,
@@ -137,101 +136,79 @@ class PFitter():
         m_star,
         redshift,
         luminosity_distance,
-        multi_component=False,              
+        vel_sys,
+        sigma_vel,
+        sigma_gas,
+                 
         likelihood_call=False,
-        bands=None,
+        bands=[],
         trans_arrays=None,
         trans_mask=None,
         pivot_wls=None,
+
+        obs_spec=None,
+        polydeg=None,
+        spec_noise_scale=0,
+
+        multi_component=False,     
+
         **kwargs,
     ):
-        """
-        Generate a physically motivated synthetic galaxy spectrum including stellar,
-        nebular, dust, and kinematic effects (velocity shift and broadening).
 
-        Parameters
-        ----------
-        fesc : float
-            Escape fraction of ionizing photons (0 = fully absorbed by gas; 1 = no nebular emission).
-        ion_gas : float
-            Ionization parameter of the nebular gas.
-        age_gas : float
-            Age of the nebular region in Myr (affects emission line spectrum).
-        av : float
-            V-band attenuation for the old stellar population (in magnitudes).
-        av_ext : float
-            Extra V-band attenuation applied only to the young stellar population.
-        alpha : float
-            Parameter controlling the shape of the dust emission SED (Dale & Helou 2002 models).
-        m_star : float
-            Logarithmic stellar mass of the galaxy (log₁₀[M*/M☉]).
-        redshift : float
-            Cosmological redshift of the galaxy.
-        luminosity_distance : float
-            Luminosity distance to the galaxy in Mpc (used for flux scaling).
-        vel_sys : float, optional
-            Systemic velocity offset [km/s], adds an extra Doppler shift to the spectrum.
-        sigma_vel : float, optional
-            Line-of-sight velocity dispersion [km/s], broadens absorption/emission lines.
-        multi_component : bool, optional
-            If True, includes component arrays (dust, young/old spectra) in the output Spectrum.
-        **kwargs :
-            Additional parameters for stellar population model interpolation (e.g., age, Z, SFH).
-
-        Returns
-        -------
-        Spectrum
-            Synthetic `Spectrum` object with wavelength (Å) and flux (erg/s/cm²/Å),
-            including optional subcomponents if `multi_component=True`.
-        """
+        # PHOTOMETRY
 
         # --- Stellar population spectra ---
-        young_stellar_spec = self.interp_young_flux(**kwargs)
-        old_stellar_spec   = self.interp_old_flux(**kwargs)
+        young_stellar = self.interp_young_flux(**kwargs)
+        old_stellar = self.interp_old_flux(**kwargs)
 
         # --- Ionizing photons and nebular emission ---
         index_lyman = np.searchsorted(self.model_wl, 912, side="left")
         lycont_wls = np.r_[self.model_wl[:index_lyman], np.array([912])]
 
         # Young
-        lycont_spec = np.interp(lycont_wls, self.model_wl, young_stellar_spec)
+        lycont_spec = np.interp(lycont_wls, self.model_wl, young_stellar)
         nlyman_young = np.trapz(lycont_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
 
         # Old
-        lycont_spec = np.interp(lycont_wls, self.model_wl, old_stellar_spec)
+        lycont_spec = np.interp(lycont_wls, self.model_wl, old_stellar)
         nlyman_old = np.trapz(lycont_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
 
         # Remove escaped photons
         if fesc >= 0:
-            young_stellar_spec[:index_lyman] *= fesc
-            old_stellar_spec[:index_lyman]  *= fesc
+            young_stellar[:index_lyman] *= fesc
+            old_stellar[:index_lyman]  *= fesc
+
 
         # Nebular emission
         nebular_lines = self.nebular_func(ion_gas, age_gas)
-        nebular_young = nebular_lines * nlyman_young
-        nebular_old   = nebular_lines * nlyman_old
+        young_nebular = nebular_lines * nlyman_young
+        old_nebular   = nebular_lines * nlyman_old
 
-        young_stellar_nebular_spec = young_stellar_spec + nebular_young
-        old_stellar_nebular_spec   = old_stellar_spec + nebular_old
-        stellar_nebular_spec       = young_stellar_nebular_spec + old_stellar_nebular_spec
+        stellar_nebular = young_stellar + old_stellar + young_nebular + old_nebular
 
         # --- Dust attenuation ---
-        att_young_stellar_nebular_spec = (10 ** (-(av + av_ext) * self.k_calzetti_array)) * young_stellar_nebular_spec
-        att_old_stellar_nebular_spec   = (10 ** (-av * self.k_calzetti_array)) * old_stellar_nebular_spec
-        att_stellar_nebular_spec       = att_young_stellar_nebular_spec + att_old_stellar_nebular_spec
+        att_young_stellar = (10 ** (-(av + av_ext) * self.k_calzetti_array)) * young_stellar
+        att_old_stellar   = (10 ** (-av * self.k_calzetti_array)) * old_stellar
+        att_stellar      = att_young_stellar + att_old_stellar
+
+        att_young_nebular = (10 ** (-(av + av_ext) * self.k_calzetti_array)) * young_nebular
+        att_old_nebular   = (10 ** (-av * self.k_calzetti_array)) * old_nebular
+        att_nebular       = att_young_nebular + att_old_nebular
+
+        att_stellar_nebular = att_stellar + att_nebular
 
         # --- Thermal dust re-emission ---
-        lbol_init = np.trapz(stellar_nebular_spec, self.model_wl)
-        lbol_att  = np.trapz(att_stellar_nebular_spec, self.model_wl)
+        lbol_init = np.trapz(stellar_nebular, self.model_wl)
+        lbol_att  = np.trapz(att_stellar_nebular, self.model_wl)
         dust_bol  = lbol_init - lbol_att
 
         tdust_spec = self.dustem_func(alpha)
 
         # Remove stellar leakage in Dale templates
         mask_pixels = (self.model_wl >= 2.5e4) & (self.model_wl <= 3e4)
-        scale = np.sum(stellar_nebular_spec[mask_pixels] * tdust_spec[mask_pixels]) / \
-                np.sum(stellar_nebular_spec[mask_pixels] ** 2)
-        tdust_spec -= scale * stellar_nebular_spec
+        scale = np.sum(stellar_nebular[mask_pixels] * tdust_spec[mask_pixels]) / \
+                np.sum(stellar_nebular[mask_pixels] ** 2)
+        tdust_spec -= scale * stellar_nebular
         tdust_spec[(self.model_wl < 2.5e4) | (tdust_spec < 0.)] = 0.
 
         # Scale dust emission
@@ -239,17 +216,220 @@ class PFitter():
         dust_spec = tdust_spec * dust_bol / norm
 
         # --- Total rest-frame spectrum ---
-        total_spec = att_stellar_nebular_spec + dust_spec
+        final_spec_phot = att_stellar_nebular + dust_spec
 
         # --- Redshift to observed frame ---
         model_red_wl = self.model_wl * (1 + redshift)
-        total_spec /= (1 + redshift)
+        final_spec_phot /= (1 + redshift)
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
         fscale = 10**m_star / (luminosity_distance * 1e5)**2
-        total_spec *= fscale
+        final_spec_phot *= fscale
+        
+        # --- Compute synthetic photometric points
+        model_phot = []
+        for b in bands:
+            mask_b = trans_mask[b]
+            spec_array = final_spec_phot[mask_b]
+            wl_b = model_red_wl[mask_b] 
+            if len(spec_array) == 0:
+                model_phot.append(np.nan)
+                continue
+            num_int = np.trapz(trans_arrays[b] * spec_array * wl_b, wl_b)
+            den = np.trapz(trans_arrays[b] * wl_b, wl_b)
+            if den == 0:
+                model_phot.append(np.nan)
+                continue
+            phot_point = num_int / den
+            
+            # convert to mJy if needed
+            c = 2.99792458e18  # Å/s
+            phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
+            model_phot.append(phot_point)
+
+        
+        # SPECTROSCOPY
+        final_spec = None
+        if obs_spec:
+
+            c_kms = 2.99792458e5  # km/s
+            
+            # --- Kinematics of stellar spectrum: LOSVD + systemic shift ---
+            
+            wl_obs = self.model_wl * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
+            att_stellar /= (1.0 + redshift)
+            
+            mask = (wl_obs > obs_spec.wl[0]) & (wl_obs < obs_spec.wl[-1])
+            wl_obs = wl_obs[mask]
+            att_stellar = att_stellar[mask]
+            model_resolution = self.model_resolution[mask]
+
+            sigma_model = c_kms / (model_resolution * 2.355)
+            sigma_obs = c_kms / (obs_spec.resolution * 2.355)
+            
+            sigma_int = max(max(sigma_model),max(sigma_obs))
+
+            # Final broadening to apply to the stellar spectrum
+            sigma_tot = np.sqrt(sigma_int**2 + sigma_vel**2 - max(sigma_model)**2)
+
+            # CONVOLVE MODEL SPECTRUM WITH LOSVD GAUSSIAN FUNCTION WITH SIGMA_TOT
+            
+            # Build a uniform log lambda grid
+            loglam = np.log(wl_obs)
+            loglam_unif = np.linspace(loglam[0],loglam[-1],len(loglam))
+
+            # interpolate spectrum on new lambda grid
+            logspec = np.interp(loglam_unif, loglam, att_stellar)
+
+            # velocity in pixel space
+            dloglam = np.median(np.diff(loglam_unif))
+            kms_per_pix = 2.99792458e5 * dloglam
+            vel_pix = vel_sys / kms_per_pix
+            sigma_pix = sigma_tot / kms_per_pix    
+
+            
+            # Velocity-space convolution using analytic LOSVD in Fourier domain    
+            
+            npix = len(loglam_unif)
+            npad = 2 * npix  # zero-padding to avoid wrap-around
+
+            # make LOSVD kernel for same npad length
+            
+            nl = npad // 2 + 1                # size of RFFT array
+            w = np.linspace(0, np.pi, nl)     # frequency vector for RFFT
+
+            if sigma_pix == 0:
+                losvd_rfft = np.ones_like(w, dtype=complex)
+            else:   
+                #a = v_pix / sigma_pix 
+                # velocity shift already considered when shifting wl_obs
+                a = 0
+                losvd_rfft = np.exp(1j * a * w - 0.5 * (sigma_pix * w)**2)
+
+            fft_losvd = np.conj(losvd_rfft)
+
+            
+            # FFT of the input spectrum
+            fft_spec = np.fft.rfft(logspec, n=npad)
+
+            # multiply in Fourier space (convolution)
+            spec_conv = np.fft.irfft(fft_spec * fft_losvd, n=npad)
+
+            # trim to original size
+            stellar_conv = spec_conv[:npix]
+            
+
+            # Nebular emission lines kinematics
+            nebular_scales = self.nebular_scales(age = age_gas, ion = ion_gas)
+            nebular_wls = self.nebular_wls * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
+            
+            # remove emission lines out of range interest
+            mask_nebular = (nebular_wls > obs_spec.wl[0]) & (nebular_wls < obs_spec.wl[-1])
+            nebular_wls = nebular_wls[mask_nebular] 
+            nebular_scales = nebular_scales[mask_nebular]
+
+            # sigma to apply
+            # changes with changing instrumental spectral resolution
+            # interpolate instrumental resolution from obs_spec grid onto wl_unif
+            R_unif = np.interp(np.exp(loglam_unif), obs_spec.wl, obs_spec.resolution)
+
+            sigma_obs = c_kms / (R_unif * 2.355)
+            sigma_gas_tot = np.sqrt(sigma_obs**2 + sigma_gas**2)
+            sigma_gas_pix = sigma_gas_tot / kms_per_pix 
+                
+            # Build pixel edges
+            pixels_left_borders = loglam_unif - dloglam/2
+            pixels_right_borders = loglam_unif + dloglam/2
+
+            nebular_conv = np.zeros_like(loglam_unif, dtype=float)
+            delta_lambda = np.exp(pixels_right_borders) - np.exp(pixels_left_borders)
+            sqrt2 = np.sqrt(2.0)
+
+            # use a typical sigma in pixel space to set a window
+            sig_med = np.median(sigma_gas_pix)
+            win = int(np.ceil(6.0 * sig_med))  # +/- 6σ is plenty
+
+            for w_line, scale in zip(nebular_wls, nebular_scales):
+                mu = np.log(w_line)
+                j0 = np.searchsorted(loglam_unif, mu)
+                j1 = max(0, j0 - win)
+                j2 = min(len(loglam_unif), j0 + win + 1)
+
+                d_left  = (pixels_left_borders[j1:j2]  - mu) / dloglam
+                d_right = (pixels_right_borders[j1:j2] - mu) / dloglam
+
+                sig = sigma_gas_pix[j1:j2]
+
+                frac = 0.5 * (
+                    erf(d_right / (sqrt2 * sig)) -
+                    erf(d_left  / (sqrt2 * sig))
+                )
+
+                nebular_conv[j1:j2] += scale * frac / delta_lambda[j1:j2]
+
+            """
+            # i runs over emission lines
+            # j runs over pixels
+            for i in range(len(nebular_wls)):
+                for j in range(len(loglam_unif)):
+                    # The fraction of line i’s total flux landing in pixel j is:
+                    
+                    d_ij_left = (pixels_left_borders[j] - np.log(nebular_wls[i]))/ dloglam
+                    d_ij_right = (pixels_right_borders[j] - np.log(nebular_wls[i]))/ dloglam
+                    fraction_flux_ij = 0.5 * (erf(d_ij_right /(np.sqrt(2)*sigma_gas_pix[j])) - erf(d_ij_left /(np.sqrt(2)*sigma_gas_pix[j])))
+                    # convert to flux_density
+                    delta_lambda_j = np.exp(pixels_right_borders[j]) - np.exp(pixels_left_borders[j])
+                    nebular_conv[j] += nebular_scales[i] * fraction_flux_ij / delta_lambda_j
+            """
+
+            # restore wavelengths
+            wl = np.exp(loglam_unif)
+            
+            # finally multiply for number of lyman photons and apply reddening
+            young_nebular_conv = nebular_conv * nlyman_young *  (10.0 ** (-(av + av_ext) * self.k_calzetti(wl))) 
+            old_nebular_conv = nebular_conv * nlyman_old * (10.0 ** (-av * self.k_calzetti(wl)))
+
+            nebular_conv = young_nebular_conv + old_nebular_conv
+
+            edge = int(np.ceil(4.0 * sigma_pix))
+            wl = wl[edge:-edge]
+            stellar_conv = stellar_conv[edge:-edge]
+            nebular_conv = nebular_conv[edge:-edge]
+
+            total_spec = stellar_conv+nebular_conv
+
+            # Re sample on observed spectrum grid
+            final_spec = np.interp(obs_spec.wl, wl, total_spec)
 
 
+            #remove shape differences between spectrum and model
+            eps = 1e-30  # choose for your flux units
+            
+            x = obs_spec.wl
+            y = obs_spec.flux / final_spec
+            
+            # uncertainty on ratio (assuming model_spec exact)
+            sigma_y = (obs_spec.flux_err * np.exp(spec_noise_scale)) / np.maximum(np.abs(final_spec), eps)
+            
+            good = np.isfinite(x) & np.isfinite(y) & np.isfinite(sigma_y)
+            good &= (np.abs(final_spec) > eps) & (sigma_y > 0)
+
+            # Need enough points
+            if good.sum() < (polydeg + 1):
+                raise ValueError(f"Not enough valid points for deg={polydeg}: {good.sum()} points")
+            
+            # Weights for polyfit are ~ 1/sigma (not sigma)
+            w = 1.0 / sigma_y[good]
+            
+            coeff = np.polyfit(x[good], y[good], deg=polydeg, w=w)
+            cont_poly = np.polyval(coeff, x)
+
+            final_spec *= cont_poly
+
+        if likelihood_call:
+            return model_phot, final_spec
+  
+        
         if not likelihood_call:
 
             # --- Build FITS header ---
@@ -267,6 +447,7 @@ class PFitter():
             header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
             header["DL_MPC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
 
+
             # Add kwargs for traceability
             for k, v in kwargs.items():
                 key = k[:8].upper()
@@ -276,16 +457,34 @@ class PFitter():
                     header[key] = str(v)
 
             # --- Create Spectrum object ---
-            spec = Spectrum(wl=model_red_wl, resolution=self.model_resolution, flux=total_spec, header=header)
+            spec = Spectrum(wl=model_red_wl, resolution=self.model_resolution, flux=final_spec_phot, header=header)
+
+            if obs_spec:
+                spec.obs_spec = obs_spec
+
+                header_conv = header.copy()
+                header_conv["VEL_SYS"]   = (vel_sys, "Systemic velocity [km/s]")
+                header_conv["SIGMA_VEL"] = (sigma_vel, "Stellar Doppler broadening [km/s]")
+                header_conv["SIGMA_GAS"] = (sigma_gas, "Gas Doppler broadening [km/s]")
+            
+                header_conv["POLYDEG"] = (polydeg, "Polynomial degree of normalization")
+                header_conv["SPECNOI"]   = (spec_noise_scale, "Extra noise factor for spectrum")
+            
+                spec.model_spec_on_obs_grid = Spectrum(
+                    wl=obs_spec.wl,
+                    resolution=obs_spec.resolution,
+                    flux=final_spec,
+                    header=header_conv,
+                )
 
             
             if multi_component:
                 # --- Rescale fluxes to observed frame ---
                 # Avoid modifying the original arrays if needed later
-                young_stellar_nebular_flux = young_stellar_nebular_spec / (1 + redshift) * fscale
-                old_stellar_nebular_flux   = old_stellar_nebular_spec   / (1 + redshift) * fscale
-                att_young_stellar_nebular_flux = att_young_stellar_nebular_spec / (1 + redshift) * fscale
-                att_old_stellar_nebular_flux   = att_old_stellar_nebular_spec   / (1 + redshift) * fscale
+                young_stellar_nebular_flux = (young_stellar + young_nebular) / (1 + redshift) * fscale
+                old_stellar_nebular_flux   = (old_stellar + old_nebular)  / (1 + redshift) * fscale
+                att_young_stellar_nebular_flux = (att_young_stellar + att_young_nebular) / (1 + redshift) * fscale
+                att_old_stellar_nebular_flux   = (att_old_stellar + att_old_nebular)  / (1 + redshift) * fscale
                 dust_flux = dust_spec * fscale / (1 + redshift)
 
                 # --- Save main components ---
@@ -325,266 +524,6 @@ class PFitter():
                 )
 
             return spec
-        
-        # For likelihood
-        # Photometric fluxes in mJy by default 
-        else: 
-
-            model_phot = []
-            for b in bands:
-                mask_b = trans_mask[b]
-                spec_array = total_spec[mask_b]
-                wl_b = model_red_wl[mask_b] 
-                if len(spec_array) == 0:
-                    model_phot.append(np.nan)
-                    continue
-                num_int = np.trapz(trans_arrays[b] * spec_array * wl_b, wl_b)
-                den = np.trapz(trans_arrays[b] * wl_b, wl_b)
-                if den == 0:
-                    model_phot.append(np.nan)
-                    continue
-                phot_point = num_int / den
-                
-                # convert to mJy if needed
-                c = 2.99792458e18  # Å/s
-                phot_point = phot_point * pivot_wls[b]**2 / c / 1e-26
-                model_phot.append(phot_point)
-                
-            return np.array(model_phot)
-
-       
-    def synthetic_spectrum_for_fitting(
-        self,
-        obs_spec,
-        polydeg,
-        spec_noise_scale,
-        
-        fesc,
-        ion_gas,
-        age_gas,
-        
-        av,
-        av_ext,
-        alpha,
-        redshift,
-        vel_sys,                         # systemic velocity [km/s]
-        sigma_vel,                         # LOS velocity dispersion [km/s]
-        sigma_gas,
-        
-        likelihood_call=False,
-        **kwargs,
-    ):
-
-        """
-        mcspf-matched dust-emission handling:
-        (1) Stellar-leakage subtraction in the DH02 templates uses the *continuum-only* spectrum
-            (mcspf uses spec_model), not stellar+nebular.
-        (2) Dust emission is attenuated by 10^(-Av*k_cal) and iterated to conserve energy,
-            as in mcspf reconstruct_phot().
-        """
-
-        c_kms = 2.99792458e5  # km/s
-
-        # --- Stellar population spectra (rest-frame, on self.model_wl) ---
-        young_stellar = self.interp_young_flux(**kwargs)
-        old_stellar   = self.interp_old_flux(**kwargs)
-        
-        # Number of ionizing photons for later nebular spectrum
-        index_lyman = np.searchsorted(self.model_wl, 912, side="left")
-        lycont_wls = np.r_[self.model_wl[:index_lyman], np.array([912])]
-        lycont_young_spec = np.interp(lycont_wls, self.model_wl, young_stellar)
-        nlyman_young = np.trapz(lycont_young_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
-        lycont_old_spec = np.interp(lycont_wls, self.model_wl, old_stellar)
-        nlyman_old = np.trapz(lycont_old_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
-
-        # Remove escaped photons
-        young_stellar[:index_lyman] *= fesc
-        old_stellar[:index_lyman]   *= fesc
-
-        # --- Dust attenuation of stellar spectrum (rest-frame) ---
-        att_young = (10.0 ** (-(av + av_ext) * self.k_calzetti_array)) * young_stellar
-        att_old   = (10.0 ** (-av * self.k_calzetti_array))           * old_stellar
-        att_stellar = att_young + att_old
-
-
-
-        
-        # --- Kinematics of stellar spectrum: LOSVD + systemic shift ---
-        
-        wl_obs = self.model_wl * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
-        att_stellar /= (1.0 + redshift)
-        
-        mask = (wl_obs > obs_spec.wl[0]) & (wl_obs < obs_spec.wl[-1])
-        wl_obs = wl_obs[mask]
-        att_stellar = att_stellar[mask]
-        model_resolution = self.model_resolution[mask]
-
-        sigma_model = c_kms / (model_resolution * 2.355)
-        sigma_obs = c_kms / (obs_spec.resolution * 2.355)
-        
-        sigma_int = max(max(sigma_model),max(sigma_obs))
-
-        # Final broadening to apply to the stellar spectrum
-        sigma_tot = np.sqrt(sigma_int**2 + sigma_vel**2 - max(sigma_model)**2)
-
-        # CONVOLVE MODEL SPECTRUM WITH LOSVD GAUSSIAN FUNCTION WITH SIGMA_TOT
-        
-        # Build a uniform log lambda grid
-        loglam = np.log(wl_obs)
-        loglam_unif = np.linspace(loglam[0],loglam[-1],len(loglam))
-
-        # interpolate spectrum on new lambda grid
-        logspec = np.interp(loglam_unif, loglam, att_stellar)
-
-        # velocity in pixel space
-        dloglam = np.median(np.diff(loglam_unif))
-        kms_per_pix = 2.99792458e5 * dloglam
-        vel_pix = vel_sys / kms_per_pix
-        sigma_pix = sigma_tot / kms_per_pix    
-
-        
-        # Velocity-space convolution using analytic LOSVD in Fourier domain    
-        
-        npix = len(loglam_unif)
-        npad = 2 * npix  # zero-padding to avoid wrap-around
-
-        # make LOSVD kernel for same npad length
-        
-        nl = npad // 2 + 1                # size of RFFT array
-        w = np.linspace(0, np.pi, nl)     # frequency vector for RFFT
-
-        if sigma_pix == 0:
-            losvd_rfft = np.ones_like(w, dtype=complex)
-        else:   
-            #a = v_pix / sigma_pix 
-            # velocity shift already considered when shifting wl_obs
-            a = 0
-            losvd_rfft = np.exp(1j * a * w - 0.5 * (sigma_pix * w)**2)
-
-        fft_losvd = np.conj(losvd_rfft)
-
-
-        
-        # FFT of the input spectrum
-        fft_spec = np.fft.rfft(logspec, n=npad)
-
-        # multiply in Fourier space (convolution)
-        spec_conv = np.fft.irfft(fft_spec * fft_losvd, n=npad)
-
-        # trim to original size
-        stellar_conv = spec_conv[:npix]
-        
-
-        # Nebular emission lines kinematics
-        nebular_scales = self.nebular_scales(age = age_gas, ion = ion_gas)
-        nebular_wls = self.nebular_wls * (1.0 + redshift) * (1.0 + vel_sys / c_kms) 
-        
-        # remove emission lines out of range interest
-        mask_nebular = (nebular_wls > obs_spec.wl[0]) & (nebular_wls < obs_spec.wl[-1])
-        nebular_wls = nebular_wls[mask_nebular] 
-        nebular_scales = nebular_scales[mask_nebular]
-
-        # sigma to apply
-        # changes with changing instrumental spectral resolution
-        # interpolate instrumental resolution from obs_spec grid onto wl_unif
-        R_unif = np.interp(np.exp(loglam_unif), obs_spec.wl, obs_spec.resolution)
-
-        sigma_obs = c_kms / (R_unif * 2.355)
-        sigma_gas_tot = np.sqrt(sigma_obs**2 + sigma_gas**2)
-        sigma_gas_pix = sigma_gas_tot / kms_per_pix 
-            
-        # Build pixel edges
-        pixels_left_borders = loglam_unif - dloglam/2
-        pixels_right_borders = loglam_unif + dloglam/2
-
-
-        nebular_conv = np.zeros_like(loglam_unif, dtype=float)
-        delta_lambda = np.exp(pixels_right_borders) - np.exp(pixels_left_borders)
-        sqrt2 = np.sqrt(2.0)
-
-        # use a typical sigma in pixel space to set a window
-        sig_med = np.median(sigma_gas_pix)
-        win = int(np.ceil(6.0 * sig_med))  # +/- 6σ is plenty
-
-        for w_line, scale in zip(nebular_wls, nebular_scales):
-            mu = np.log(w_line)
-            j0 = np.searchsorted(loglam_unif, mu)
-            j1 = max(0, j0 - win)
-            j2 = min(len(loglam_unif), j0 + win + 1)
-
-            d_left  = (pixels_left_borders[j1:j2]  - mu) / dloglam
-            d_right = (pixels_right_borders[j1:j2] - mu) / dloglam
-
-            sig = sigma_gas_pix[j1:j2]
-
-            frac = 0.5 * (
-                erf(d_right / (sqrt2 * sig)) -
-                erf(d_left  / (sqrt2 * sig))
-            )
-
-            nebular_conv[j1:j2] += scale * frac / delta_lambda[j1:j2]
-
-
-        """
-        # i runs over emission lines
-        # j runs over pixels
-        for i in range(len(nebular_wls)):
-            for j in range(len(loglam_unif)):
-                # The fraction of line i’s total flux landing in pixel j is:
-                
-                d_ij_left = (pixels_left_borders[j] - np.log(nebular_wls[i]))/ dloglam
-                d_ij_right = (pixels_right_borders[j] - np.log(nebular_wls[i]))/ dloglam
-                fraction_flux_ij = 0.5 * (erf(d_ij_right /(np.sqrt(2)*sigma_gas_pix[j])) - erf(d_ij_left /(np.sqrt(2)*sigma_gas_pix[j])))
-                # convert to flux_density
-                delta_lambda_j = np.exp(pixels_right_borders[j]) - np.exp(pixels_left_borders[j])
-                nebular_conv[j] += nebular_scales[i] * fraction_flux_ij / delta_lambda_j
-        """
-
-        # restore wavelengths
-        wl = np.exp(loglam_unif)
-        
-        # finally multiply for number of lyman photons and apply reddening
-        young_nebular_conv = nebular_conv * nlyman_young *  (10.0 ** (-(av + av_ext) * self.k_calzetti(wl))) 
-        old_nebular_conv = nebular_conv * nlyman_old * (10.0 ** (-av * self.k_calzetti(wl)))
-
-        nebular_conv = young_nebular_conv + old_nebular_conv
-
-        edge = int(np.ceil(4.0 * sigma_pix))
-        wl = wl[edge:-edge]
-        stellar_conv = stellar_conv[edge:-edge]
-        nebular_conv = nebular_conv[edge:-edge]
-
-        total_spec = stellar_conv+nebular_conv
-
-        # Re sample on observed spectrum grid
-        model_spec = np.interp(obs_spec.wl, wl, total_spec)
-
-
-
-        #remove shape differences between spectrum and model
-        eps = 1e-30  # choose for your flux units
-        
-        x = obs_spec.wl
-        y = obs_spec.flux / model_spec
-        
-        # uncertainty on ratio (assuming model_spec exact)
-        sigma_y = (obs_spec.flux_err * np.exp(spec_noise_scale)) / np.maximum(np.abs(model_spec), eps)
-        
-        good = np.isfinite(x) & np.isfinite(y) & np.isfinite(sigma_y)
-        good &= (np.abs(model_spec) > eps) & (sigma_y > 0)
-
-        # Need enough points
-        if good.sum() < (polydeg + 1):
-            raise ValueError(f"Not enough valid points for deg={polydeg}: {good.sum()} points")
-        
-        # Weights for polyfit are ~ 1/sigma (not sigma)
-        w = 1.0 / sigma_y[good]
-        
-        coeff = np.polyfit(x[good], y[good], deg=polydeg, w=w)
-        cont_poly = np.polyval(coeff, x)
-
-
-        return model_spec*cont_poly
 
 
 
@@ -667,7 +606,7 @@ class PFitter():
                 polydeg=7,
                 nlive=500,
                 dlogz=0.01):
-        
+
         if phot is not None:
             if not isinstance(phot, PhotometryTable):
                 raise TypeError(
@@ -692,7 +631,6 @@ class PFitter():
         
 
         run = Run()     # new Run container
-        run.pfitter = self
         run.model_file = self.model_file
         run.model_pars = self.model_pars
         run.spectral_range = spectral_range
@@ -701,6 +639,9 @@ class PFitter():
         run.polydeg = polydeg
         run.custom_priors = custom_priors
         run.fix_pars = dict(fix_pars) 
+
+        run.bands = []
+        run.spec_crop = None
         
 
         # --- bands selection ---
@@ -724,8 +665,6 @@ class PFitter():
         # --- preprocess observed spectrum once (done here) ---
         if spec:
             run.spec_crop = self._preprocess_observed_spectrum(spec, run.spectral_range, atmospheric_lines)
-
-
 
 
         # ------- build lists of free parameters (separate model and global) -------
@@ -757,9 +696,8 @@ class PFitter():
 
 
 
-
         # --- build likelihood and prior ---
-        run.log_likelihood = self.make_log_likelihood(run, spec, phot, run.free_pars)
+        run.log_likelihood = self.make_log_likelihood(run, spec, phot, run.free_pars) #self.
         run.prior_transform = self.make_prior_transform(run, run.custom_priors)
 
         print("Initializing live points")
@@ -772,15 +710,12 @@ class PFitter():
         return run
 
 
-
-
-
     def make_log_likelihood(self, run, spec, phot, free_pars,):
 
         if phot: 
 
-            phot_fluxes = np.array([run.phot.data[b][0] for b in run.bands])
-            phot_errors = np.array([run.phot.data[b][1] for b in run.bands])
+            obs_phot = np.array([run.phot.data[b][0] for b in run.bands])
+            obs_errors = np.array([run.phot.data[b][1] for b in run.bands])
             phot_units = phot.header["UNITS"]
 
             # Upper limits
@@ -792,8 +727,8 @@ class PFitter():
             mask_ul = np.array([b in run.treat_as_upper_limits for b in run.bands], dtype=bool)
             
             # for upper limits: flux -> 0, error -> original flux (your logic)
-            phot_errors[mask_ul] = phot_fluxes[mask_ul]
-            phot_fluxes[mask_ul] = 0.0
+            obs_errors[mask_ul] = obs_phot[mask_ul]
+            obs_phot[mask_ul] = 0.0
 
             # Set filter trasmission curves
             trans_mask = {}
@@ -808,8 +743,6 @@ class PFitter():
                 pivot_wls[b] = F.pivot_wavelength
 
 
-            # other very usefull stuff
-            self.k_calzetti_array = self.k_calzetti(self.model_wl)
           
         # --- closure used by the sampler ---
         def log_likelihood(pars):
@@ -842,55 +775,50 @@ class PFitter():
             spec_noise_scale = p["spec_noise_scale"]
 
 
+            model_phot, final_spec = self.synthetic_spectrum(**model_kwargs,
+                        fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
+                        av=av, av_ext=av_ext, alpha=alpha,
+                        m_star=m_star,
+                        luminosity_distance=luminosity_distance,
+                        redshift=redshift,
+                        vel_sys=vel_sys,sigma_vel=sigma_vel,sigma_gas=sigma_gas,
+                        likelihood_call=True,
+                        bands=run.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls,
+                        obs_spec=run.spec_crop,polydeg=run.polydeg,spec_noise_scale=spec_noise_scale,
+                        )
+
 
             # ----------------- Photometric likelihood -----------------
-            if phot is not None:
+            if model_phot:
 
-                model_phot_array = self.synthetic_spectrum(**model_kwargs,
-                                        fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
-                                        av=av, av_ext=av_ext, alpha=alpha,
-                                        m_star=m_star,
-                                        luminosity_distance=luminosity_distance,
-                                        redshift=redshift,
-                                        likelihood_call=True,
-                                        bands=run.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
-
-                if not np.all(np.isfinite(model_phot_array)):
+                if not np.all(np.isfinite(model_phot)):
                     return -1e100
                 
-                for i in range(len(phot_fluxes)):
-                    if phot_fluxes[i] > 0:
-                        var = phot_errors[i]**2
-                        residual = (phot_fluxes[i] - model_phot_array[i]) / phot_errors[i]
+                for i in range(len(obs_phot)):
+                    if obs_phot[i] > 0:
+                        var = obs_errors[i]**2
+                        residual = (obs_phot[i] - model_phot[i]) / obs_errors[i]
                         phot_lhood += -0.5 * (residual**2 + np.log(2*np.pi*var)) 
                     else:
-                        terf = 0.5 * (1 + erf((phot_fluxes[i] - model_phot_array[i]) / 
-                                            (np.sqrt(2.) * phot_errors[i])))
+                        terf = 0.5 * (1 + erf((obs_phot[i] - model_phot[i]) / 
+                                            (np.sqrt(2.) * obs_errors[i])))
                         if terf <= 0:
                             return -1e100
                         phot_lhood += np.log(terf)
 
 
             # ----------------- Spectral likelihood (features only) -------------
-            if spec is not None:
-
-                model_spec_array = self.synthetic_spectrum_for_fitting(**model_kwargs,
-                                        fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
-                                        av=av, av_ext=av_ext, alpha=alpha,
-                                        m_star=m_star,
-                                        vel_sys=vel_sys, sigma_vel = sigma_vel, sigma_gas = sigma_gas,
-                                        luminosity_distance=luminosity_distance,redshift=redshift,
-                                        obs_spec=run.spec_crop,polydeg=run.polydeg,spec_noise_scale=spec_noise_scale)
+            if final_spec:
 
                 # Likelihood mask 
                 mask_like = (
-                    np.isfinite(model_spec_array)
+                    np.isfinite(final_spec)
                     & np.isfinite(run.spec_crop.flux)
                     & (run.spec_crop.flux_err > 0)
                 )
                 flux_obs = run.spec_crop.flux[mask_like]
                 flux_err = run.spec_crop.flux_err[mask_like]
-                model = model_spec_array[mask_like]
+                final_spec = final_spec[mask_like]
 
 
                 # Free nuisance parameter: This is not arbitrary — it is equivalent to marginalizing over unknown variance.
@@ -899,7 +827,7 @@ class PFitter():
                                 
                 flux_err_corr = flux_err * np.exp(spec_noise_scale)
 
-                residuals = (flux_obs - model) / (flux_err_corr)
+                residuals = (flux_obs -final_spec) / (flux_err_corr)
                 
                 chi2 = np.sum(residuals**2)
                 
@@ -908,8 +836,6 @@ class PFitter():
             return spec_lhood + phot_lhood
 
         return log_likelihood
-    
-
 
 
 
@@ -1117,81 +1043,6 @@ class PFitter():
             raise ValueError("No valid spectral pixels remain after preprocessing.")
 
         return Spectrum(wl=wl, flux=flux, flux_err=err, resolution=resolution, header=spec.header)
-
-
-
-
-def _adapt_model_spectrum_to_observed_spectrum(wl_obs, flux_obs, err_obs, model_red_wl, synth_flux, spectral_range,polydeg):
-
-    # Interpolate model on observed wl grid WITHOUT extrapolation 
-    flux_model = interp1d(model_red_wl, synth_flux,
-                            kind='linear', bounds_error=False, fill_value=np.nan)(wl_obs) 
-
-    # --- User-selected wavelength range for continuum fit ---
-    wl_fit_min = spectral_range[0][0] if isinstance(spectral_range[0], (list, tuple)) else spectral_range[0]
-    wl_fit_max = spectral_range[-1][1] if isinstance(spectral_range[-1], (list, tuple)) else spectral_range[1]
-
-
-    # ---------------- 1) Build a safe mask for continuum fitting ----------------
-    mask = (np.isfinite(flux_model) & np.isfinite(flux_obs) & np.isfinite(err_obs) & (err_obs > 0))
-    
-    # Restrict mask to the wavelength fitting window 
-    mask &= (wl_obs >= wl_fit_min) & (wl_obs <= wl_fit_max)
-
-
-    n_valid = mask.sum()
-
-    # ---------------- 2) Determine polynomial degree ----------------
-    if n_valid < max(10, polydeg + 1):
-        polydeg = max(1, min(polydeg, n_valid - 1))
-    else:
-        polydeg = min(polydeg, n_valid - 1)
-
-    # ---------------- 3) Compute raw normalization factor ----------------
-    normalization_factor = np.full_like(flux_obs, np.nan)
-    normalization_factor[mask] = flux_obs[mask] / flux_model[mask]
-
-
-    # ---------------- 4) Fit polynomial only on masked region ----------------
-    if n_valid >= polydeg + 1:
-
-        # weights
-        w = 1.0 / err_obs[mask]
-
-        # wavelength scaling for stability
-        wl_masked = wl_obs[mask]
-        wl_med = np.median(wl_masked)
-        wl_span = wl_masked.ptp() if wl_masked.ptp() != 0 else 1.0
-        wl_scaled = (wl_masked - wl_med) / wl_span
-
-        # polyfit
-        coeff = np.polyfit(wl_scaled, normalization_factor[mask], deg=polydeg, w=w)
-
-        # evaluate across full wavelength range:
-        wl_scaled_full = (wl_obs - wl_med) / wl_span
-        normalization_factor_smoothed = np.polyval(coeff, wl_scaled_full)
-
-    else:
-        # fallback: constant continuum
-        median_val = np.nanmedian(normalization_factor[mask])
-        normalization_factor_smoothed = np.full_like(wl_obs, median_val)
-
-    # ---------------- 5) Scale the model ----------------
-    model_scaled = flux_model * normalization_factor_smoothed
-
-    
-    return normalization_factor, normalization_factor_smoothed, model_scaled
-
-
-
-
-
-
-
-
-
-
-
 
 
 
