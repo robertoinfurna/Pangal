@@ -345,3 +345,56 @@ def model_grid_interpolator(self, model_list, param_names):
 
 
 
+# Dust attenuation curve based on Calzetti et al. (2000) law
+# wl must be in Angstrom
+# Takes in imput an array of wavelengths and returns the attenuation function
+
+def dust_attenuation_curve(self, leitatt: bool = False, uv_bump: bool = False):
+    """
+    return 0.4 * k_cal / R_V
+    k_cal is the Calzetti (2000) selective attenuation curve with:
+    - optional Leitherer (2002) replacement below 1500 Å
+    - optional 2175 Å bump (Drude profile)
+    The returned function accepts scalar or array wavelengths in Angstrom.
+    """
+
+    R_V = 4.05
+
+    def k_lambda(wl):
+        wl = np.asarray(wl, dtype=float)
+
+        k_cal = np.zeros_like(wl, dtype=float)
+
+        # Calzetti+ 2000: piecewise at 6300 Å
+        m_long = wl >= 6300.0
+        m_short = ~m_long
+
+        # Longer than 6300 Å
+        if np.any(m_long):
+            k_cal[m_long] = 2.659 * (-1.857 + 1.04 * (1e4 / wl[m_long])) + R_V
+
+        # Shorter than 6300 Å
+        if np.any(m_short):
+            x = 1e4 / wl[m_short]
+            k_cal[m_short] = 2.659 * (-2.156 + 1.509 * x - 0.198 * x**2 + 0.011 * x**3) + R_V
+
+        # Optional Leitherer (2002) below 1500 Å
+        if leitatt:
+            m_uv = wl < 1500.0
+            if np.any(m_uv):
+                w = wl[m_uv]
+                k_cal[m_uv] = (5.472 + 0.671e4 / w - 9.218e5 / w**2 + 2.620e9 / w**3)
+
+        # Enforce non-negative attenuation pointwise
+        k_cal = np.maximum(k_cal, 0.0)
+
+        # Optional 2175 Å bump (Drude-like profile)
+        if uv_bump:
+            eb = 1.0
+            bump = eb * (wl * 350.0) ** 2 / ((wl**2 - 2175.0**2) ** 2 + (wl * 350.0) ** 2)
+            k_cal = k_cal + bump
+
+        # Return 0.4 * A(lam)/A(V)
+        return 0.4 * k_cal / R_V
+
+    return k_lambda

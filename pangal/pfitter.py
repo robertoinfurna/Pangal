@@ -23,7 +23,7 @@ from .run import Run
 from .filter import Filter, map_filter_names, nice_filter_names, default_plot_scale_lims, default_plot_units, default_cmaps
 from .data.spectral_lines import spectral_lines,atmospheric_lines
 
-from .pfitter_utils import load_nebular_tables, load_dust_emission_models, model_grid_interpolator, load_spectrum_models_from_fits
+from .pfitter_utils import load_nebular_tables, load_dust_emission_models, model_grid_interpolator, load_spectrum_models_from_fits, dust_attenuation_curve
 
 """
 PFitter
@@ -122,6 +122,7 @@ class PFitter():
     load_nebular_tables = load_nebular_tables
     load_dust_emission_models = load_dust_emission_models
     model_grid_interpolator = model_grid_interpolator
+    dust_attenuation_curve = dust_attenuation_curve
 
 
 
@@ -181,8 +182,8 @@ class PFitter():
 
         # Nebular emission
         nebular_lines = self.nebular_func(ion_gas, age_gas)
-        young_nebular = nebular_lines * nlyman_young
-        old_nebular   = nebular_lines * nlyman_old
+        young_nebular = nebular_lines * nlyman_young 
+        old_nebular   = nebular_lines * nlyman_old   
 
         stellar_nebular = young_stellar + old_stellar + young_nebular + old_nebular
 
@@ -402,6 +403,8 @@ class PFitter():
             final_spec = np.interp(obs_spec.wl, wl, total_spec)
 
 
+
+
             #remove shape differences between spectrum and model
             eps = 1e-30  # choose for your flux units
             
@@ -524,64 +527,6 @@ class PFitter():
                 )
 
             return spec
-
-
-
-
-
-    # Dust attenuation curve based on Calzetti et al. (2000) law
-    # wl must be in Angstrom
-    # Takes in imput an array of wavelengths and returns the attenuation function
-
-    def dust_attenuation_curve(self, leitatt: bool = False, uv_bump: bool = False):
-        """
-        return 0.4 * k_cal / R_V
-        k_cal is the Calzetti (2000) selective attenuation curve with:
-        - optional Leitherer (2002) replacement below 1500 Å
-        - optional 2175 Å bump (Drude profile)
-        The returned function accepts scalar or array wavelengths in Angstrom.
-        """
-
-        R_V = 4.05
-
-        def k_lambda(wl):
-            wl = np.asarray(wl, dtype=float)
-
-            k_cal = np.zeros_like(wl, dtype=float)
-
-            # Calzetti+ 2000: piecewise at 6300 Å
-            m_long = wl >= 6300.0
-            m_short = ~m_long
-
-            # Longer than 6300 Å
-            if np.any(m_long):
-                k_cal[m_long] = 2.659 * (-1.857 + 1.04 * (1e4 / wl[m_long])) + R_V
-
-            # Shorter than 6300 Å
-            if np.any(m_short):
-                x = 1e4 / wl[m_short]
-                k_cal[m_short] = 2.659 * (-2.156 + 1.509 * x - 0.198 * x**2 + 0.011 * x**3) + R_V
-
-            # Optional Leitherer (2002) below 1500 Å
-            if leitatt:
-                m_uv = wl < 1500.0
-                if np.any(m_uv):
-                    w = wl[m_uv]
-                    k_cal[m_uv] = (5.472 + 0.671e4 / w - 9.218e5 / w**2 + 2.620e9 / w**3)
-
-            # Enforce non-negative attenuation pointwise
-            k_cal = np.maximum(k_cal, 0.0)
-
-            # Optional 2175 Å bump (Drude-like profile)
-            if uv_bump:
-                eb = 1.0
-                bump = eb * (wl * 350.0) ** 2 / ((wl**2 - 2175.0**2) ** 2 + (wl * 350.0) ** 2)
-                k_cal = k_cal + bump
-
-            # Return 0.4 * A(lam)/A(V)
-            return 0.4 * k_cal / R_V
-
-        return k_lambda
 
 
 
@@ -808,7 +753,7 @@ class PFitter():
 
 
             # ----------------- Spectral likelihood (features only) -------------
-            if final_spec:
+            if final_spec is not None:
 
                 # Likelihood mask 
                 mask_like = (
@@ -1047,6 +992,281 @@ class PFitter():
 
 
 
+
+
+
+    def fit_diagnostic(
+            self,
+            params,
+            spec=None,
+            spectral_range=None,
+            polydeg=7,
+            phot=None,
+            bands=None,
+            treat_as_upper_limits=[],
+
+            # plotting window
+            winf_spec=None,
+            wsup_spec=None,
+        
+            winf_phot=1e2,
+            wsup_phot=1e7,
+            ymin_phot=None,
+            ymax_phot=None,
+
+            # aestethics
+            figsize=(10,10),
+            color='crimson',
+            show_errorbars=True,
+                
+            # optionals
+            redshift=None,
+            show_top_spectral_lines=False,
+            show_all_spectral_lines=False,
+            show_atmospheric_lines=False,
+                
+            spec_legend_pars=None,
+            observed_spec_label=None,
+            spec_legend_loc="upper right",
+            phot_legend_loc="upper right",
+            spec_legend_fontsize=14,
+            title_fontsize=14,
+            label_fontsize=14,
+            spec_legend_title=None,
+            phot_legend_title=None,
+            title_color='black',
+            title_fontweight='normal',
+            
+        ):
+        
+
+        if phot:
+            
+            if bands:
+                for b in bands:
+                    if b not in map_filter_names.keys():
+                        raise ValueError(f'Unrecognized filter: {b}. Abort')
+                bands = list(bands)
+            else:
+                bands = [b for b in phot.data.keys() if b in map_filter_names.keys()]
+
+        
+        if spec:
+            
+            spec_crop = self._preprocess_observed_spectrum(spec,spectral_range,atmospheric_lines)
+
+
+        
+        # keys that match the explicit signature of synthetic_spectrum
+        spec_keys = {
+            "fesc","ion_gas","age_gas","av","av_ext","alpha","m_star","redshift",
+            "luminosity_distance","vel_sys","sigma_vel","sigma_gas","spec_noise_scale"
+        }
+            
+        spec_args  = {k: params[k] for k in spec_keys if k in params}
+        model_args = {k: v for k, v in params.items() if k not in spec_keys}  # e.g. TRUNCAGE/TRUNCTAU
+
+        
+        # Set filter trasmission curves
+        trans_mask = {}
+        trans_arrays = {}
+        pivot_wls = {}
+        for b in bands:
+            F = Filter(b)
+            lmin, lmax = F.wavelength_range
+            mask_b = (self.model_wl >= lmin) & (self.model_wl <= lmax)
+            trans_mask[b] = mask_b
+            trans_arrays[b] = F.transmission_curve(self.model_wl[mask_b])
+            pivot_wls[b] = F.pivot_wavelength
+
+        
+        synth_spec = self.synthetic_spectrum(
+            **model_args,
+            **spec_args,
+            likelihood_call=False,
+            bands=bands,
+            trans_arrays=trans_arrays,
+            trans_mask=trans_mask,
+            pivot_wls=pivot_wls,
+            obs_spec=spec_crop,
+            polydeg=polydeg,
+        )
+
+
+
+        
+        if phot:
+        
+            phot_fluxes = np.array([phot.data[b][0] for b in bands])
+            phot_errors = np.array([phot.data[b][1] for b in bands]) 
+            
+            # apply upper limits locally
+            bad = [b for b in treat_as_upper_limits if b not in map_filter_names]
+            if bad:
+                raise ValueError(f'Unrecognized filter(s): {bad}. Abort')
+            
+            mask_ul = np.array([b in treat_as_upper_limits for b in bands], dtype=bool)
+            
+            # for upper limits: flux -> 0, error -> original flux (your logic)
+            phot_errors[mask_ul] = phot_fluxes[mask_ul]
+            phot_fluxes[mask_ul] = 0.0
+            
+            # Just for plot
+            phot_loc = copy.deepcopy(phot)
+            for b in treat_as_upper_limits:
+                appo = phot_loc.data[b][0] 
+                phot_loc.data[b] = (0,appo)
+            
+            phot_units = phot.header["UNITS"]
+
+            
+            model_phot = synth_spec.get_phot(bands=bands,method='trapz',units='mJy' ) 
+            model_phot_array = np.array([model_phot.data[b][0] for b in bands])
+            
+            if not np.all(np.isfinite(model_phot_array)):
+                raise ValueError(f"Model spectrum {j:.0f} gives invalid photometry")
+                            
+            chi2 = 0.0
+            logL_phot = 0.0
+            
+            for i in range(len(bands)):
+            
+                mod = model_phot_array[i]
+                obs = phot_fluxes[i]
+                err = phot_errors[i]
+                var = err**2
+        
+                if obs > 0:
+                    # Detection: Gaussian likelihood
+                    resid = (obs - mod) / err
+        
+                    chi2 += resid**2
+                    logL_phot += -0.5 * (resid**2 + np.log(2 * np.pi * var))
+        
+                    #residuals_per_band_dict[nice_filter_names[bands[i]]] =  resid**2
+                    
+                else:
+                    # Upper limit: one-sided Gaussian
+                    arg = (obs - mod) / (np.sqrt(2.0) * err)
+                    cdf = 0.5 * (1 + erf(arg))
+                    #if cdf <= 0:
+                    #    logL = -1e100
+                    #    break
+                    logL_phot += np.log(cdf)
+                    chi2 += - 2*np.log(cdf)
+
+            
+            
+            #print('Photometric fitting:')
+            #print('chi1: ',chi2,'  chi2_reduced: ',chi2/len(bands),'  logL: ',logL_phot)
+
+            title = f'$A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["m_star"]:.2f},  $d_L = ${params["luminosity_distance"]:.0f} Mpc'
+            title += f',    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_phot:.2f}'
+            
+            synth_spec.plot(
+                per_wavelength=True,
+                winf=winf_phot,
+                wsup=wsup_phot,
+                ymin=ymin_phot,
+                ymax=ymax_phot,
+        
+                figsize=(20,7),
+                color=color,
+        
+                redshift=None,
+                show_top_spectral_lines=False,
+                show_all_spectral_lines=False,
+                show_atmospheric_lines=False,
+                show_filters=False,
+
+                label_fontsize=label_fontsize,
+                phot=phot_loc,
+                synth_phot=bands,
+                spec_legend_pars=spec_legend_pars,
+                show_phot_legend=True,
+                show_spec_legend=True,
+                spec_legend_loc=phot_legend_loc,
+                spec_legend_title=None,
+                spec_legend_fontsize=spec_legend_fontsize,
+
+                title=title,
+                title_fontsize=title_fontsize,
+                title_fontweight=title_fontweight,
+                title_loc='center',
+                title_color=title_color,
+                )
+            
+        
+        ####################################
+        
+        if spec:
+
+            wl = synth_spec.model_spec_on_obs_grid.wl
+            flux_obs = spec_crop.flux
+            spec_noise_scale = params["spec_noise_scale"]
+            flux_err_corr = spec_crop.flux_err * np.exp(spec_noise_scale)
+            flux_model = synth_spec.model_spec_on_obs_grid.flux
+
+            residuals = (flux_obs - flux_model) / flux_err_corr
+
+            chi2 = np.nansum(residuals**2)
+            logL_spec = - 0.5 * chi2  - np.nansum (np.log( np.sqrt(2 * np.pi) * flux_err_corr ))
+
+            #print('Spectral fitting:')
+            #print('chi1: ',chi2,'  chi2_reduced: ',chi2/len(wl),'  logL: ',logL_spec)
+
+            
+            # Figure with shared x-axis
+            fig, (ax1, ax2) = plt.subplots(
+                2, 1,
+                sharex=True,
+                figsize=(20, 7),
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0}
+            )
+            
+            # -----------------------
+            # Top panel: spectrum
+            # -----------------------
+            ax1.plot(wl, flux_obs, color="k", lw=1, label="Observed")      
+            ax1.plot(wl, flux_model, color=color, lw=1.2, label="Model")  
+            
+            # Optional error band (nice but optional)
+            ax1.fill_between(
+                wl,
+                flux_obs - flux_err_corr,
+                flux_obs + flux_err_corr,
+                color="k",
+                alpha=0.2,
+                lw=0,
+            )
+
+            ax1.set_xlim(winf_spec,wsup_spec)
+            
+            ax1.set_ylabel("Flux (erg/s/cm$^2$/Å)", fontsize=label_fontsize)
+            ax1.legend(frameon=False)
+            
+            # -----------------------
+            # Bottom panel: residuals
+            # -----------------------
+            ax2.axhline(0.0, color="k", lw=0.8, ls="--")
+            ax2.plot(wl, residuals, color="steelblue", lw=0.8)
+            
+            ax2.set_xlabel("Wavelength (Å)", fontsize=label_fontsize)
+            ax2.set_ylabel(r"$(F_{\rm obs}-F_{\rm model})/\sigma$", fontsize=label_fontsize)
+            
+            # Optional: symmetric limits for clarity
+            rmax = np.nanpercentile(np.abs(residuals), 99)
+            ax1.set_xlim(winf_spec,wsup_spec)
+            ax2.set_ylim(-rmax, rmax)
+
+            #title = f'$A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  '
+            #title = f'$v_\\text{{sys}}=${params["vel_sys"]:.1f} km/s, $\sigma_v =${params["sigma_vel"]:.1f} km/s,  $\sigma_\\text{{gas}} =${params["sigma_gas"]:.1f}'
+            title = f'$f_\\text{{esc}} =${params["fesc"]:.1f},  $\mathcal{{U}}_\\text{{ion}} =${params["ion_gas"]:.1f},  $\\text{{Age}}_\\text{{gas}} =${params["age_gas"]:.1f} Myr,  '
+            title += f'    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_spec:.2f}'
+
+            ax1.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc='center')
+            
+            plt.show()
 
 
 

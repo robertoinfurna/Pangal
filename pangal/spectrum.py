@@ -111,7 +111,7 @@ class Spectrum:
             #    pivot_wls[b] = F.pivot_wavelength
 
             if method == 'quad':
-                num_int, _ = quad(lambda l: trans_curve(l) * spec_func(l) * l, lmin, lmax)
+                num, _ = quad(lambda l: trans_curve(l) * spec_func(l) * l, lmin, lmax)
                 den, _ = quad(lambda l: trans_curve(l) * l, lmin, lmax)
             
             elif method == 'trapz': 
@@ -119,12 +119,12 @@ class Spectrum:
                 spec_array = self.flux[mask_b]
                 trans_array = trans_curve(self.wl)[mask_b]
                 wl_b = self.wl[mask_b] 
-                num_int = np.trapz(trans_array * spec_array * wl_b, wl_b)
+                num = np.trapz(trans_array * spec_array * wl_b, wl_b)
                 den = np.trapz(trans_array * wl_b, wl_b)
             else:
                 raise ValueError('method must be either quad or trapz')
 
-            phot_point = num_int / den
+            phot_point = num / den
 
             pivot_w = filter.pivot_wavelength  # in Å
 
@@ -218,6 +218,7 @@ class Spectrum:
         linestyle_1='-',
         linestyle_2='-',
         ecolor='green',
+        label_fontsize=15,
         show_snr=False,
         
         # optionals
@@ -239,6 +240,11 @@ class Spectrum:
         spec_legend_loc="upper left",
         spec_legend_title=None,
         spec_legend_fontsize=10,
+        title=None,
+        title_fontsize=10,
+        title_color='black',
+        title_fontweight='normal',
+        title_loc='center',
     ):
 
 
@@ -266,8 +272,6 @@ class Spectrum:
         fig, axes = plt.subplots(1, n_cols, figsize=figsize, squeeze=False)
 
         cols = zoom_on_line if zoom_on_line else [None]
-
-
 
 
         for j, line in enumerate(cols):
@@ -435,7 +439,7 @@ class Spectrum:
                 # --- Synthetic photometric points (larger, white-filled) ---
                 if synth_phot:
                     markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
-                    model_phot = spec.get_phot(bands=synth_phot, units=y_u)
+                    model_phot = spec.get_phot(bands=synth_phot, units=y_u, method='trapz')
                     for band in synth_phot:
                         pivot_wl_A = Filter(band).pivot_wavelength
                         wl_plot = self._angstrom_to_wl([pivot_wl_A], x_u)[0]
@@ -454,8 +458,9 @@ class Spectrum:
                             zorder=3,
                             label=None           # optional: don't add to legend to avoid duplicates
                         )
-                        band_handles[band] = h
-                        band_labels[band] = nice_filter_names.get(band, band)
+                        if x0 <= wl_plot <= x1:
+                            band_handles[band] = h
+                            band_labels[band] = nice_filter_names.get(band, band)
 
 
 
@@ -506,20 +511,20 @@ class Spectrum:
                 unit_label = 'Å'
             else:
                 unit_label = x_u 
-            ax.set_xlabel(f"Wavelength ({unit_label})")
-            ylabel = r"$\lambda \times F_\lambda$" if per_wavelength else "Flux"
-           
-            if y_u == 'erg/s/cm2/A':
-                unit_label = 'erg/s/cm$^2/Å$' if per_wavelength == False else 'erg/s/cm$^2$'
-            if y_u == 'erg/s/A':
-                unit_label = 'erg/s/Å$' if per_wavelength == False else 'erg/s'
-            else: unit_label = y_u
-            ax.set_ylabel(f"{ylabel} ({unit_label})")
-            if normalized or remove_continuum:
-                ax.set_ylabel("arbitrary units")
-            if custom_ylabel: 
-                ax.set_ylabel(custom_ylabel)
+            ax.set_xlabel(f"Wavelength ({unit_label})",fontsize=label_fontsize)
+            ylabel = r"$\lambda \, F_\lambda$" if per_wavelength else "Flux"
 
+            # default
+            unit_label = y_u
+            if y_u == "erg/s/cm2/A":
+                unit_label = r"erg/s/cm$^2$/Å" if not per_wavelength else r"erg/s/cm$^2$"
+            elif y_u == "erg/s/A":
+                unit_label = r"erg/s/Å" if not per_wavelength else r"erg/s"
+            ax.set_ylabel(f"{ylabel} ({unit_label})", fontsize=label_fontsize)
+            if normalized or remove_continuum:
+                ax.set_ylabel("arbitrary units", fontsize=label_fontsize)
+            if custom_ylabel:
+                ax.set_ylabel(custom_ylabel, fontsize=label_fontsize)
 
             # --- Spectra legend ---
             if show_spec_legend:
@@ -590,6 +595,9 @@ class Spectrum:
                                 va="bottom", fontsize=9, ha='center', clip_on=True,
                                 bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
 
+
+            if title:
+                ax.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc=title_loc)
 
         plt.tight_layout(rect=[0,0,0.85,1])
         plt.show()

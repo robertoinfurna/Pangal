@@ -1,10 +1,12 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
 from astropy.io import fits
 from bisect import bisect_left
 from scipy.special import erf, erfinv
 from scipy.interpolate import RegularGridInterpolator, interp1d
-from scipy.ndimage import gaussian_filter1d #?
+from scipy.ndimage import gaussian_filter1d 
 from scipy.signal import fftconvolve
 import itertools
 import os
@@ -56,7 +58,6 @@ class Run:
         self.phot = None
 
         # Likelihood, priors, and sampler
-        self.pfitter = None
         self.result = None
 
 
@@ -151,9 +152,6 @@ class Run:
             - 'median' : Posterior median
 
         Returns
-        -------
-        synth_spec : Spectrum
-            Synthetic spectrum built with best parameters
         best_params : dict
             Dictionary of parameter names and best-fit values
         """
@@ -196,464 +194,204 @@ class Run:
         for name, val in self.fix_pars.items():
             best_params[name] = val
 
-        # --- Build synthetic spectrum ---
-        synth_spec = self.pfitter.synthetic_spectrum(**best_params,)
-                                                    #observed_spectrum_resolution=getattr(self, 'obs_resolution_on_model_grid', None))
+        return best_params
+    
 
-        return synth_spec
-        
-            
+    def cornerplot(
+        self,
+        parameters=None,
+        show_stats=True,
+        show_histograms=True,
+        cmap=None,
+        contour_color='k',
+        alpha=0.7,
+        mark_point=None,          # None, "median", "maxlogl"
+        mark_color="crimson",
+        mark_lw=2.0,
+    ):
+        if not hasattr(self, "result"):
+            raise ValueError("Run has no .result attribute. Did you run run_fit()?")
 
+        samples = self.result.samples
+        logwt   = self.result.logwt
+        logz    = self.result.logz
 
-    def fit_diagnostic_plot(self,
-                        models=[],
+        weights = np.exp(logwt - logz[-1])
+        equal_samples = resample_equal(samples, weights)
 
-                        method='MAP',
+        latex_labels = {
+            "age": r"$\mathrm{Age~[Myr]}$",
+            "tau_main": r"$\tau_\mathrm{main}\ \mathrm{[Myr]}$",
+            "TRUNCAGE": r"$Q_\mathrm{AGE}\ \mathrm{[Myr]}$",
+            "TRUNCTAU": r"$\tau_Q\ \mathrm{[Myr]}$",
+            "fesc": r"$f_\mathrm{esc}$",
+            "ion_gas": r"$U_\mathrm{ion}$",
+            "age_gas": r"$\mathrm{Age_{gas}}$",
+            "av": r"$A_V$",
+            "av_ext": r"$A_{V,\mathrm{ext}}$",
+            "alpha": r"$\alpha$",
+            "m_star": r"$\log M_\star$",
+            "vel_sys": r"$v\ \mathrm{[km/s]}$",
+            "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
+            "redshift": r"redshift",
+            "luminosity_distance": r"luminosity distance",
+            "ln_spec_noise_scale": r"spectral noise scaling parameter"
+        }
 
-                        spec_noise_scale = None,
-                        polydeg = None,
-                    
-                        # plotting window
-                        winf_spec=None,
-                        wsup_spec=None,
-
-                        winf_phot=1e2,
-                        wsup_phot=1e7,
-                        ymin=None,
-                        ymax=None,
-
-                        # aestethics
-                        figsize=(10,10),
-                        color=None,
-                        show_errorbars=True,
-                        
-                        # optionals
-                        redshift=None,
-                        show_top_spectral_lines=False,
-                        show_all_spectral_lines=False,
-                        show_atmospheric_lines=False,
-                        
-                        spec_legend_pars=None,
-                        spec_legend_loc="upper right",
-                        phot_legend_loc="upper right",
-                        spec_legend_title=None,
-                        phot_legend_title=None,
-
-                    ):
-        
-
-        ### --- Loading PFitter --- ###
-        if self.pfitter is None: 
-
-            # FIX THIS!
-
-            print('No PFitter object detected, missing the model grid. Loading models and initialising PFitter')
-                    
-            from .pfitter import PFitter
-
-            self.pfitter = PFitter(
-                model_file=self.model_file,
-                model_pars=self.model_pars,
-            )
-
-
-        
-        if models:
-            models= models
+        # ---- select parameters ----
+        if parameters is None:
+            selected_pars = list(self.free_pars)
+            indices = list(range(len(self.free_pars)))
         else:
-            models= [self.best_model(method=method)]
+            missing = [p for p in parameters if p not in self.free_pars]
+            if missing:
+                raise ValueError(f"Requested parameters not in free_pars: {missing}")
+            selected_pars = list(parameters)
+            indices = [self.free_pars.index(p) for p in selected_pars]
+            equal_samples = equal_samples[:, indices]
 
+        labels = [latex_labels.get(p, p) for p in selected_pars]
 
+        # ---- make figure ----
+        plt.close("all")
 
-        ### --- Diagnostic for the spectral component --- ###
-
-        if self.spec:
+        if cmap is None:
+            # ----- Standard white corner style -----
+            fig = corner.corner(
+                equal_samples,
+                labels=labels,
+                plot_contours=True,
+                fill_contours=False,
+                color=contour_color,
+            )
         
-            if polydeg is None: 
-                polydeg = self.polydeg 
-            if spec_noise_scale is None:
-                spec_noise_scale = self.best_model(method='MAP').header['SPEC_NOI']
-            
-
-            wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
-            flux_err_corr = flux_err * np.exp(spec_noise_scale)
-
-            header = fits.Header()
-            header["WUNITS"]  = "A"
-            header["FUNITS"]  = "erg/s/cm2/A"
-            spectrum_obs = Spectrum(wl=wl,flux=flux_obs,flux_err=flux_err_corr,header=header)
-            
-            
-            normalization_factor_list = []
-            normalization_factor_smoothed_list = []
-            models_comparable_to_obs = []
-            residuals = []
-
-
-            for model in models:
-
-                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,polydeg)
-            
-                normalization_factor_list.append(normalization_factor)
-                normalization_factor_smoothed_list.append(normalization_factor_smoothed)
-            
-                models_comparable_to_obs.append(model)
-
-                res = (flux_obs - model) / flux_err_corr
-                residuals.append(res)
-            
-
-
-
-
-
-            ### --- Plotting --- ###
-
-            fig, ax = plt.subplots(2,2,figsize=figsize)
-            ax = ax.flatten()
-            
-            global_fmax = -np.inf
-            global_fmin = +np.inf
-            if winf_spec is None: winf_spec = wl[0]
-            if winf_spec is None: wsup_spec = wl[-1]
-            mask = (wl>winf_spec) & (wl<wsup_spec)
-            
-            global_norm_max = -np.inf
-            global_norm_min = +np.inf
-            global_res_max = -np.inf
-            global_res_min = +np.inf
-            
-            for i in [0,2]:
-                if show_errorbars:
-                    ax[i].errorbar(wl, flux_obs, yerr=flux_err_corr, fmt='o', markersize=2,
-                                    color='black', ecolor='gray', elinewidth=1.0,
-                                    capsize=2, capthick=1.0, linestyle=' ', lw=0.5,
-                                    label='observed')
-                else:
-                    ax[i].plot(wl, flux_obs, color='black', lw=0.5, label='observed')
-                
-                global_fmax = max(np.nanmax(flux_obs[mask]),global_fmax)
-                global_fmin = min(np.nanmin(flux_obs[mask]),global_fmin)
-            
-
-            for j,model in enumerate(models):
-            
-                # --- Color ---
-                if isinstance(color, (list, tuple)) and len(color) > 0:
-                    c = color[j % len(color)]
-                elif color is None:
-                    c = f"C{j % 10}" 
-                else:
-                    c = color
-            
-
-                # --- Label ---
-                label = None
-
-                if isinstance(spec_legend_pars, str):
-                    label = str(model.header.get(spec_legend_pars))
-
-                elif isinstance(spec_legend_pars, dict):
-                    parts = []
-                    for k, p in spec_legend_pars.items():
-                        if k in model.header:
-                            parts.append(
-                                f"{p['label']}={model.header[k]:{p['fmt']}} {p['unit']}"
-                            )
-                    label = ", ".join(parts) if parts else None
-
-                else:
-                    label = model.header.get("ID", getattr(model, "id", None))
-
-                
-                ax[0].plot(model.wl,model.flux,color=c,label=label)
-            
-                mask_m = (model.wl > winf_spec) & (model.wl < wsup_spec)
-                global_fmax = max(global_fmax, np.nanmax(model.flux[mask_m]))
-                global_fmin = min(global_fmin, np.nanmin(model.flux[mask_m]))
-            
-                ax[1].plot(wl,normalization_factor_list[j],color=c,alpha=0.3)
-                ax[1].plot(wl,normalization_factor_smoothed_list[j],color=c,)
-                
-                global_norm_max = max(np.nanmax(normalization_factor_list[j][mask]),global_norm_max)
-                global_norm_min = min(np.nanmin(normalization_factor_list[j][mask]),global_norm_min)
-                
-                ax[2].plot(wl,models_comparable_to_obs[j],color=c)
-                
-                global_res_max = max(np.nanmax(residuals[j][mask]),global_res_max)
-                global_res_min = min(np.nanmin(residuals[j][mask]),global_res_min)
-                #ax[3].plot(wl,residuals[j],alpha=1,color=c,label=f"$\chi_2=${chi2:.2f}")
-                ax[3].scatter(wl,residuals[j],s=10,alpha=1,color=c,)
-
-
-
-            
-            
-            for i in range(4):
-                ax[i].set_xlim(winf_spec,wsup_spec)
-            
-            for i in [0,2]:
-                ax[i].set_ylim(0.8*global_fmin,1.2*global_fmax)
-            
-            ax[1].set_ylim(0.8*global_norm_min,1.2*global_norm_max)
-
-            ax[0].legend() 
-
-            ax[0].set_title('Raw observed spectrum and model')
-            ax[2].set_title('Raw spectrum and model fitted to observed spectrum continuum')
-            ax[1].set_title(f'Polynomial multiplicative factor. Polynomial degree {polydeg:.0f}')
-            ax[1].set_ylabel('$f_\\text{obs}/f_\\text{model}$')
-
-            ax[3].set_title('Residuals')
-            ax[3].set_ylabel('$(f_\\text{obs}-f_\\text{model})/\sigma_f$')
-            ax[3].set_ylim(0.8*global_res_min,1.2*global_res_max)
-            ax[3].axhline(y=0,color='black',lw=1)
-
-
-            # Lines
-            x_u = 'A'
-            z = models[0].header['REDSHIFT'] if redshift is None else redshift
-
-            for i in range(4):
-                if show_top_spectral_lines:
-                    for name in ['Lya','Ha','Hb','Hg','Hd']:
-                        wavelength = spectral_lines[name]
-                        wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                        if wl_shift > winf_spec and wl_shift < wsup_spec:
-                            ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                            name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                            ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
-                                    rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
-                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-
-                if show_all_spectral_lines:
-                    for name, wavelength in spectral_lines.items():
-                        wavelength = spectral_lines[name]
-                        wl_shift = models[0]._angstrom_to_wl(wavelength * (1 + z), x_u)
-                        if wl_shift > winf_spec and wl_shift < wsup_spec:
-                            ax[i].axvline(wl_shift, color="black", linestyle="dashed", alpha=0.4)
-                            name_map = {'Ha': '$H\\alpha$', 'Hb': '$H\\beta$', 'Hg': '$H\\gamma$', 'Hd': '$H\\delta$', 'Lya': 'Ly$\\alpha$'}
-                            ax[i].text(wl_shift, 1.1 * global_fmax, name_map.get(name, name),
-                                    rotation=90, va="bottom", fontsize=10, ha='center', clip_on=True,
-                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-
-                if show_atmospheric_lines:
-                    for name, wavelength in atmospheric_lines.items():
-                        wl_plot = models[0]._angstrom_to_wl(wavelength, x_u)
-                        if wl_plot > winf_spec and wl_plot < wsup_spec:
-                            ax[i].axvline(wl_plot, color="cyan", linestyle="dashed", alpha=0.7)
-                            ax[i].text(wl_plot, 1.1 * global_fmax, name, rotation=90, color='cyan',
-                                    va="bottom", fontsize=9, ha='center', clip_on=True,
-                                    bbox=dict(facecolor='white', edgecolor='white', boxstyle='square,pad=0.2'))
-            plt.show()
-
-        
-        ### --- Diagnostic for the photometric component --- ###
-
-        if self.phot:
-
-            models[0].plot(
-
-                spectra=models,
-                per_wavelength=True,
-                winf=winf_phot,
-                wsup=wsup_phot,
-                ymin=ymin,
-                ymax=ymax,
-
-                figsize=(20,7),
-                color=color,
-
-                redshift=None,
-                show_top_spectral_lines=False,
-                show_all_spectral_lines=False,
-                show_atmospheric_lines=False,
-                show_filters=False,
-            
-                phot=self.phot,
-                synth_phot=self.bands,
-                spec_legend_pars=spec_legend_pars,
-                show_phot_legend=True,
-                show_spec_legend=True,
-                spec_legend_loc="upper right",
-                spec_legend_title=None,
+        else:
+            # ----- Colored filled contours -----
+            fig = corner.corner(
+                equal_samples,
+                labels=labels,
+                plot_contours=True,
+                fill_contours=True,
+                contourf_kwargs={
+                    "cmap": cm.get_cmap(cmap),
+                    "colors": None,
+                    "alpha": alpha
+                },
+                contour_kwargs={"colors": contour_color},
             )
 
+        n = len(selected_pars)
 
-    #############################################
+        # ---- optional: hide histograms (diagonal) ----
+        diag_axes = [fig.axes[i*(n+1)] for i in range(n)]
+        if not show_histograms:
+            for ax in diag_axes:
+                ax.set_visible(False)
 
-
-
-
-    def fit_diagnostic_likelihoods(self,
-                        models=[],
-                        method='MAP',
-                        polydeg = None,
-                        spec_noise_scale = None,
-                        w_spec = None,
-                        ):
+        # ---- optional: stats ----
+        if show_stats and show_histograms:
         
-        if self.spec:
+            if mark_point is None:
+                vals = np.mean(equal_samples, axis=0)
+                errs = np.std(equal_samples, axis=0)
+                label = "mean"
+        
+            elif str(mark_point).lower() == "median":
+                vals = np.median(equal_samples, axis=0)
+                errs = np.std(equal_samples, axis=0)
+                label = "median"
+        
+            elif str(mark_point).lower() in ("maxlogl", "maxlikelihood", "map"):
+        
+                if not hasattr(self.result, "logl"):
+                    raise ValueError("No logl available for MAP.")
+        
+                idx_best = int(np.argmax(self.result.logl))
+                pt_full = samples[idx_best]
+                vals = pt_full[indices]
+                errs = None
+                label = "MAP"
+        
+            else:
+                vals = np.mean(equal_samples, axis=0)
+                errs = np.std(equal_samples, axis=0)
+                label = str(mark_point)
+        
+            # ---- Apply titles ----
+            for i, ax in enumerate(diag_axes):
+        
+                if errs is None:
+                    ax.set_title(f"{vals[i]:.3f}", fontsize=10, pad=12) #{label} = 
+                else:
+                    ax.set_title(f"{vals[i]:.3f} ± {errs[i]:.3f}", #{label} = 
+                                fontsize=10, pad=12)
 
-            if polydeg is None: 
-                polydeg = self.polydeg 
-            if spec_noise_scale is None:
-                spec_noise_scale = self.best_model(method='MAP').header['SPEC_NOI']
-            if w_spec is None:
-                w_spec = self.w_spec
+        
+        # =========================================================
+        # Add a cross at a "best" point (median or max-likelihood)
+        # =========================================================
+        if mark_point is not None:
+            mark_point = str(mark_point).lower()
+
+            if mark_point == "median":
+                pt = np.median(equal_samples, axis=0)
+
+            elif mark_point in ("maxlogl", "maxlikelihood", "map"):
+                # Prefer using the original samples + logl if available
+                if not hasattr(self.result, "logl"):
+                    raise ValueError(
+                        "mark_point='maxlogl' requested but result has no .logl attribute. "
+                        "Use mark_point='median' or store log-likelihoods in result.logl."
+                    )
+                idx_best = int(np.argmax(self.result.logl))
+                pt_full = samples[idx_best]      # full parameter set
+                pt = pt_full[indices]            # subset to selected parameters
+
+            else:
+                raise ValueError("mark_point must be None, 'median', or 'maxlogl'.")
+
+            # Overplot crosses on 2D panels (lower triangle)
+            # Axes are in row-major order; diag indices are i*(n+1).
+            for i in range(n):
+                for j in range(i):
+                    ax = fig.axes[i*n + j]  # row i, col j
+                    # Overplot crosshairs on 2D panels (lower triangle)
+                    for i in range(n):
+                        for j in range(i):
+                            ax = fig.axes[i*n + j]  # row i, col j
+                    
+                            # vertical line at x = pt[j]
+                            ax.axvline(
+                                pt[j],
+                                color=mark_color,
+                                linewidth=mark_lw,
+                                alpha=0.9,
+                                zorder=10,
+                            )
+                    
+                            # horizontal line at y = pt[i]
+                            ax.axhline(
+                                pt[i],
+                                color=mark_color,
+                                linewidth=mark_lw,
+                                alpha=0.9,
+                                zorder=10,
+                            )
+                            
+            # Optional: mark on diagonal histograms with a vertical line
+            if show_histograms:
+                for i, ax in enumerate(diag_axes):
+                    ax.axvline(pt[i], color=mark_color, linewidth=mark_lw)
+
+        plt.show()
+
+
+
+
+
+
+
             
-
-            wl, flux_obs, flux_err, = self.spec_crop.wl, self.spec_crop.flux, self.spec_crop.flux_err
-            flux_err_corr = flux_err * np.exp(spec_noise_scale)
-
-            header = fits.Header()
-            header["WUNITS"]  = "A"
-            header["FUNITS"]  = "erg/s/cm2/A"
-            spectrum_obs = Spectrum(wl=wl,flux=flux_obs,flux_err=flux_err_corr,header=header)
-            
-            
-            normalization_factor_list = []
-            normalization_factor_smoothed_list = []
-            models_comparable_to_obs = []
-            residuals = []
-            
-            for model in models:
-            
-                normalization_factor, normalization_factor_smoothed, model = self.pfitter._adapt_model_spectrum_to_observed_spectrum(self.spec_crop,model,self.spectral_range,self.polydeg)
-            
-                normalization_factor_list.append(normalization_factor)
-                normalization_factor_smoothed_list.append(normalization_factor_smoothed)
-            
-                models_comparable_to_obs.append(model)
-
-                res = (flux_obs - model) / flux_err_corr
-                residuals.append(res)
-
-
-        ### --- Print likelihoods --- ###
-        print('LIKELIHOODS')
-        if self.spec:
-            print(f'Spectral nuisance scale parameter: {spec_noise_scale:.2f} (log). Spectral errors multiplied by {np.exp(spec_noise_scale):.2f}','\n')
-            print(f'spectral likelihood weight (N_corr/N_pix) is: {self.w_spec}')
-            print('\n')
-
-        for j in range(len(models)):
-            print('###########################')
-            print('For model number: ',j+1,'\n')
-            
-            #if spec_legend_pars: print(spec_legend_pars)
-
-            if self.spec:
-
-                res = residuals[j]
-
-                chi2 = np.nansum(res**2)
-                print(f'Spectral chi2: {chi2:.2f}')
-
-                print(f'Spectral reduced chi2: {chi2/len(flux_obs)}')
-
-                logL_spec = - 0.5 * chi2  - np.nansum (np.log( np.sqrt(2 * np.pi) * flux_err_corr ))
-                print(f'Spectral log-likelihood {logL_spec:.2f}')
-
-                print('\n')
-            
-
-            if self.phot:
-
-                phot_fluxes = np.array([self.phot.data[b][0] for b in self.bands])
-                phot_errors = np.array([self.phot.data[b][1] for b in self.bands])
-                upper_limits = (phot_fluxes / phot_errors < 5).astype(int)
-                phot_units = self.phot.header["UNITS"]
-            
-                trans_mask = {}
-                trans_arrays = {}
-                pivot_wls = {}
-                for b in self.bands:
-                    F = Filter(b)
-                    lmin, lmax = F.wavelength_range
-                    mask_b = (models[0].wl >= lmin) & (models[0].wl <= lmax)
-                    trans_mask[b] = mask_b
-                    trans_arrays[b] = F.transmission_curve(models[0].wl[mask_b])
-                    pivot_wls[b] = F.pivot_wavelength
-
-                model_phot_array = models[j].get_phot(bands=self.bands,trans_arrays=trans_arrays,trans_mask=trans_mask,pivot_wls=pivot_wls)
-                
-                if not np.all(np.isfinite(model_phot_array)):
-                    raise ValueError(f"Model spectrum {j:.0f} gives invalid photometry")
-                                
-                chi2 = 0.0
-                logL_phot = 0.0
-
-                residuals_per_band = []
-
-                N_phot = len(phot_fluxes)
-
-                for i in range(N_phot):
-
-                    mod = model_phot_array[i]
-                    obs = phot_fluxes[i]
-                    err = phot_errors[i]
-                    var = err**2
-
-                    if upper_limits[i] == 0:
-                        # Detection: Gaussian likelihood
-                        resid = (obs - mod) / err
-
-                        chi2 += resid**2
-                        logL_phot += -0.5 * (resid**2 + np.log(2 * np.pi * var))
-
-                        residuals_per_band.append(
-                            (nice_filter_names[self.bands[i]], resid,)
-                        )
-
-                    else:
-                        # Upper limit: one-sided Gaussian
-                        arg = (obs - mod) / (np.sqrt(2.0) * err)
-                        cdf = 0.5 * (1 + erf(arg))
-
-                        #if cdf <= 0:
-                        #    logL = -1e100
-                        #    break
-
-                        logL_phot += np.log(cdf)
-
-                        residuals_per_band.append(
-                            (nice_filter_names[self.bands[i]], arg,)
-                        )
-
-
-                print(f"Photometric chi2           = {chi2:.2f}")
-                print(f"Photometric reduced chi2   = {chi2/N_phot:.2f}")
-                print(f"Photometric log-likelihood  = {logL_phot:.2f}")
-
-                print('\n')
-                if self.spec and self.phot:
-                    print(f"TOTAL LIKELIHOOD: {float(self.w_spec):.4f} x logL_spec +  logL_phot = {self.w_spec * logL_spec+logL_phot}") 
-                    print('\n')                 
-
-                print(f"{'Band':<15} {'Residual':>12}")
-                print("-" * 40)
-
-                for band, resid in residuals_per_band:
-                    if np.isnan(resid):
-                        print(f"{band:<15} {'--':>12}")
-                    else:
-                        print(f"{band:<15} {resid:12.3f}")
-
-                print("\n")
-
-
-
-
-
-
-
-
-
-
-
-
-
     def save(self, filename):
         """Save dynesty samples, priors, and run metadata to a compressed NPZ file."""
 
@@ -683,6 +421,7 @@ class Run:
             nlive=self.nlive,
             dlogz=self.dlogz,
             bands=self.bands,
+            treat_as_upper_limits=np.array(self.treat_as_upper_limits, dtype="U")
         )
 
         if self.spec is not None:
@@ -765,6 +504,7 @@ class Run:
             self.nlive   = int(data["nlive"]) if "nlive" in data else None
             self.dlogz   = float(data["dlogz"]) if "dlogz" in data else None
             self.bands   = data["bands"].tolist() if "bands" in data else None
+            self.treat_as_upper_limits = data["treat_as_upper_limits"].tolist() if "treat_as_upper_limits" in data else None
 
             # -------------------------------------------------
             # Restore observed photometry
