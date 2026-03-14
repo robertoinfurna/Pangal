@@ -265,14 +265,22 @@ def load_dust_emission_models(self, wl, dustemimodel):
 
 def model_grid_interpolator(self, model_list, param_names):
     """
-    Build N-dimensional interpolators for young and old fluxes on the model grid,
-    and return callables that output spectra resampled onto self.model_wl.
+    Build N-dimensional interpolators for young and old fluxes on the model grid
+    (WITHOUT dividing by MSTAR), and also an interpolator for MSTAR itself.
+
+    Returns
+    -------
+    interp_flux_young : callable(**params) -> spectrum on self.model_wl
+    interp_flux_old   : callable(**params) -> spectrum on self.model_wl
+    interp_mstar      : callable(**params) -> float (MSTAR on the grid, interpolated)
+    grid_axes         : list[np.ndarray]
+    short_wl          : np.ndarray
     """
 
-    # Native (short) wavelength grid from SPS models
+    # Native SPS wavelength grid
     short_wl = np.array(model_list[0].wl, dtype=float)
 
-    # --- Step 1: Build param space ---
+    # --- Step 1: Build param space mapping ---
     param_tuples = []
     param_to_model = {}
     for model in model_list:
@@ -280,12 +288,21 @@ def model_grid_interpolator(self, model_list, param_names):
             values = tuple(float(model.header[k]) for k in param_names)
         except KeyError as e:
             raise KeyError(f"Model is missing parameter {e} in header.")
+
+        if values in param_to_model:
+            raise ValueError(
+                f"Duplicate model grid point for params={values}. "
+                f"Check that param_names uniquely identify models."
+            )
+
         param_tuples.append(values)
         param_to_model[values] = model
 
     # --- Step 2: Build grid axes ---
-    grid_axes = [np.array(sorted(set(p[i] for p in param_tuples)), dtype=float)
-                 for i in range(len(param_names))]
+    grid_axes = [
+        np.array(sorted(set(p[i] for p in param_tuples)), dtype=float)
+        for i in range(len(param_names))
+    ]
 
     # --- Step 3: Allocate grids ---
     grid_shape = tuple(len(ax) for ax in grid_axes)
@@ -293,14 +310,30 @@ def model_grid_interpolator(self, model_list, param_names):
 
     flux_young_grid = np.zeros(grid_shape + (n_wl,), dtype=float)
     flux_old_grid   = np.zeros(grid_shape + (n_wl,), dtype=float)
+    mstar_grid      = np.zeros(grid_shape, dtype=float)  # <--- NEW
 
-    # --- Step 4: Fill the grids (store flux per unit mass, like mcspf) ---
+    # --- Step 4: Fill the grids (NO mass-normalisation) ---
     for idxs in np.ndindex(*grid_shape):
         key = tuple(grid_axes[i][idxs[i]] for i in range(len(grid_axes)))
-        model = param_to_model[key]
-        mstar = float(model.header["MSTAR"])  # you said: linear in FITS
-        flux_young_grid[idxs] = np.asarray(model.flux_young, dtype=float) / mstar
-        flux_old_grid[idxs]   = np.asarray(model.flux_old,   dtype=float) / mstar
+        try:
+            model = param_to_model[key]
+        except KeyError:
+            raise KeyError(
+                f"Missing model at grid point {key}. "
+                f"Your grid is not complete (not a full Cartesian product)."
+            )
+
+        # Store raw fluxes (per whatever your library normalization is: in your case 1 M_formed at 10 pc)
+        flux_young_grid[idxs] = np.asarray(model.flux_young, dtype=float)
+        flux_old_grid[idxs]   = np.asarray(model.flux_old,   dtype=float)
+
+        # Store MSTAR (surviving mass corresponding to that library normalization)
+        mstar = float(model.header.get("MSTAR", np.nan))
+        if not np.isfinite(mstar):
+            raise ValueError(f"Model at {key} has non-finite MSTAR={mstar}")
+        if mstar <= 0:
+            raise ValueError(f"Model at {key} has non-positive MSTAR={mstar}")
+        mstar_grid[idxs] = mstar
 
     # --- Step 5: Build interpolators on the native wavelength grid ---
     interp_young = RegularGridInterpolator(
@@ -309,6 +342,10 @@ def model_grid_interpolator(self, model_list, param_names):
     )
     interp_old = RegularGridInterpolator(
         points=grid_axes, values=flux_old_grid,
+        bounds_error=True, fill_value=None
+    )
+    interp_mstar_native = RegularGridInterpolator(   # <--- NEW
+        points=grid_axes, values=mstar_grid,
         bounds_error=True, fill_value=None
     )
 
@@ -321,26 +358,27 @@ def model_grid_interpolator(self, model_list, param_names):
                     f"[{grid_axes[i][0]}, {grid_axes[i][-1]}]"
                 )
 
+    def _x_from_kwargs(kwargs):
+        return [float(kwargs[name]) for name in param_names]
+
     def interp_flux_young(**kwargs):
-        x = [float(kwargs[name]) for name in param_names]
+        x = _x_from_kwargs(kwargs)
         _check_bounds(x)
-
-        # RGI wants (n_points, ndim)
         spec_short = interp_young(np.array([x], dtype=float))[0]  # (n_wl,)
-
-        # Resample to the extended wavelength grid, matching mcspf left/right=0 behavior
         return np.interp(self.model_wl, short_wl, spec_short, left=0.0, right=0.0)
 
     def interp_flux_old(**kwargs):
-        x = [float(kwargs[name]) for name in param_names]
+        x = _x_from_kwargs(kwargs)
         _check_bounds(x)
-
         spec_short = interp_old(np.array([x], dtype=float))[0]
         return np.interp(self.model_wl, short_wl, spec_short, left=0.0, right=0.0)
 
-    return interp_flux_young, interp_flux_old, grid_axes, short_wl
+    def interp_mstar(**kwargs):  
+        x = _x_from_kwargs(kwargs)
+        _check_bounds(x)
+        return float(interp_mstar_native(np.array([x], dtype=float))[0])
 
-
+    return interp_flux_young, interp_flux_old, interp_mstar, grid_axes, short_wl
 
 
 
@@ -398,3 +436,7 @@ def dust_attenuation_curve(self, leitatt: bool = False, uv_bump: bool = False):
         return 0.4 * k_cal / R_V
 
     return k_lambda
+
+
+
+    

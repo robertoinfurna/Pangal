@@ -524,8 +524,8 @@ class PanGal:
                 # --------------------------------------------------------
                 # CONVERT UNITS (in-place)
                 # --------------------------------------------------------
-                cube *= 1e-20
-                var  *= 1e-40
+                cube = cube * 1e-20
+                var = var * 1e-40
 
                 header['FUNITS'] = 'erg/s/cm2/A'
                 header['WUNITS'] = 'A'
@@ -635,7 +635,7 @@ class PanGal:
                         header=header,
                         filter=filter
                         )
-                    
+                
 
                 # --------------------------------------------------------
                 # EXTRACT LINE MAPS

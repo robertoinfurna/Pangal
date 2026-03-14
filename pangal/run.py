@@ -54,148 +54,88 @@ class Run:
 
         # Processed data
         self.spec = None
-        self.spec_crop = None
         self.phot = None
 
         # Likelihood, priors, and sampler
         self.result = None
 
 
-    # FUNCTIONS IMPORTANT FOR FITTING
 
 
-    def cornerplot(self, show_stats=True, cmap='viridis', alpha=0.7):
-        """
-        Make a corner plot from the nested sampling results stored in this Run.
+    def best_model(self, method='MAP', quantiles=None):
 
-        Parameters
-        ----------
-        show_stats : bool
-            Add mean ± std titles on diagonal histograms.
-        cmap : str
-            Matplotlib colormap for filled contours.
-        alpha : float
-            Transparency of contour fills.
-        """
-
-        if not hasattr(self, "result"):
-            raise ValueError("Run has no .result attribute. Did you run run_fit()?")
-
-        # Extract samples
-        samples = self.result.samples
-        logwt   = self.result.logwt
-        logz    = self.result.logz
-
-        # Convert to equal-weight posterior samples
-        weights = np.exp(logwt - logz[-1])
-        equal_samples = resample_equal(samples, weights)
-
-        # Labels for the parameters
-        latex_labels = {
-            "age": r"$\mathrm{Age~[Myr]}$",
-            "tau_main": r"$\tau_\mathrm{main}\ \mathrm{[Myr]}$",
-            "age_trunc": r"$Q_\mathrm{AGE}\ \mathrm{[Myr]}$",
-            "tau_trunc": r"$\tau_Q\ \mathrm{[Myr]}$",
-            "fesc": r"$f_\mathrm{esc}$",
-            "ion_gas": r"$U_\mathrm{ion}$",
-            "age_gas": r"$\mathrm{Age_{gas}}$",
-            "av": r"$A_V$",
-            "av_ext": r"$A_{V,\mathrm{ext}}$",
-            "alpha": r"$\alpha$",
-            "m_star": r"$\log M_\star$",
-            "vel_sys": r"$v\ \mathrm{[km/s]}$",
-            "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
-            "redshift": r'redshift',
-            "luminosity_distance": r'luminosity distance',
-            "ln_spec_noise_scale": r'spectral noise scaling parameter'
-        }
-
-        labels = [latex_labels.get(p, p) for p in self.free_pars]
-
-        # Plot
-        plt.close("all")
-        fig = corner.corner(
-            equal_samples,
-            labels=labels,
-            plot_contours=True,
-            fill_contours=True,
-            color="k",
-            cmap=cmap,
-            alpha=alpha
-        )
-
-        # Add stats on diagonal
-        if show_stats:
-            means = np.mean(equal_samples, axis=0)
-            stds  = np.std(equal_samples, axis=0)
-
-            n = len(self.free_pars)
-            diag_axes = [fig.axes[i*(n+1)] for i in range(n)]
-
-            for i, ax in enumerate(diag_axes):
-                ax.set_title(f"{means[i]:.3f} ± {stds[i]:.3f}", fontsize=10, pad=12)
-
-        plt.show()
-
-
-
-    def best_model(self, method='MAP'):
-        """
-        Build a synthetic spectrum using the 'best' parameters from the fit.
-
-        Parameters
-        ----------
-        method : str
-            Which parameters to use:
-            - 'MAP' : Maximum a posteriori
-            - 'ML'  : Maximum likelihood
-            - 'median' : Posterior median
-
-        Returns
-        best_params : dict
-            Dictionary of parameter names and best-fit values
-        """
-
-        if not hasattr(self, 'result'):
+        if self.result is None:
             raise ValueError("No fit results found in this Run object.")
+        if not hasattr(self, "free_pars"):
+            raise ValueError("Run has no 'free_pars' attribute.")
+        if self.fix_pars is None:
+            self.fix_pars = {}
 
         samples = self.result.samples
         weights = np.exp(self.result.logwt - self.result.logz[-1])
+        weights = weights / np.sum(weights)
         param_names = self.free_pars
+
+        def weighted_quantile_1d(x, qs, w):
+            x = np.asarray(x)
+            w = np.asarray(w)
+            qs = np.asarray(qs)
+
+            sorter = np.argsort(x)
+            x_sorted = x[sorter]
+            w_sorted = w[sorter]
+
+            cdf = np.cumsum(w_sorted)
+            cdf = cdf / cdf[-1]
+
+            cdf = np.concatenate([[0.0], cdf])
+            x_sorted = np.concatenate([[x_sorted[0]], x_sorted])
+
+            return np.interp(qs, cdf, x_sorted)
 
         # --- Select best parameters ---
         if method == 'MAP':
-            logpost = self.result.logl + np.log(weights + 1e-300)  # approximate posterior
+            logpost = self.result.logl + np.log(weights + 1e-300)
             idx = np.argmax(logpost)
             best_vals = samples[idx]
+
         elif method == 'ML':
             idx = np.argmax(self.result.logl)
             best_vals = samples[idx]
+
         elif method == 'median':
-            # weighted median
-            best_vals = []
-            for i in range(samples.shape[1]):
-                sorted_idx = np.argsort(samples[:, i])
-                cumsum = np.cumsum(weights[sorted_idx])
-                cumsum /= cumsum[-1]
-                best_vals.append(samples[sorted_idx][np.searchsorted(cumsum, 0.5), i])
-            best_vals = np.array(best_vals)
+            best_vals = np.array([
+                weighted_quantile_1d(samples[:, i], 0.5, weights)
+                for i in range(samples.shape[1])
+            ])
         else:
             raise ValueError(f"Unknown method '{method}'")
 
-        # --- Build parameter dictionary including fixed parameters ---
-        best_params = {}
+        best_params = {name: val for name, val in zip(param_names, best_vals)}
+        best_params.update(self.fix_pars)
+
+        # --- OLD behaviour ---
+        if quantiles is None:
+            return best_params
+
+        # --- Quantiles requested ---
+        if (not isinstance(quantiles, (tuple, list))) or len(quantiles) != 2:
+            raise ValueError("quantiles must be (q_lo, q_hi)")
+        q_lo, q_hi = quantiles
+
+        out = {}
 
         # free parameters
-        for name, val in zip(self.free_pars, best_vals):
-            best_params[name] = val
+        for i, name in enumerate(param_names):
+            lo, hi = weighted_quantile_1d(samples[:, i], [q_lo, q_hi], weights)
+            out[name] = (lo, best_params[name], hi)
 
         # fixed parameters
         for name, val in self.fix_pars.items():
-            best_params[name] = val
+            out[name] = (val, val, val)
 
-        return best_params
-    
+        return out
+
 
     def cornerplot(
         self,
@@ -224,13 +164,15 @@ class Run:
             "tau_main": r"$\tau_\mathrm{main}\ \mathrm{[Myr]}$",
             "TRUNCAGE": r"$Q_\mathrm{AGE}\ \mathrm{[Myr]}$",
             "TRUNCTAU": r"$\tau_Q\ \mathrm{[Myr]}$",
+            "BURST": r"burst factor",
+            "METAL": r"metallicity [$Z_\odot$]", 
             "fesc": r"$f_\mathrm{esc}$",
             "ion_gas": r"$U_\mathrm{ion}$",
             "age_gas": r"$\mathrm{Age_{gas}}$",
             "av": r"$A_V$",
             "av_ext": r"$A_{V,\mathrm{ext}}$",
             "alpha": r"$\alpha$",
-            "m_star": r"$\log M_\star$",
+            "log_m_star": r"$\log M_\star$",
             "vel_sys": r"$v\ \mathrm{[km/s]}$",
             "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
             "redshift": r"redshift",
@@ -433,19 +375,18 @@ class Run:
                     obs_spec_res=self.spec.resolution,
                     obs_spec_wl_units=self.spec.header["WUNITS"],
                     obs_spec_flux_units=self.spec.header["FUNITS"],
-                    w_spec=self.w_spec
                 )
             )
 
-        if self.spec_crop is not None:
+        if self.spec is not None:
             save_dict.update(
                 dict(
-                    obs_spec_crop_wl=self.spec_crop.wl,
-                    obs_spec_crop_flux=self.spec_crop.flux,
-                    obs_spec_crop_flux_err=self.spec_crop.flux_err,
-                    obs_spec_crop_res=self.spec_crop.resolution,
-                    obs_spec_crop_wl_units=self.spec_crop.header["WUNITS"],
-                    obs_spec_crop_flux_units=self.spec_crop.header["FUNITS"],
+                    obs_spec_wl=self.spec.wl,
+                    obs_spec_flux=self.spec.flux,
+                    obs_spec_flux_err=self.spec.flux_err,
+                    obs_spec_res=self.spec.resolution,
+                    obs_spec_wl_units=self.spec.header["WUNITS"],
+                    obs_spec_flux_units=self.spec.header["FUNITS"],
                 )
             )
 
@@ -542,22 +483,21 @@ class Run:
                     resolution=data["obs_spec_res"],
                     header=hdr,
                 )
-                self.w_spec=data["w_spec"]
 
             # -------------------------------------------------
             # Restore cropped observed spectrum
             # -------------------------------------------------
-            self.spec_crop = None
-            if "obs_spec_crop_wl" in data:
+            self.spec = None
+            if "obs_spec_wl" in data:
                 hdr = fits.Header()
-                hdr["WUNITS"] = data["obs_spec_crop_wl_units"].item()
-                hdr["FUNITS"] = data["obs_spec_crop_flux_units"].item()
+                hdr["WUNITS"] = data["obs_spec_wl_units"].item()
+                hdr["FUNITS"] = data["obs_spec_flux_units"].item()
 
-                self.spec_crop = Spectrum(
-                    wl=data["obs_spec_crop_wl"],
-                    flux=data["obs_spec_crop_flux"],
-                    flux_err=data["obs_spec_crop_flux_err"],
-                    resolution=data["obs_spec_crop_res"],
+                self.spec = Spectrum(
+                    wl=data["obs_spec_wl"],
+                    flux=data["obs_spec_flux"],
+                    flux_err=data["obs_spec_flux_err"],
+                    resolution=data["obs_spec_res"],
                     header=hdr,
                 )
 

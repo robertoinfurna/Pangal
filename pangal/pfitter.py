@@ -47,7 +47,7 @@ class PFitter():
     
     # Parametric fitter: this first block loads a grid of models
 
-    def __init__(self, model_file, model_pars, cosmo=None, dustemimodel='dh02', leitatt=False, uv_bump=False, emimetal=0.017, emimodel='nebular_Byler_mist_2018.lines'):
+    def __init__(self, model_file, model_pars, burst_model_file=None, burst_model_pars=None, cosmo=None, dustemimodel='dh02', leitatt=False, uv_bump=False, emimetal=0.017, emimodel='nebular_Byler_mist_2018.lines'):
 
         print(f"Initializing PFitter object")
         self.model_file = model_file
@@ -61,9 +61,13 @@ class PFitter():
 
         print("Loading models from ",model_file)
         model_list = load_spectrum_models_from_fits(model_file)
-
         ### ADDED LATER!! JUST DIAGNOSTICS
-        self.model_list = model_list
+
+
+        if burst_model_file and burst_model_pars:
+            self.burst_model_pars = burst_model_pars
+            print("Burst component: loading models from ",burst_model_file)
+            burst_model_list = load_spectrum_models_from_fits(burst_model_file)          
 
         # Menages model grid
         if not isinstance(model_list, list):
@@ -96,12 +100,19 @@ class PFitter():
 
 
         # INTERPOLATION!
-        self.interp_young_flux, self.interp_old_flux, self.model_pars_arr, _ = self.model_grid_interpolator(model_list, self.model_pars)
-
+        
+        self.interp_young_flux, self.interp_old_flux, self.interp_current_stellar_mass, self.model_pars_arr, _ = self.model_grid_interpolator(model_list, model_pars)
+        
         print(f" Pre-computed model grid:")
         for name, arr in zip(self.model_pars, self.model_pars_arr):
-            print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")
+            print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")   
         
+        if burst_model_file and burst_model_pars:
+            self.interp_burst_young_flux, self.interp_burst_old_flux, self.interp_burst_current_stellar_mass, self.burst_model_pars_arr, _ = self.model_grid_interpolator(burst_model_list, burst_model_pars)
+
+            for name, arr in zip(self.burst_model_pars, self.burst_model_pars_arr):
+                print(f"   - {name}: {len(arr)} values, min={arr[0]}, max={arr[-1]}")       
+
 
         # PRECOMPUTES DUST ATTENUATION CURVE (Calzetti, 2000 + optional Leitherer+2002 + optional UV bump)
         self.k_calzetti = self.dust_attenuation_curve(leitatt, uv_bump)
@@ -128,13 +139,14 @@ class PFitter():
 
     def synthetic_spectrum(
         self,
+        burst_mass_fraction,
         fesc,
         ion_gas,
         age_gas,
         av,
         av_ext,
         alpha,
-        m_star,
+        log_m_star,
         redshift,
         luminosity_distance,
         vel_sys,
@@ -159,8 +171,20 @@ class PFitter():
         # PHOTOMETRY
 
         # --- Stellar population spectra ---
-        young_stellar = self.interp_young_flux(**kwargs)
-        old_stellar = self.interp_old_flux(**kwargs)
+
+        Fym = self.interp_young_flux(**kwargs)
+        Fom = self.interp_old_flux(**kwargs)
+        eta_m = self.interp_current_stellar_mass(**kwargs)
+
+        Fyb = self.interp_burst_young_flux(BURSTAGE=kwargs["TRUNCAGE"])
+        Fob = self.interp_burst_old_flux(BURSTAGE=kwargs["TRUNCAGE"])
+        eta_b = self.interp_burst_current_stellar_mass(BURSTAGE=kwargs["TRUNCAGE"])
+
+        a = 1.0 / (eta_m + burst_mass_fraction * eta_b)   # makes total current mass = 1 Msun
+
+        young_stellar = a * (Fym + burst_mass_fraction * Fyb)
+        old_stellar   = a * (Fom + burst_mass_fraction * Fob)
+
 
         # --- Ionizing photons and nebular emission ---
         index_lyman = np.searchsorted(self.model_wl, 912, side="left")
@@ -173,6 +197,8 @@ class PFitter():
         # Old
         lycont_spec = np.interp(lycont_wls, self.model_wl, old_stellar)
         nlyman_old = np.trapz(lycont_spec * lycont_wls, lycont_wls) / 6.626e-27 / 2.998e18 * (1 - fesc)
+
+
 
         # Remove escaped photons
         if fesc >= 0:
@@ -224,8 +250,17 @@ class PFitter():
         final_spec_phot /= (1 + redshift)
 
         # --- Flux scaling to given stellar mass and luminosity distance ---
-        fscale = 10**m_star / (luminosity_distance * 1e5)**2
+        fscale = 10**log_m_star / (luminosity_distance * 1e5)**2
         final_spec_phot *= fscale
+
+
+
+        # Mass formed 
+        Mstar = 10**log_m_star
+        Mform_main  = Mstar / (eta_m + burst_mass_fraction * eta_b)
+        Mform_burst = burst_mass_fraction * Mform_main              # <-- total stellar mass formed in burst [Msun]
+        Mform_total = Mform_main + Mform_burst
+
         
         # --- Compute synthetic photometric points
         model_phot = []
@@ -309,7 +344,6 @@ class PFitter():
 
             fft_losvd = np.conj(losvd_rfft)
 
-            
             # FFT of the input spectrum
             fft_spec = np.fft.rfft(logspec, n=npad)
 
@@ -442,13 +476,17 @@ class PFitter():
             header["FUNITS"]  = "erg/s/cm2/A"
             header["REDSHIFT"] = (redshift, "Cosmological redshift")
             header["AV"]       = (av, "V-band attenuation (old stars)")
-            header["AV_EXT"]   = (av_ext, "Extra attenuation (young stars)")
+            header["AVEXT"]   = (av_ext, "Extra attenuation (young stars)")
+            header["BURSTF"]   = (burst_mass_fraction, "Fraction of stellar mass formed during burst")
             header["FESC"]     = (fesc, "Escape fraction of ionizing photons")
-            header["ION_GAS"]  = (ion_gas, "Ionization parameter")
-            header["AGE_GAS"]  = (age_gas, "Nebular region age [Myr]")
+            header["IONGAS"]  = (ion_gas, "Ionization parameter")
+            header["AGEGAS"]  = (age_gas, "Nebular region age [Myr]")
             header["ALPHA"]    = (alpha, "Dust heating parameter")
-            header["MSTAR"]    = (m_star, "log10 Stellar mass [Msun]")
-            header["DL_MPC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
+            header["LOGMSTAR"]    = (log_m_star, "log10 Stellar mass [Msun]")
+            header["MFORMTOT"]  = (np.log10(Mform_total),  "log10 total formed stellar mass [Msun]")
+            if burst_mass_fraction>0: header["MFORMBST"]  = (np.log10(Mform_burst),  "log10 formed mass in burst [Msun]")
+            header["MFORMMAN"]  = (np.log10(Mform_main),   "log10 formed mass in main SFH [Msun]")
+            header["DLMPC"]    = (luminosity_distance, "Luminosity distance [Mpc]")
 
 
             # Add kwargs for traceability
@@ -466,9 +504,9 @@ class PFitter():
                 spec.obs_spec = obs_spec
 
                 header_conv = header.copy()
-                header_conv["VEL_SYS"]   = (vel_sys, "Systemic velocity [km/s]")
-                header_conv["SIGMA_VEL"] = (sigma_vel, "Stellar Doppler broadening [km/s]")
-                header_conv["SIGMA_GAS"] = (sigma_gas, "Gas Doppler broadening [km/s]")
+                header_conv["VELSYS"]   = (vel_sys, "Systemic velocity [km/s]")
+                header_conv["SIGMAVEL"] = (sigma_vel, "Stellar Doppler broadening [km/s]")
+                header_conv["SIGMAGAS"] = (sigma_gas, "Gas Doppler broadening [km/s]")
             
                 header_conv["POLYDEG"] = (polydeg, "Polynomial degree of normalization")
                 header_conv["SPECNOI"]   = (spec_noise_scale, "Extra noise factor for spectrum")
@@ -491,6 +529,8 @@ class PFitter():
                 dust_flux = dust_spec * fscale / (1 + redshift)
 
                 # --- Save main components ---
+
+                
                 spec.young_stellar_nebular = Spectrum(
                     wl=model_red_wl,
                     resolution=self.model_resolution,
@@ -539,6 +579,7 @@ class PFitter():
     # make_log_likelihood()   →   precomputes constants, returns log_likelihood()
     # log_likelihood()        →   called thousands of times by the sampler
 
+    # ADD run.spec!!!!
 
     def run_fit(self,
                 spec=None,   # observed spectrum (a spectrum object)
@@ -586,7 +627,8 @@ class PFitter():
         run.fix_pars = dict(fix_pars) 
 
         run.bands = []
-        run.spec_crop = None
+
+        run.spec_crop = None # initialized None
         
 
         # --- bands selection ---
@@ -609,14 +651,15 @@ class PFitter():
 
         # --- preprocess observed spectrum once (done here) ---
         if spec:
+            run.spec = spec
             run.spec_crop = self._preprocess_observed_spectrum(spec, run.spectral_range, atmospheric_lines)
 
 
         # ------- build lists of free parameters (separate model and global) -------
         run.free_model_pars = [p for p in self.model_pars if p not in run.fix_pars]
 
-        global_pars = ["fesc", "ion_gas", "age_gas", "av", "av_ext",
-                    "alpha", "m_star", "vel_sys", "sigma_vel", "sigma_gas", "luminosity_distance", "redshift", "spec_noise_scale"]
+        global_pars = ["burst_mass_fraction","fesc", "ion_gas", "age_gas", "av", "av_ext",
+                    "alpha", "log_m_star", "vel_sys", "sigma_vel", "sigma_gas", "luminosity_distance", "redshift", "spec_noise_scale"]
 
         if not spec:
             print("No spectral data. Neglecting kinematics")
@@ -627,7 +670,7 @@ class PFitter():
 
         if not phot:
             print("No photometric data. Neglecting scaling")
-            run.fix_pars["m_star"] = 1
+            run.fix_pars["log_m_star"] = 1
             run.fix_pars["luminosity_distance"] = 1
             run.fix_pars["alpha"] = 1
 
@@ -635,7 +678,7 @@ class PFitter():
 
         # Printing
         for p in run.fix_pars.keys():
-            if p in global_pars: print(f'Fixed parameter: {p} = {run.fix_pars[p]}')
+            print(f'Fixed parameter: {p} = {run.fix_pars[p]}')
         for p in run.free_pars: 
             print('Fitting: ',p)
 
@@ -688,7 +731,6 @@ class PFitter():
                 pivot_wls[b] = F.pivot_wavelength
 
 
-          
         # --- closure used by the sampler ---
         def log_likelihood(pars):
             
@@ -705,13 +747,14 @@ class PFitter():
             model_kwargs = {k: p[k] for k in self.model_pars}
 
             # unpack named params for readability
+            burst_mass_fraction = p["burst_mass_fraction"]
             fesc = p["fesc"]
             ion_gas = p["ion_gas"]
             age_gas = p["age_gas"]
             av = p["av"]
             av_ext = p["av_ext"]
             alpha = p["alpha"]
-            m_star = p["m_star"]
+            log_m_star = p["log_m_star"]
             vel_sys = p["vel_sys"]
             sigma_vel = p["sigma_vel"]
             sigma_gas = p["sigma_gas"]
@@ -721,9 +764,10 @@ class PFitter():
 
 
             model_phot, final_spec = self.synthetic_spectrum(**model_kwargs,
+                        burst_mass_fraction=burst_mass_fraction,
                         fesc=fesc, ion_gas=ion_gas, age_gas=age_gas,
                         av=av, av_ext=av_ext, alpha=alpha,
-                        m_star=m_star,
+                        log_m_star=log_m_star,
                         luminosity_distance=luminosity_distance,
                         redshift=redshift,
                         vel_sys=vel_sys,sigma_vel=sigma_vel,sigma_gas=sigma_gas,
@@ -798,6 +842,7 @@ class PFitter():
 
         # default priors
         priors = {
+            'burst_mass_fraction':    {'type': 'uniform', 'low': 0, 'high': 1.0},
             'fesc':    {'type': 'uniform', 'low': -1.0, 'high': 1.0},
             'ion_gas': {'type': 'uniform', 'low': self.nebular_ions[0], 'high': self.nebular_ions[-1]},
             'age_gas': {'type': 'uniform', 'low': self.nebular_ages[0], 'high': self.nebular_ages[-1] + 1},
@@ -808,7 +853,7 @@ class PFitter():
                         'low': 0.0, 'high': 1.0},
 
             'alpha':   {'type': 'uniform', 'low': self.dustem_alpha[0], 'high': self.dustem_alpha[-1]},
-            'm_star':  {'type': 'uniform', 'low': 4.0, 'high': 12.0},
+            'log_m_star':  {'type': 'uniform', 'low': 4.0, 'high': 12.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
             'sigma_gas': {'type': 'uniform', 'low': 1.0, 'high': 500.0},
@@ -908,13 +953,28 @@ class PFitter():
 
 
 
+    """
+    ranges = spectral_range
+
+    if isinstance(ranges, np.ndarray) and ranges.ndim == 1 and ranges.size == 2:
+        ranges = [tuple(ranges.tolist())]
+    elif isinstance(ranges, list) and len(ranges) == 2 and all(np.isscalar(x) for x in ranges):
+        ranges = [tuple(ranges)]
+    elif isinstance(ranges, tuple) and len(ranges) == 2 and all(np.isscalar(x) for x in ranges):
+        ranges = [ranges]
+    
+    """
+
+
+    # atmospheric mask not depending on resolution! CHANGE IN FUTURE
+    from .pangal_utils import airtovac, vactoair
 
     def _preprocess_observed_spectrum(self, spec, spectral_range, atmospheric_lines):
         """
         Preprocess observed spectrum:
         - Accepts one range [wl1, wl2] or multiple ranges [[wl1, wl2], [wl3, wl4], ...]
         - Zeroes out flux and err outside allowed ranges
-        - Removes ±25 Å around each atmospheric line
+        - Removes ±5 Å around each atmospheric line
         """
 
         wl = spec.wl.copy()
@@ -941,12 +1001,16 @@ class PFitter():
             mask_ranges |= (wl >= wl1) & (wl <= wl2)
 
         # ------------------------------
-        # 3. Remove atmospheric lines ±25 Å
+        # 3. Remove atmospheric lines ±10 Å
         # ------------------------------
         mask_atm = np.ones_like(wl, dtype=bool)
         for line in atmospheric_lines:
             lam = atmospheric_lines[line]
-            bad = (wl >= lam - 25) & (wl <= lam + 25)
+
+            if spec.header['WAVESYS'] == 'VACUUM  ':
+                lam = self.airtovac(lam)
+
+            bad = (wl >= lam - 10) & (wl <= lam + 10)
             mask_atm &= ~bad  # remove these pixels
 
         # ------------------------------
@@ -1052,14 +1116,14 @@ class PFitter():
 
         
         if spec:
-            
+
             spec_crop = self._preprocess_observed_spectrum(spec,spectral_range,atmospheric_lines)
 
 
         
         # keys that match the explicit signature of synthetic_spectrum
         spec_keys = {
-            "fesc","ion_gas","age_gas","av","av_ext","alpha","m_star","redshift",
+            "burst_mass_fraction","fesc","ion_gas","age_gas","av","av_ext","alpha","log_m_star","redshift",
             "luminosity_distance","vel_sys","sigma_vel","sigma_gas","spec_noise_scale"
         }
             
@@ -1160,7 +1224,7 @@ class PFitter():
             #print('Photometric fitting:')
             #print('chi1: ',chi2,'  chi2_reduced: ',chi2/len(bands),'  logL: ',logL_phot)
 
-            title = f'$A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["m_star"]:.2f},  $d_L = ${params["luminosity_distance"]:.0f} Mpc'
+            title = f'$A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["log_m_star"]:.2f},  $d_L = ${params["luminosity_distance"]:.0f} Mpc'
             title += f',    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_phot:.2f}'
             
             synth_spec.plot(
