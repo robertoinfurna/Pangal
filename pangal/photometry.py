@@ -41,7 +41,6 @@ def photometry(self,
                region,
                bands=None,
                units='mJy',
-               threshold_quantile=0.9,
                n_background_regions=500,
                background_exclude_regions=[],
                print_output=True):
@@ -80,6 +79,7 @@ def photometry(self,
 
 
         image = self.images[band].data
+        valid_pixel_mask = np.isfinite(image) & (image != -999) #& (image != 0)  # remove NaN/inf 
         wcs = self.images[band].wcs
 
         if print_output:
@@ -113,7 +113,6 @@ def photometry(self,
         if outer_area > 10 * source_area:
 
             back_flux_arr = []
-            threshold = np.nanquantile(image[image > -999], threshold_quantile)
 
             mask_indices = np.argwhere(mask > 0)
             mask_values = mask[mask > 0]
@@ -128,19 +127,28 @@ def photometry(self,
                     shifted[:, 1].min() < 0 or shifted[:, 1].max() >= image.shape[1]):
                     continue
 
-                shifted_vals = image[shifted[:, 0], shifted[:, 1]]
-
-                if np.any(source_mask[shifted[:, 0], shifted[:, 1]]):
+        
+                yy = shifted[:, 0]
+                xx = shifted[:, 1]
+            
+                # reject apertures overlapping masked sources
+                if np.any(source_mask[yy, xx]):
                     continue
-                if np.any(np.isclose(shifted_vals, -999)):
+            
+                # reject apertures containing invalid / zero / NaN         
+                if not np.all(valid_pixel_mask[yy, xx]):
                     continue
-
+   
+                shifted_vals = image[yy, xx]
                 back_flux = np.nansum(shifted_vals * mask_values)
-                if back_flux < threshold * n:
-                    back_flux_arr.append(back_flux)
+                back_flux_arr.append(back_flux)
 
-            mean_background_flux = np.mean(back_flux_arr)
-            background_standard_dev = np.std(back_flux_arr)
+            # exclude outliars: sigma clipping
+            back_flux_arr = np.array(back_flux_arr)
+            clipped, low, high = sigmaclip(back_flux_arr, low=3, high=3)
+
+            mean_background_flux = np.median(clipped)
+            background_standard_dev = 1.4826 * np.median(np.abs(clipped - mean_background_flux))
 
         else:
             masked_image = np.where(source_mask, image, np.nan)
@@ -215,8 +223,9 @@ def photometry(self,
         # ---------------------------
         # Print output 
         # ---------------------------
-        if print_output: fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
-        print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} " f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
+        if print_output: 
+            fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
+            print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} " f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
 
         # ---------------------------
         # SAVE RESULT INTO REGION ENTRY
@@ -227,6 +236,8 @@ def photometry(self,
  
     return phot_table
     
+
+
 
 
 
@@ -278,6 +289,7 @@ def surface_brightness_profile(self,regions,units='mJy_arcsec2',bands=None,thres
             r = np.linspace(0.8*min(radii),1.2*max(radii))
             fun = function(r,*popt)
             ax.plot(r,fun, c=default_filter_colors[band], label=f"{nice_filter_names[band]}: fit ($\Sigma_0$={popt[0]:.1e}, $R_d$={popt[1]:.2f} kpc)")
+
 
     if 'mag' in units:
         import matplotlib.ticker as ticker
@@ -338,20 +350,20 @@ def surface_brightness_profile(self,regions,units='mJy_arcsec2',bands=None,thres
 
 from matplotlib.ticker import MaxNLocator
 from matplotlib.ticker import LogFormatter, NullFormatter, FuncFormatter
+from scipy.stats import sigmaclip
 
 def inspect_photometry(      
-               galaxy,
-               band,              # One band only
-               region,            # One region only
-               units='mJy',        # units of output 
-               threshold_quantile=0.9,
+               self,
+               band,              
+               region,          
+               units='mJy',       
                n_background_regions=500,
-               N_background_gaussians=3,
                background_exclude_regions = [],     
                region_plot_cmap='plasma',
                background_plot_cmap='viridis',
                bad_pixel_color='black',
                ):
+    
     """
     Perform aperture photometry with sky subtraction and error estimation.
 
@@ -367,28 +379,43 @@ def inspect_photometry(
     hdu : FITS HDU, optional
         If provided, photometry results will be stored in the HDU.
     """
-    self=galaxy
     
     if band not in self.images.keys():
         raise ValueError(f"Band '{band}' not found in self.images. Available bands: {list(self.images.keys())}")
-
-    print(f"### PHOTOMETRY, BAND: {band} ###")
+    
+    if units not in ['mJy', 'mJy_arcsec2', 'mag', 'mag_arcsec2', 'erg_s_cm2_A', 'erg_s_cm2_A_arcsec2']: #, 'erg_s_cm2', 'erg_s_cm2_arcsec2']:
+        raise ValueError('Unrecognized output units: must be "mJy", "mJy_arcsec2", "mag", "mag_arcsec2", "erg_s_cm2_A", "erg_s_cm2_A_arcsec2"') #, "erg_s_cm2", "erg_s_cm2_arcsec2"')
 
     if not isinstance(background_exclude_regions, (list, tuple)):
         background_exclude_regions = [background_exclude_regions]
-            
-    # Check units
-    if units not in ['mJy', 'mJy_arcsec2', 'mag', 'mag_arcsec2', 'erg_s_cm2_A', 'erg_s_cm2_A_arcsec2']: #, 'erg_s_cm2', 'erg_s_cm2_arcsec2']:
-        raise ValueError('Unrecognized output units: must be "mJy", "mJy_arcsec2", "mag", "mag_arcsec2", "erg_s_cm2_A", "erg_s_cm2_A_arcsec2"') #, "erg_s_cm2", "erg_s_cm2_arcsec2"')
-    
-    print("Units of output: ",units)
+                
+
+    print(f"### PHOTOMETRY, BAND: {band} ###")
 
     image = self.images[band].data
-
+    valid_pixel_mask = np.isfinite(image) & (image != -999) #& (image != 0)  # remove NaN/inf 
     wcs = self.images[band].wcs
 
 
     
+    # ---- Plotting pixel histogram ---- 
+
+    fig, ax = plt.subplots(1,2,figsize=(8, 4),constrained_layout=True)
+    ax[0].hist(image.flatten(), bins=100)
+    
+    vals = image[valid_pixel_mask].flatten()   
+    p1, p99 = np.nanquantile(vals, [0.001, 0.999])
+    vals_clipped = vals[(vals >= p1) & (vals <= p99)]
+    
+    ax[1].hist(vals_clipped, bins=100)
+    ax[1].set_yscale('log')
+
+    for i in range(2): ax[i].set_xlabel('native units')
+    
+    plt.show()
+
+
+
 
     # ---- Plotting ----
     fig, ax = plt.subplots(1,2,figsize=(18, 10),constrained_layout=True)
@@ -420,16 +447,18 @@ def inspect_photometry(
     ra_max, dec_min = region.wcs.all_pix2world([[0, 0]], 0)[0]
     ra_min, dec_max = region.wcs.all_pix2world([[nx, ny]], 0)[0]
     x_min, y_min = wcs.all_world2pix([[ra_max, dec_min]], 0)[0]
-    x_max, y_max = wcs.all_world2pix([[ra_min, dec_max]], 0)[0]               
-    dx = (x_max - x_min) / nx
-    dy = (y_max - y_min) / ny
-    X_low = np.linspace(x_min + dx/2, x_max - dx/2, nx)
-    Y_low = np.linspace(y_min + dy/2, y_max - dy/2, ny)
+    x_max, y_max = wcs.all_world2pix([[ra_min, dec_max]], 0)[0]    
+      
+    #dx = (x_max - x_min) / nx
+    #dy = (y_max - y_min) / ny
+    #X_low = np.linspace(x_min + dx/2, x_max - dx/2, nx)
+    #Y_low = np.linspace(y_min + dy/2, y_max - dy/2, ny)
+    X_low = np.linspace(x_min, x_max, nx) - 0.5
+    Y_low = np.linspace(y_min, y_max, ny) - 0.5
     X_low, Y_low = np.meshgrid(X_low, Y_low)
     for j in [0,1]:
         ax[j].contour(X_low,Y_low,region.mask,levels=[0.5],
             colors=region.color,linestyles=region.linestyle,linewidths=region.linewidth,alpha=region.alpha)    
-    
     
     mask = region.project(image, wcs)
     
@@ -458,6 +487,7 @@ def inspect_photometry(
     
 
 
+
     
     # Background plot!
     cmap = cm.get_cmap(background_plot_cmap).copy()
@@ -477,7 +507,6 @@ def inspect_photometry(
     # --- Add Ra Dec
     add_ra_dec_ticks(ax[1],image,wcs,4,4,12,12,)
 
-    
     ax_hist = ax[1].inset_axes([1.1, 0., 1.05, 0.85])
     ax_hist.set_xlabel(units_label, fontsize=12)
     ax_hist.tick_params(axis='both', which='major', labelsize=10)
@@ -509,7 +538,6 @@ def inspect_photometry(
 
 
 
-    
 
 
     # region mask
@@ -529,8 +557,8 @@ def inspect_photometry(
     if outer_area > 10 * source_area:
 
         back_flux_arr = []
+        region_contours = []
         
-        threshold = np.nanquantile(image[image>-999], threshold_quantile)
 
         mask_indices = np.argwhere(mask > 0)
         mask_values = mask[mask > 0]
@@ -541,31 +569,30 @@ def inspect_photometry(
         max_bad = 20
 
         while len(back_flux_arr) < n_background_regions:
-            dy = random.randint(- (image.shape[0] - 5), image.shape[0] - 5)
-            dx = random.randint(- (image.shape[1] - 5), image.shape[1] - 5)
+            dy = random.randint(-(image.shape[0] - 5), image.shape[0] - 5)
+            dx = random.randint(-(image.shape[1] - 5), image.shape[1] - 5)
             shifted = mask_indices + [dy, dx]
-            
+        
             # check if all shifted pixels are inside the image
-            if (shifted[:,0].min() < 0 or shifted[:,0].max() >= image.shape[0] or
-                shifted[:,1].min() < 0 or shifted[:,1].max() >= image.shape[1]):
-                continue  # reject this shift
-            shifted_vals = image[shifted[:, 0], shifted[:, 1]]
-
-            # extra checks
-            # background region must not overlap with the source region
-            if np.any(source_mask[shifted[:, 0], shifted[:, 1]]):
+            if (shifted[:, 0].min() < 0 or shifted[:, 0].max() >= image.shape[0] or
+                shifted[:, 1].min() < 0 or shifted[:, 1].max() >= image.shape[1]):
                 continue
-
-            # All pixels outside the original image that appear after rotation will be set to -999
-            # Exclude regions that follow even partially outside original image
-            if np.any(np.isclose(shifted_vals, -999, atol=1e-6)):
+        
+            yy = shifted[:, 0]
+            xx = shifted[:, 1]
+        
+            # reject apertures overlapping masked sources
+            if np.any(source_mask[yy, xx]):
                 continue
-
-            
+        
+            # reject apertures containing invalid / zero / NaN         
+            if not np.all(valid_pixel_mask[yy, xx]):
+               continue
+        
+            shifted_vals = image[yy, xx]
             back_flux = np.nansum(shifted_vals * mask_values)
 
-            if back_flux < threshold * n:
-                back_flux_arr.append(back_flux)
+            back_flux_arr.append(back_flux)
 
             # ---- plotting
             back_reg_plot = np.column_stack((shifted[:, 0], shifted[:, 1]))
@@ -573,26 +600,47 @@ def inspect_photometry(
             mask_plot[back_reg_plot[:, 0], back_reg_plot[:, 1]] = 1.0
             contours = measure.find_contours(mask_plot, level=0.5)
 
-            if back_flux < threshold * n and good_regions_plotted < max_good:
-                color = 'lime'
-                good_regions_plotted += 1
-            elif back_flux >= threshold * n and bad_regions_plotted < max_bad:
-                color = 'red'
-                bad_regions_plotted += 1
-            else:
-                continue
+            # store contours for later plotting
+            region_contours.append(contours)
 
+
+        # exclude outliars: sigma clipping
+        back_flux_arr = np.array(back_flux_arr)
+        clipped, low, high = sigmaclip(back_flux_arr, low=3, high=3)
+
+        mean_background_flux = np.median(clipped)
+        background_standard_dev = 1.4826 * np.median(np.abs(clipped - mean_background_flux))
+
+
+        # ---- plotting
+
+        max_good = 50
+        max_bad = 20
+        good_count = 0
+        bad_count = 0
+        
+        for flux, contours in zip(back_flux_arr, region_contours):
+            is_good = (low <= flux <= high)
+        
+            if is_good and good_count >= max_good:
+                continue
+            if (not is_good) and bad_count >= max_bad:
+                continue
+        
+            color = 'lime' if is_good else 'red'
+        
             for contour in contours:
                 ax[1].plot(contour[:, 1], contour[:, 0], color=color, linewidth=1.5, alpha=1)
-            # -----
+        
+            if is_good:
+                good_count += 1
+            else:
+                bad_count += 1
 
-        back_flux_arr = np.array(back_flux_arr)
-        mean_background_flux = np.mean(back_flux_arr)
-        background_standard_dev = np.std(back_flux_arr)
 
         
         # ---- plotting
-        
+    
         # bin width using Freedman Diaconis rule
         q_75 = np.nanquantile(back_flux_arr, 0.75)
         q_25 = np.nanquantile(back_flux_arr, 0.25)
@@ -608,50 +656,34 @@ def inspect_photometry(
         )
         bin_centers = (bins[:-1] + bins[1:]) / 2
         bin_width = bins[1] - bins[0]  # for scaling
+
         
-        # Prepare data for GMM
-        valid_data = back_flux_arr[~np.isnan(back_flux_arr)].reshape(-1, 1)
+        # fit ONE Gaussian
+        mu, sigma = stat_norm.fit(clipped)
         
-        # Fit GMM
-        gmm = GaussianMixture(n_components=int(N_background_gaussians), covariance_type='full', random_state=42)
-        gmm.fit(valid_data)
+        # x-axis for smooth curve
+        x_vals = np.linspace(q_01, q_99, 500)
         
-        # Extract parameters
-        means = gmm.means_.flatten()
-        weights = gmm.weights_.flatten()
-        stds = np.sqrt(gmm.covariances_.flatten())
+        # Gaussian PDF scaled to histogram counts
+        gauss_pdf = stat_norm.pdf(x_vals, mu, sigma)
+        gauss_scaled = gauss_pdf * len(clipped) * bin_width
         
-        # Sort by mean for consistency
-        sorted_idx = np.argsort(means)
-        means = means[sorted_idx]
-        weights = weights[sorted_idx]
-        stds = stds[sorted_idx]
+        # plot single Gaussian
+        ax_hist.plot(
+            x_vals,
+            gauss_scaled,
+            color='navy',
+            lw=2,
+            label=rf"Gaussian fit (clipped data): $\mu$={mu:.2e}, $\sigma$={sigma:.2e}"
+        )
+        ax_hist.axvline(x=mean_background_flux,color='crimson',ls='--',lw=1.5)
+        ax_hist.axvline(x=mean_background_flux+background_standard_dev,color='red',ls='--',lw=0.5)
+        ax_hist.axvline(x=mean_background_flux-background_standard_dev,color='red',ls='--',lw=0.5)
         
-        # X-axis for PDF plotting
-        x_vals = np.linspace(np.nanquantile(valid_data, 0.005), np.nanquantile(valid_data, 0.995), 500).reshape(-1, 1)
-        gmm_pdf = np.exp(gmm.score_samples(x_vals))
-        gmm_scaled = gmm_pdf * len(valid_data) * bin_width
-        
-        # Plot GMM total PDF
-        ax_hist.plot(x_vals, gmm_scaled, 'navy', lw=2, label=f'{N_background_gaussians:.0f}-Gaussian Mixture')
-        
-        # Plot individual Gaussian components
-        colors = ['red', 'green', 'purple']
-        for i, idx in enumerate(sorted_idx):
-            mu = means[i]
-            sigma = stds[i]
-            weight = weights[i]
+        ax_hist.legend(loc='upper left', bbox_to_anchor=(0.0, 1.13), fontsize=12)
+        ax_hist.set_xlim(-5*background_standard_dev,5*background_standard_dev)
             
-            # Individual Gaussian scaled to histogram
-            component_pdf = stat_norm.pdf(x_vals.flatten(), mu, sigma)
-            component_scaled = component_pdf * weight * len(valid_data) * bin_width
-            
-            ax_hist.plot(
-                x_vals, component_scaled, linestyle='--', lw=2, color=colors[i],
-                label=rf"$\mu$={mu:.2e}, $\sigma$={sigma:.2e}"
-            )
-        
-        ax_hist.legend(fontsize=12)
+    
 
     else:
         # SMALL FOV
@@ -678,6 +710,9 @@ def inspect_photometry(
         ax_hist.axvline(x=peak_value,linestyle=':',c='black',lw=2)
 
 
+
+
+    
 
 
     # photometry
@@ -716,6 +751,7 @@ def inspect_photometry(
     if total_flux_err / flux_sky_subtracted < 0.01:
         total_flux_err = 0.01 * flux_sky_subtracted
 
+
     if 'arcsec2' in units: 
         flux_sky_subtracted = flux_sky_subtracted / (n * self.images[band].area_pix_arcsec2)
         total_flux_err = total_flux_err / (n * self.images[band].area_pix_arcsec2)
@@ -751,7 +787,7 @@ def inspect_photometry(
     print('\n')
     
     ax[0].text(
-        0.02, 0.98,
+        0.00, 1.1,
         f"{nice_filter_names[band]}, region {region.id}\n"
         f"Flux and Poisson: {flux:g} ± {poisson_err:g}",
         transform=ax[0].transAxes,
@@ -766,8 +802,8 @@ def inspect_photometry(
     )
 
     ax[1].text(
-        0.02, 0.98,
-        f"Background: mean = {np.mean(back_flux_arr):g}, std = {np.std(back_flux_arr):g}",
+        0.00, 1.06,
+        f"All backgrounds: mean = {np.mean(back_flux_arr):g}, std = {np.std(back_flux_arr):g}",
         transform=ax[1].transAxes,
         fontsize=15,
         va="top",  # anchor top since you're near y=0.98
@@ -781,6 +817,3 @@ def inspect_photometry(
 
 
     plt.show()
-
-
-            

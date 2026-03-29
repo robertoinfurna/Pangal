@@ -54,15 +54,15 @@ class Region:
     Use one of the named constructors (from_circle, from_ellipse, from_ellipse_annulus)
     to build a region from sky geometry.
     """
-    header: fits.Header = field(default_factory=fits.Header)
     id: str = None
+    header: fits.Header = field(default_factory=fits.Header)
     mask: np.ndarray = None
     wcs: np.ndarray = None
     image_shape: tuple = None
-    galactocentric_radius: float = None
-    target_bands: np.ndarray = None
+    
 
     # Aesthetic defaults for plotting
+    target_bands = None
     color: str = 'cyan'
     linestyle: str = '-'
     linewidth: float = 2
@@ -71,53 +71,105 @@ class Region:
     caption_coords: tuple = None
     caption_fontsize: int = 10
 
-    # ------------------------------
+
+    def __post_init__(self):
+        if self.id is None:
+            raise ValueError("Region id must be provided.")
+        self.header["ID"] = self.id
+
+
+    # ============================================================
     # Named constructors
-    # ------------------------------
+    # ============================================================
+
     @classmethod
-    def circle(cls, ra_center, dec_center, radius, wcs, image_shape, **kwargs):
+    def circle(cls, id, ra_center, dec_center, radius, wcs, image_shape, **kwargs):
         if wcs is None or image_shape is None:
             raise ValueError("WCS and image_shape must be provided for CircleRegion.")
 
         sky_region = CircleSkyRegion(
-            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame='fk5'),
+            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame="fk5"),
             radius=radius * u.deg
         )
-        mask = sky_region.to_pixel(wcs).to_mask(mode='center').to_image(image_shape).astype(bool)
-        return cls(mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        mask = sky_region.to_pixel(wcs).to_mask(mode="center").to_image(image_shape).astype(bool)
+
+        # build object and write parameters
+        self = cls(id=id, mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        # Write specific metadata
+        self.header["SHAPE"] = 'circle'
+        self.header["RA"] = ra_center
+        self.header["DEC"] = dec_center
+        self.header["RADIUS"] = radius
+
+        return self
+
 
     @classmethod
-    def ellipse(cls, ra_center, dec_center, semimajor_axis, axis_ratio, angle, wcs, image_shape, **kwargs):
+    def ellipse(cls, id, ra_center, dec_center, semimajor_axis, axis_ratio,
+                angle, wcs, image_shape, **kwargs):
+
         if wcs is None or image_shape is None:
             raise ValueError("WCS and image_shape must be provided for EllipseRegion.")
 
         sky_region = EllipseSkyRegion(
-            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame='fk5'),
+            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame="fk5"),
             width=2 * semimajor_axis * u.deg,
             height=2 * semimajor_axis * u.deg * axis_ratio,
             angle=angle * u.deg
         )
-        mask = sky_region.to_pixel(wcs).to_mask(mode='center').to_image(image_shape).astype(bool)
-        return cls(mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        mask = sky_region.to_pixel(wcs).to_mask(mode="center").to_image(image_shape).astype(bool)
+
+        self = cls(id=id, mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        # Header metadata
+        self.header["SHAPE"] = 'ellipse'
+        self.header["RA"] = ra_center
+        self.header["DEC"] = dec_center
+        self.header["SMA"] = semimajor_axis
+        self.header["AXRATIO"] = axis_ratio
+        self.header["ANGLE"] = angle
+
+        return self
+
 
     @classmethod
-    def ellipse_annulus(cls, ra_center, dec_center, semimajor_axis, axis_ratio, angle, dr, wcs, image_shape, **kwargs):
+    def ellipse_annulus(cls, id, ra_center, dec_center, semimajor_axis, axis_ratio,
+                        angle, dr, wcs, image_shape, **kwargs):
+
         if wcs is None or image_shape is None:
             raise ValueError("WCS and image_shape must be provided for EllipseAnnulusRegion.")
 
-        if semimajor_axis - dr / 2 <= 0:
-            semimajor_axis = dr / 2 + 1e-5  # avoid negative inner radius
+        # Ensure valid inner radius
+        if semimajor_axis - dr/2 <= 0:
+            semimajor_axis = dr/2 + 1e-5
 
         sky_region = EllipseAnnulusSkyRegion(
-            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame='fk5'),
+            center=SkyCoord(ra=ra_center * u.deg, dec=dec_center * u.deg, frame="fk5"),
             inner_width=2 * (semimajor_axis - dr/2) * u.deg,
             inner_height=2 * (semimajor_axis - dr/2) * u.deg * axis_ratio,
             outer_width=2 * (semimajor_axis + dr/2) * u.deg,
             outer_height=2 * (semimajor_axis + dr/2) * u.deg * axis_ratio,
             angle=angle * u.deg
         )
-        mask = sky_region.to_pixel(wcs).to_mask(mode='center').to_image(image_shape).astype(bool)
-        return cls(mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        mask = sky_region.to_pixel(wcs).to_mask(mode="center").to_image(image_shape).astype(bool)
+
+        self = cls(id=id, mask=mask, wcs=wcs, image_shape=image_shape, **kwargs)
+
+        # Header metadata
+        self.header["SHAPE"] = 'ellipse annulus'
+        self.header["RA"] = ra_center
+        self.header["DEC"] = dec_center
+        self.header["SMA"] = semimajor_axis
+        self.header["AXRATIO"] = axis_ratio
+        self.header["ANGLE"] = angle
+        self.header["DR"] = dr
+
+        return self
+
 
 
     # Core function of this class
@@ -138,19 +190,67 @@ class Region:
         if self.wcs.wcs.compare(new_wcs.wcs):  # compare WCS objects directly
             new_mask = self.mask.astype(float)
         
-        elif new_resolution >= old_resolution: 
-    
-            x_grid = np.arange(new_image.shape[1])
-            y_grid = np.arange(new_image.shape[0])
-            X, Y = np.meshgrid(x_grid, y_grid)
+
+        #elif new_resolution >= old_resolution: 
+        #
+        #    x_grid = np.arange(new_image.shape[1])
+        #    y_grid = np.arange(new_image.shape[0])
+        #    X, Y = np.meshgrid(x_grid, y_grid)
                                 
-            counter = Counter((np.digitize(y, Y[:, 0])-1, np.digitize(x, X[0, :])-1) for x, y in x_y)  
-            normalization_factor = (new_resolution / old_resolution)**2
-            for (i, j), n in counter.items():
-                mask_pixel_value = min(1, n / normalization_factor)
-                if mask_pixel_value > 0.9: mask_pixel_value = 1    # UVIT needs this
-                new_mask[i, j] = mask_pixel_value
+        #    counter = Counter((np.digitize(y, Y[:, 0])-1, np.digitize(x, X[0, :])-1) for x, y in x_y)  
+        #    normalization_factor = (new_resolution / old_resolution)**2
+        #    for (i, j), n in counter.items():
+        #        mask_pixel_value = min(1, n / normalization_factor)
+        #        if mask_pixel_value > 0.9: mask_pixel_value = 1    # UVIT needs this
+        #        new_mask[i, j] = mask_pixel_value
+        #    new_mask = median_filter(new_mask, size=3)
+
+
+
+        elif new_resolution >= old_resolution:
+
+
+            # Projected pixel coordinates in new image
+            x_new = x_y[:, 0]
+            y_new = x_y[:, 1]
+
+            # Assign each old pixel to a new pixel (pixel index)
+            j = np.floor(x_new).astype(int)
+            i = np.floor(y_new).astype(int)
+
+            # Keep only valid pixels
+            valid = (
+                (i >= 0) & (i < new_image.shape[0]) &
+                (j >= 0) & (j < new_image.shape[1])
+            )
+
+            i = i[valid]
+            j = j[valid]
+
+            # Count how many old pixels fall into each new pixel
+            counter = Counter(zip(i, j))
+
+            # Area normalization factor
+            # (how many old pixels fit into one new pixel)
+            area_ratio = (new_resolution / old_resolution) ** 2
+
+            for (i_pix, j_pix), n in counter.items():
+                frac = n / area_ratio
+
+                # Clip to [0,1]
+                if frac > 1:
+                    frac = 1.0
+
+                # Optional hard threshold (UVIT workaround)
+                if frac > 0.9:
+                    frac = 1.0
+
+                new_mask[i_pix, j_pix] = frac
+
+            # Optional cosmetic smoothing (DO NOT overdo this)
             new_mask = median_filter(new_mask, size=3)
+
+
 
         
         elif new_resolution < old_resolution:  # HST versus MUSE case
@@ -177,14 +277,19 @@ class Region:
         
         return new_mask
     
-    
 
+
+
+    
+    # Aesthetic for plotting
     def plot_aesthetic(self, color=None, linestyle=None, linewidth=None, alpha=None, label=None, caption_coords=None, caption_fontsize=None):
         for key, val in {'color': color, 'linestyle': linestyle, 'linewidth': linewidth, 'alpha': alpha,
                          'label': label, 'caption_coords': caption_coords,
                          'caption_fontsize': caption_fontsize}.items():
             setattr(self, key, val if val is not None else getattr(self, key))
             
+
+
 
     def to_ds9(self, filepath: str, system: str = 'fk5', append: bool = False):
         """
@@ -277,52 +382,5 @@ class Region:
 
 
 ####################################################################################################################à
-
-
-
-            
-@dataclass
-class Point:
-    coords: tuple = None
-    color: str = 'white'
-    m: str = '+'
-    s: float = 50
-    caption: str = None
-    caption_fontsize: float = 12
-    caption_offset: tuple = (0.02,0.02)
-
-    target_bands: np.array=None      # List of bands where to plot point
-
-    def plot_aesthetic(self, color=None, m=None, s=None, caption=None, caption_fontsize=None):
-        self.color = color or self.color
-        self.m = m or self.m
-        self.s = s or self.s
-        self.caption = caption if caption is not None else self.caption
-        self.caption_fontsize = caption_fontsize or self.caption_fontsize
-        self.caption_offset = caption_fontsize or self.caption_offset
-
-@dataclass
-class Contours:
-    header: fits.Header = field(default_factory=fits.Header)  # FITS header 
-    image: np.ndarray=None                              # image to compute contours on 
-    wcs: WCS=None                                       # Astropy WCS object of the image
-    levels: np.array=None                               
-
-    target_bands: np.array=None                         # List of bands where to plot contours
-    
-    # aesthetic defaults for plotting
-    color: str = 'red'
-    linestyle: str = '-'
-    linewidth: float = 2
-    alpha: float = 1
-    label: str = None
-    clabel_fmt: str = None
-    clabel_fontsize: float = 12
-
-
-    def plot_aesthetic(self, color=None, linestyle=None, linewidth=None, alpha=None, label=None, clabel_fmt=None, clabel_fontsize=None):
-        for key, val in {'color': color, 'linestyle': linestyle, 'linewidth': linewidth, 'alpha': alpha,
-                         'label': label, 'clabel_fmt': clabel_fmt, 'clabel_fontsize': clabel_fontsize}.items():
-            setattr(self, key, val if val is not None else getattr(self, key))
 
 

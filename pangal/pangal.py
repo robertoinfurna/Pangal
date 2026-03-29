@@ -63,6 +63,7 @@ from .pangal_utils import area_pixel, dtheta_pixel, cut_and_rotate, correct_coor
 # https://www.astronomy.ohio-state.edu/martini.10/usefuldata.html    Vega-to-AB conversions
 # https://hst-docs.stsci.edu/wfc3ihb/chapter-6-uvis-imaging-with-wfc3/6-5-uvis-spectral-elements   HST-UVIS 
 # https://archive.stsci.edu/manuals/archive_handbook/chap4.html      GALEX
+# https://www.cfht.hawaii.edu/Instruments/Imaging/MegaCam/specsinformation.html CFHT MegaCam
 # https://www.iiap.res.in/projects/uvit/instrument/filters/          UVIT
 
 
@@ -247,6 +248,38 @@ class PanGal:
         
                 image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov, position_angle=position_angle)
                 
+
+            # https://www.cfht.hawaii.edu/Instruments/Imaging/MegaCam/specsinformation.html
+            elif 'cfht' in file.lower():
+            
+                print('Processing CFHT MegaCam file: ',file)
+        
+                header = hdul[0].header
+        
+                filter = hdul[0].header['FILTER'][0].lower()
+                band = 'cfht_megacam_'+filter
+                cfht_megacam_wavelengths = {'u': 3550, 'g': 4750, 'r': 6400, 'i': 7760, 'z': 9250}
+                pivot_wavelength = cfht_megacam_wavelengths[filter]
+
+                # native image are given in nanomaggy
+                # header['NMGY'] gives counts/s to nanomaggy
+                # m_AB = -2.5 * log10(flux) + PHOTZP
+        
+                # internal SWarp units
+                ZP = 30.0
+                ZP_err = 0.02 ## ??
+ 
+                exptime = float(header['EXPTIME']) 
+
+                wcs = WCS(header)
+                dtheta_pix_deg = dtheta_pixel(wcs)
+                area_pix_deg2 = area_pixel(wcs)
+                area_pix_arcsec2 = area_pix_deg2 * 3600**2
+        
+                image = hdul[0].data
+                image, wcs = cut_and_rotate(image, wcs=wcs, target_coords=self.target_coords, fov=self.fov,)
+                
+
                 
             elif 'hst' in file.lower():
             
@@ -645,11 +678,12 @@ class PanGal:
                 for line in top_galaxy_lines:
                     print(f' Building {line} image')
                     base_name = f"{self.cubes.muse.id}_{line}"
+                    
                     image_name = base_name
-                    i = 1
+                    ii = 1
                     while image_name in self.images:
-                        image_name = f"{base_name}({i})"
-                        i += 1
+                        image_name = f"{base_name}({ii})"
+                        ii += 1
     
                     self.images[image_name] = self.cubes.muse.line_map(line=line, width=10, continuum_offset_1=50, continuum_offset_2=50, z=self.z)
                 

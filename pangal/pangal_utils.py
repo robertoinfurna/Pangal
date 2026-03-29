@@ -167,6 +167,10 @@ def correct_coords_offset(self, bands, offset):
                     raise AttributeError(f"WCS is missing or malformed in band '{band}': {e}")
    
    
+
+
+
+   
 def mosaic(self, image_list, weight_list=None):
     """
     Combines several Image objects (self.images[..]) in a single mosaic 
@@ -210,7 +214,7 @@ def mosaic(self, image_list, weight_list=None):
     for ID in image_list:
 
         Im = self.images[ID]
-        image = Im.image  # suppose all with same bunit
+        image = Im.data  # suppose all with same bunit
         wcs = Im.wcs
         
         ny, nx = image.shape
@@ -238,7 +242,7 @@ def mosaic(self, image_list, weight_list=None):
     for ID in image_list:
 
         Im = self.images[ID]
-        image = Im.image  # suppose all with same bunit
+        image = Im.data  # suppose all with same bunit
         wcs = Im.wcs
         
         ny_in, nx_in = image.shape
@@ -267,7 +271,7 @@ def mosaic(self, image_list, weight_list=None):
     #    mosaic_image /= np.where(weight == 0, np.nan, weight)
         
     mosaic_Image = Image(
-        image=mosaic_image,
+        data=mosaic_image,
         wcs=wcs_new,
         dtheta_pix_deg=dtheta,
         area_pix_arcsec2=area_pix_arcsec2,
@@ -323,4 +327,26 @@ def MW_extinction(self,lam,plot=False):
 
 
 
+
+def vactoair(wl):
+    """Convert vacuum wavelengths to air wavelengths using the conversion
+    given by Morton (1991, ApJS, 77, 119).
+
+    """
+    wave2 = np.asarray(wl, dtype=float)**2
+    fact = 1. + 2.735182e-4 + 131.4182/wave2 + 2.76249e8/(wave2*wave2)
+    return wl/fact
+
+
+def airtovac(wl):
+    """Convert air wavelengths to vacuum wavelengths using the conversion
+    given by Morton (1991, ApJS, 77, 119).
+
+    """
+    sigma2 = np.asarray(1E4/wl, dtype=float)**2
+    
+    fact = 1. + 6.4328e-5 + 2.949281e-2/(146.-sigma2) + 2.5540e-4/(41.-sigma2)
+    fact[wl < 2000] = 1.0
+    
+    return wl*fact
 

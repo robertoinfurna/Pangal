@@ -30,65 +30,11 @@ from .image import Image
 from .cube import Cube
 from .region import Region 
 from .filter import Filter, list_filters, plot_filters, map_filter_names, nice_filter_names
+from .filter import default_cmaps, default_filter_colors, default_plot_units, default_plot_scale_lims
 
 
 # INTERACTIVE SKY COORDS NOT WORKING!!
 # BBOX STILL BELOW COLORBAR!
-
-
-default_cmaps = {
-    'galex_fuv': 'gnuplot', 'galex_nuv': 'gnuplot2', 
-    'muse_blue': 'bone', 'muse_green': 'viridis','muse_red': 'hot', 'muse_nir': 'copper', 'muse_white_aoe': 'gray',
-    'muse_Ha': 'plasma', 'muse_Hb': 'inferno', 'muse_SII': 'viridis', 
-    **{band: 'gray' for band in map_filter_names if band.startswith('hst')},
-    'sdss_u': 'Blues_r','sdss_g': 'Greens_r', 'sdss_r': 'Reds_r', 'sdss_i': 'YlOrBr_r', 'sdss_z': 'Greys_r',
-    '2mass_j': 'PuRd_r', '2mass_h': 'BuPu_r', '2mass_ks': 'Oranges_r', 
-    **{f'wise_w{band}': 'viridis' for band in ['1','2','3','4']},
-    **{band: 'nipy_spectral' for band in map_filter_names if band.startswith('spitzer_irac')},
-    'herschel_pacs_70um': 'Blues_r', 'herschel_pacs_100um': 'Greens_r', 'herschel_pacs_160um': 'Reds_r'
-    }
-    
-default_filter_colors = { 
-    'galex_fuv': 'violet', 'galex_nuv': 'darkblue', 
-    'muse_blue': 'blue', 'muse_green': 'green', 'muse_red': 'red', 'muse_nir': 'gold', 'muse_white_aoe':'gray',
-    'muse_Ha': 'orange', 'muse_Hb': 'purple', 'muse_sii': 'lime',
-    **{band: 'purple' for band in map_filter_names if band.startswith('hst')},
-    'sdss_u': 'midnightblue', 'sdss_g': 'cyan', 'sdss_r': 'orangered', 
-    'sdss_i': 'red', 'sdss_z': 'darkred',
-    '2mass_j': 'pink', '2mass_h': 'purple', '2mass_ks': 'darkviolet',
-    **{f'wise_w{band}': 'brown' for band in ['1','2','3','4']},
-    'spitzer_irac_1': 'teal', 'spitzer_irac_2': 'lightgreen', 
-    'spitzer_irac_3': 'orange', 'spitzer_irac_4': 'darkred',
-    'herschel_pacs_70um': 'lime', 'herschel_pacs_100um': 'lime', 'herschel_pacs_160um': 'lime'
-}    
-
-        
-default_plot_units = {
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('galex')},
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('uvit')},
-    'muse_blue': 'mag_arcsec2','muse_green': 'mag_arcsec2', 'muse_red': 'mag_arcsec2', 'muse_nir': 'mag_arcsec2', 'muse_white_aoe': 'mag_arcsec2',
-    'muse_Ha': 'erg_s_cm2_arcsec2', 'muse_Hb': 'erg_s_cm2_arcsec2',
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('hst')},
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('sdss')},
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('2mass')},
-    **{band: 'mag_arcsec2' for band in map_filter_names if band.startswith('wise')},
-    **{band: 'MJy_sr' for band in map_filter_names if band.startswith('spitzer')},
-    **{band: 'MJy_sr' for band in map_filter_names if band.startswith('herschel')},
-}
-
-default_plot_scale_lims = {
-    'FUV': (22, 27), 'NUV': (22, 27), 
-    'galex_fuv': (22, 27), 'galex_nuv': (22, 27), 
-    'muse_blue': (20, 27),'muse_green': (20, 27), 'muse_red': (20, 27), 'muse_nir': (20, 27), 'muse_white_aoe': (20,27),
-    'muse_Ha': (1e-19, 1e-14), 'muse_Hb': (1e-19, 1e-14),
-    **{band: (19, 27) for band in map_filter_names if band.startswith('hst')},
-    **{f'sdss_{band}': (20, 27) for band in ['u', 'g', 'r', 'i', 'z']},
-    '2mass_j': (15, 22), '2mass_h': (15, 22), '2mass_ks': (15, 21), 
-    **{f'wise_w{band}': (15, 22) for band in ['1','2','3','4']},
-    'spitzer_irac_1': (6e-2, 10), 'spitzer_irac_2': (1e-1, 10), 'spitzer_irac_3': (1, 10), 'spitzer_irac_4': (5, 100),
-    'herschel_pacs_70um': (10, 100), 'herschel_pacs_100um': (10, 100), 'herschel_pacs_160um': (10, 100)
-}
-         
 
 
             
@@ -591,7 +537,7 @@ def plot_false_color(self,
             title,
             color=title_color,
             fontsize=title_fontsize,
-            ha='center',       # orizzontale: left, center, right
+            ha='left',       # orizzontale: left, center, right
             va='bottom',       # verticale: bottom, center, top
             transform=ax.transAxes  # usa coordinate relative all'axes
         )

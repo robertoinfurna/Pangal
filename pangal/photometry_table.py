@@ -125,6 +125,36 @@ class PhotometryTable:
             header=new_header,
         )
 
+
+    # =========================================================
+    # --- Normalize to one band
+    # =========================================================
+    def normalize(self,normalize_to) -> "PhotometryTable":
+
+        new_data = {}
+
+        flux_of_reference, err_of_reference = self.data[normalize_to]
+
+        for band, (flux, err) in self.data.items():
+
+            flux_norm = flux / flux_of_reference
+
+            err_norm = np.sqrt(err**2/flux_of_reference**2 + flux**2/flux_of_reference**4 * err_of_reference**2)
+
+            new_data[band] = (flux_norm, err_norm if err_norm else None)
+
+        new_header = self.header.copy()
+        new_header["UNITS"] = "dimensionless"
+
+        return PhotometryTable(
+            data=new_data,
+            header=new_header,
+        )
+
+
+
+
+
     # ==========================================================
     # --- Display
     # ==========================================================

@@ -644,7 +644,7 @@ class PFitter():
             print(f"Using the following photometric filters: {', '.join(run.bands)}")
             
             run.treat_as_upper_limits = treat_as_upper_limits
-            print(f"Setting as upper limits: {', '.join(run.bands)}")
+            print(f"Setting as upper limits: {', '.join(run.treat_as_upper_limits)}")
 
             run.phot = phot
             
@@ -1105,7 +1105,6 @@ class PFitter():
         
 
         if phot:
-            
             if bands:
                 for b in bands:
                     if b not in map_filter_names.keys():
@@ -1116,9 +1115,8 @@ class PFitter():
 
         
         if spec:
-
             spec_crop = self._preprocess_observed_spectrum(spec,spectral_range,atmospheric_lines)
-
+        else: spec_crop = None
 
         
         # keys that match the explicit signature of synthetic_spectrum
