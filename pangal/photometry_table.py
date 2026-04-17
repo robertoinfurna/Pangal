@@ -20,10 +20,7 @@ class PhotometryTable:
     data: Dict[str, Tuple[float, Optional[float]]] = field(default_factory=dict)
     header: fits.Header = field(default_factory=fits.Header)
 
-    # ==========================================================
-    # --- Validation
-    # ==========================================================
-
+    # validation
     def validate(self):
         for band, val in self.data.items():
             if not isinstance(val, (tuple, list)) or len(val) < 1:
@@ -37,10 +34,7 @@ class PhotometryTable:
 
             self.data[band] = (value, error)
 
-    # ==========================================================
-    # --- Units
-    # ==========================================================
-
+    # units
     def check_units(self):
         for key in ("UNITS", "BUNIT", "units", "bunit"):
             if key in self.header:
@@ -48,10 +42,7 @@ class PhotometryTable:
 
         raise ValueError("Missing photometry units in FITS header")
 
-    # ==========================================================
-    # --- Conversions
-    # ==========================================================
-
+    # conversion
     @staticmethod
     def mJy_to_Jy(f_mJy):
         return np.asarray(f_mJy, dtype=float) * 1e-3
@@ -73,9 +64,7 @@ class PhotometryTable:
         c = 2.99792458e18  # Å/s
         fnu = f_mJy * 1e-26
         return fnu * c / (wavelength_A ** 2)
-
-    # ----------------------------------------------------------
-
+    
     def to_ABmag(self) -> "PhotometryTable":
         units = self.check_units()
         if units != "mjy":
@@ -98,8 +87,6 @@ class PhotometryTable:
             data=new_data,
             header=new_header,
         )
-
-    # ----------------------------------------------------------
 
     def to_flam(self) -> "PhotometryTable":
         units = self.check_units()
@@ -126,9 +113,7 @@ class PhotometryTable:
         )
 
 
-    # =========================================================
-    # --- Normalize to one band
-    # =========================================================
+    # Normalize to one band
     def normalize(self,normalize_to) -> "PhotometryTable":
 
         new_data = {}
@@ -153,23 +138,29 @@ class PhotometryTable:
 
 
 
-
-
-    # ==========================================================
-    # --- Display
-    # ==========================================================
-
     def print(self):
         df = pd.DataFrame.from_dict(
             self.data, orient="index", columns=["Value", "Error"]
         )
-        if "Error" in df:
-            df["SNR"] = df["Value"] / df["Error"]
-        return df
 
-    # ==========================================================
-    # --- FITS I/O (single object)
-    # ==========================================================
+        # Compute SNR
+        df["SNR"] = df["Value"] / df["Error"]
+
+        # Formatting helpers
+        def format_flux(row):
+            if pd.isna(row["Error"]):
+                return f"{row['Value']:.3e}"
+            return f"{row['Value']:.3e} ± {row['Error']:.3e}"
+
+        def format_snr(row):
+            if pd.isna(row["Error"]):
+                return "upper limit"
+            return f"{row['SNR']:.1f}"
+
+        df["Flux"] = df.apply(format_flux, axis=1)
+        df["SNR"] = df.apply(format_snr, axis=1)
+
+        return df[["Flux", "SNR"]]
 
     def to_fits(self, filename: str, overwrite: bool = True):
         self.validate()
@@ -268,9 +259,6 @@ class PhotometryCatalog:
                 self.tables[object_id] = table
                 
 
-    # ==========================================================
-    # --- Container behavior
-    # ==========================================================
 
     def __len__(self):
         return len(self.tables)
@@ -281,9 +269,6 @@ class PhotometryCatalog:
     def __getitem__(self, key):
         return self.tables[key]
 
-    # ==========================================================
-    # --- FITS I/O (many objects)
-    # ==========================================================
 
     @classmethod
     def from_fits(cls, filename: str) -> "PhotometryCatalog":
@@ -341,21 +326,10 @@ class PhotometryCatalog:
 
         hdul.writeto(filename, overwrite=overwrite)
 
-    # ==========================================================
-    # --- Pretty-print
-    # ==========================================================
 
     def print(self, nice_filter_names=None, snr_threshold=5):
-        """
-        Pretty print photometry for all objects in the catalog.
-        Returns a pandas Styler:
-            - Columns = object IDs
-            - Rows = bands
-            - Cells = "value ± error (SNR)"
-            - Low-SNR highlighted in red
-        """
+
         combined = {}
-        snr_map = {}
         units = None
 
         for obj_id, table in self.tables.items():
@@ -365,31 +339,24 @@ class PhotometryCatalog:
             df = pd.DataFrame.from_dict(
                 table.data, orient="index", columns=["Value", "Error"]
             )
+
+            # Compute SNR only where Error is valid
             df["SNR"] = df["Value"] / df["Error"]
+            df.loc[df["Error"].isna(), "SNR"] = pd.NA
 
             if nice_filter_names:
                 df.index = [nice_filter_names.get(b, b) for b in df.index]
 
-            formatted = df.apply(
-                lambda row: f"{row['Value']:.3f} ± {row['Error']:.3f} ({row['SNR']:.1f})",
-                axis=1
-            )
+            def format_row(row):
+                if pd.isna(row["Error"]):
+                    return f"{row['Value']:.3f} (upper limit)"
+                return f"{row['Value']:.3f} ± {row['Error']:.3f} ({row['SNR']:.1f})"
 
-            combined[obj_id] = formatted
-            snr_map[obj_id] = df["SNR"]
+            combined[obj_id] = df.apply(format_row, axis=1)
 
         result = pd.DataFrame(combined)
-        snr_df = pd.DataFrame(snr_map)
 
-        # Highlight low-SNR cells
-        def highlight(col):
-            return [
-                "color: red" if snr <= snr_threshold else ""
-                for snr in snr_df[col.name]
-            ]
-
-        styled = result.style.apply(highlight, axis=0)
-        styled.set_caption(f"Units: {units}")
+        styled = result.style.set_caption(f"Units: {units}")
 
         return styled
 

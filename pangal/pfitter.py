@@ -644,6 +644,9 @@ class PFitter():
             print(f"Using the following photometric filters: {', '.join(run.bands)}")
             
             run.treat_as_upper_limits = treat_as_upper_limits
+            bad = [b for b in run.treat_as_upper_limits if b not in map_filter_names]
+            if bad:
+                raise ValueError(f'Unrecognized filter(s): {bad}. Abort')
             print(f"Setting as upper limits: {', '.join(run.treat_as_upper_limits)}")
 
             run.phot = phot
@@ -702,21 +705,26 @@ class PFitter():
 
         if phot: 
 
-            obs_phot = np.array([run.phot.data[b][0] for b in run.bands])
-            obs_errors = np.array([run.phot.data[b][1] for b in run.bands])
+            obs_phot = np.array([run.phot.data[b][0] for b in run.bands], dtype=float)
+            obs_errors = np.array([run.phot.data[b][1] for b in run.bands], dtype=float)
             phot_units = phot.header["UNITS"]
 
-            # Upper limits
+            # Any band with error = NaN is an upper limit by convention.
+            # Manual ULs are added on top, but only if the stored value is a valid positive UL.
+            mask_ul = np.array([
+                (np.isnan(run.phot.data[b][1])) or
+                (
+                    b in run.treat_as_upper_limits
+                    and not np.isnan(run.phot.data[b][1])
+                )
+                for b in run.bands
+            ], dtype=bool)
 
-            bad = [b for b in run.treat_as_upper_limits if b not in map_filter_names]
-            if bad:
-                raise ValueError(f'Unrecognized filter(s): {bad}. Abort')
-            
-            mask_ul = np.array([b in run.treat_as_upper_limits for b in run.bands], dtype=bool)
-            
-            # for upper limits: flux -> 0, error -> original flux (your logic)
+            # Convert to fitting convention: UL -> (0, upper_limit_flux)
             obs_errors[mask_ul] = obs_phot[mask_ul]
             obs_phot[mask_ul] = 0.0
+
+
 
             # Set filter trasmission curves
             trans_mask = {}
@@ -982,9 +990,7 @@ class PFitter():
         err = spec.flux_err.copy()
         resolution = spec.resolution.copy()
 
-        # ------------------------------
-        # 1. Normalize spectral_range to list of intervals
-        # ------------------------------
+        # Normalize spectral_range to list of intervals
         if isinstance(spectral_range[0], (int, float)):
             # Single range -> wrap it
             ranges = [spectral_range]
@@ -992,17 +998,13 @@ class PFitter():
             # Already list of lists
             ranges = spectral_range
 
-        # ------------------------------
-        # 2. Build mask for inside ANY allowed spectral window
-        # ------------------------------
+        # Build mask for inside ANY allowed spectral window
         mask_ranges = np.zeros_like(wl, dtype=bool)
         for r in ranges:
             wl1, wl2 = r
             mask_ranges |= (wl >= wl1) & (wl <= wl2)
 
-        # ------------------------------
-        # 3. Remove atmospheric lines ±10 Å
-        # ------------------------------
+        # Remove atmospheric lines ±15 Å
         mask_atm = np.ones_like(wl, dtype=bool)
         for line in atmospheric_lines:
             lam = atmospheric_lines[line]
@@ -1010,23 +1012,17 @@ class PFitter():
             if spec.header['WAVESYS'] == 'VACUUM  ':
                 lam = self.airtovac(lam)
 
-            bad = (wl >= lam - 10) & (wl <= lam + 10)
+            bad = (wl >= lam - 15) & (wl <= lam + 15)
             mask_atm &= ~bad  # remove these pixels
 
-        # ------------------------------
-        # 4. Combined mask for valid pixels
-        # ------------------------------
+        # Combined mask for valid pixels
         mask_valid = mask_ranges & mask_atm
 
-        # ------------------------------
-        # 5. Zero out invalid pixels (requested behavior)
-        # ------------------------------
+        # Zero out invalid pixels (requested behavior)
         flux[~mask_valid] = 0.0
         err[~mask_valid] = 0.0   # error=0 means "ignore these pixels"
 
-        # ------------------------------
-        # 6. Remove NaNs, infs, negative errors INSIDE valid regions
-        # ------------------------------
+        # Remove NaNs, infs, negative errors INSIDE valid regions
         good = np.isfinite(wl) & np.isfinite(flux) & np.isfinite(err) & (err >= 0)
         # Keep invalid pixels zero, but we only mask bad valid ones:
         mask_final = mask_valid & good
@@ -1035,9 +1031,7 @@ class PFitter():
         flux[~mask_final] = np.nan
         err[~mask_final] = np.nan
 
-        # ------------------------------
-        # 7. Trim spectrum to first/last valid pixel
-        # ------------------------------
+        # Trim spectrum to first/last valid pixel
         valid = np.isfinite(flux) & (flux != 0)
 
         if np.any(valid):
@@ -1113,6 +1107,7 @@ class PFitter():
             else:
                 bands = [b for b in phot.data.keys() if b in map_filter_names.keys()]
 
+            
         
         if spec:
             spec_crop = self._preprocess_observed_spectrum(spec,spectral_range,atmospheric_lines)
@@ -1158,21 +1153,26 @@ class PFitter():
 
         
         if phot:
-        
-            phot_fluxes = np.array([phot.data[b][0] for b in bands])
-            phot_errors = np.array([phot.data[b][1] for b in bands]) 
-            
-            # apply upper limits locally
-            bad = [b for b in treat_as_upper_limits if b not in map_filter_names]
-            if bad:
-                raise ValueError(f'Unrecognized filter(s): {bad}. Abort')
-            
-            mask_ul = np.array([b in treat_as_upper_limits for b in bands], dtype=bool)
-            
-            # for upper limits: flux -> 0, error -> original flux (your logic)
-            phot_errors[mask_ul] = phot_fluxes[mask_ul]
-            phot_fluxes[mask_ul] = 0.0
-            
+
+            ### UPPER LIMITS ###
+            # automatic upper limits
+            for b in bands:
+                if np.isnan(phot.data[b][1]):
+                    phot.data[b] = (0, phot.data[b][0])
+
+            obs_phot = np.array([phot.data[b][0] for b in bands])
+            obs_errors = np.array([phot.data[b][1] for b in bands])
+            phot_units = phot.header["UNITS"]
+
+            # Manual upper limits
+            mask_ul = np.array([
+                b in treat_as_upper_limits and not np.isnan(phot.data[b][0]) and phot.data[b][0] > 0
+                for b in bands
+            ], dtype=bool)
+            obs_errors[mask_ul] = obs_phot[mask_ul]
+            obs_phot[mask_ul] = 0.0
+
+                    
             # Just for plot
             phot_loc = copy.deepcopy(phot)
             for b in treat_as_upper_limits:
@@ -1194,8 +1194,8 @@ class PFitter():
             for i in range(len(bands)):
             
                 mod = model_phot_array[i]
-                obs = phot_fluxes[i]
-                err = phot_errors[i]
+                obs = obs_phot[i]
+                err = obs_errors[i]
                 var = err**2
         
                 if obs > 0:
@@ -1205,15 +1205,11 @@ class PFitter():
                     chi2 += resid**2
                     logL_phot += -0.5 * (resid**2 + np.log(2 * np.pi * var))
         
-                    #residuals_per_band_dict[nice_filter_names[bands[i]]] =  resid**2
                     
                 else:
                     # Upper limit: one-sided Gaussian
                     arg = (obs - mod) / (np.sqrt(2.0) * err)
                     cdf = 0.5 * (1 + erf(arg))
-                    #if cdf <= 0:
-                    #    logL = -1e100
-                    #    break
                     logL_phot += np.log(cdf)
                     chi2 += - 2*np.log(cdf)
 

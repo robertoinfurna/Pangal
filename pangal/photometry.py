@@ -9,6 +9,7 @@ from matplotlib.colors import Normalize, LogNorm
 from matplotlib.patches import Ellipse
 from matplotlib import cm
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import matplotlib.ticker as ticker
 
 from skimage.draw import polygon
 from skimage import measure
@@ -25,6 +26,10 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, Angle
 from astropy import units as u
+
+from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import LogFormatter, NullFormatter, FuncFormatter
+from scipy.stats import sigmaclip
 
 from .image import Image
 from .cube import Cube
@@ -43,7 +48,8 @@ def photometry(self,
                units='mJy',
                n_background_regions=500,
                background_exclude_regions=[],
-               print_output=True):
+               print_output=True
+               ):
 
 
     if not isinstance(region, Region):
@@ -63,33 +69,20 @@ def photometry(self,
     # phot_table.header['Region'] = centroid
 
 
-    # ---------------------------
-    # Photometry loop
-    # ---------------------------
+
     for b, band in enumerate(bands):
-
-        # mosaic naming
-        exposure_id = None
-        if '(' in band:
-            idx = band.find('(')
-            exposure_id = band[idx+1:-1]
-            band = band[:idx]
-        else:
-            band = band
-
-
+  
         image = self.images[band].data
-        valid_pixel_mask = np.isfinite(image) & (image != -999) #& (image != 0)  # remove NaN/inf 
+        valid_pixel_mask = np.isfinite(image) & (image != -999)  # remove NaN/inf 
         wcs = self.images[band].wcs
 
         if print_output:
             print(nice_filter_names[band])
 
-        # ---------------------------
         # Build source mask
-        # ---------------------------
         source_mask = np.zeros_like(image, dtype=bool)
 
+        # Regions to exclude when computing background
         if background_exclude_regions:
             for reg in background_exclude_regions:
                 mask = reg.project(image, wcs).astype(bool)
@@ -101,16 +94,15 @@ def photometry(self,
             source_area = 0
             outer_area = 1
 
-        # ---------------------------
-        # Aperture loop
-        # ---------------------------
+
+        # Aperture
         mask = region.project(image, wcs)
         n = np.nansum(mask)
 
         # ---------------------------
         # BACKGROUND ESTIMATION
         # ---------------------------
-        if outer_area > 10 * source_area:
+        if outer_area > 10 * source_area:  # Large field of view
 
             back_flux_arr = []
 
@@ -127,7 +119,6 @@ def photometry(self,
                     shifted[:, 1].min() < 0 or shifted[:, 1].max() >= image.shape[1]):
                     continue
 
-        
                 yy = shifted[:, 0]
                 xx = shifted[:, 1]
             
@@ -150,7 +141,8 @@ def photometry(self,
             mean_background_flux = np.median(clipped)
             background_standard_dev = 1.4826 * np.median(np.abs(clipped - mean_background_flux))
 
-        else:
+        else:  # Small field of view
+
             masked_image = np.where(source_mask, image, np.nan)
             flattened = masked_image[(~np.isnan(masked_image)) & (masked_image != -999)]
             bins = np.linspace(np.nanquantile(flattened, 0.005),
@@ -167,6 +159,8 @@ def photometry(self,
 
             mean_background_flux = mean * n
             background_standard_dev = std * np.sqrt(n)
+
+
 
         # -------------------
         # FLUX + UNCERTAINTY 
@@ -186,53 +180,66 @@ def photometry(self,
         if print_output: 
             print(f"Total flux: {flux:.5f}, poisson unc: {poisson_err:.5f}, " f"sky flux: {mean_background_flux:.5f}, sky std: {background_standard_dev}")
 
-        if flux_sky_subtracted < 0:
-            flux_sky_subtracted = background_standard_dev
-        if total_flux_err / flux_sky_subtracted < 0.01:
-            total_flux_err = 0.01 * flux_sky_subtracted
 
-        if 'arcsec2' in units:
-            area_arcsec2 = n * self.images[band].area_pix_arcsec2
-            flux_sky_subtracted /= area_arcsec2
-            total_flux_err /= area_arcsec2
-
-        # ----------------
-        # UNIT CONVERSION 
-        # ----------------
         ZP = self.images[band].ZP
         ZP_err = self.images[band].ZP_err
 
-        mag = ZP - 2.5*np.log10(flux_sky_subtracted)
-        mag_err = np.sqrt(ZP_err**2 +
-                            (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)
+        # Real detections
+        if flux_sky_subtracted > 3 * background_standard_dev:
+            
+            # SNR above 100 are not realistic
+            if total_flux_err / flux_sky_subtracted < 0.01:
+                total_flux_err = 0.01 * flux_sky_subtracted
 
-        if 'mag' in units:
-            flux_sky_subtracted = mag
-            total_flux_err = mag_err
+            if 'arcsec2' in units:
+                area_arcsec2 = n * self.images[band].area_pix_arcsec2
+                flux_sky_subtracted /= area_arcsec2
+                total_flux_err /= area_arcsec2
 
-        if 'mJy' in units:
-            flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
-            total_flux_err = 1e3 * 0.4*np.log(10) * 10**(0.4*(-mag+8.90)) * mag_err
+            mag = ZP - 2.5*np.log10(flux_sky_subtracted)
+            mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)
 
-        if 'erg_s_cm2_A' in units:
-            wl = self.images[band].pivot_wavelength
-            factor = 2.998e18 / (wl**2)
-            flux_sky_subtracted = factor * 10**(0.4*(-mag-48.60))
-            total_flux_err = factor * 0.4*np.log(10) * 10**(0.4*(-mag-48.60)) * mag_err
+            if 'mag' in units:
+                flux_sky_subtracted = mag
+                total_flux_err = mag_err
 
-        # ---------------------------
-        # Print output 
-        # ---------------------------
-        if print_output: 
-            fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
-            print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} " f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
+            if 'mJy' in units:
+                flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
+                total_flux_err = 1e3 * 0.4*np.log(10) * 10**(0.4*(-mag+8.90)) * mag_err
 
-        # ---------------------------
-        # SAVE RESULT INTO REGION ENTRY
-        # ---------------------------
-        band = band if exposure_id is None else f"{band}({exposure_id})"
+            if 'erg_s_cm2_A' in units:
+                wl = self.images[band].pivot_wavelength
+                factor = 2.998e18 / (wl**2)
+                flux_sky_subtracted = factor * 10**(0.4*(-mag-48.60))
+                total_flux_err = factor * 0.4*np.log(10) * 10**(0.4*(-mag-48.60)) * mag_err
 
-        phot_table.data[band] = (flux_sky_subtracted,total_flux_err)
+            if print_output: 
+                fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
+                print(f"\tFlux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} " f"{units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
+
+            phot_table.data[band] = (flux_sky_subtracted,total_flux_err)
+
+        # Upper limits
+        else:
+            upper_limit_flux = 3 * background_standard_dev  
+            upper_limit_mag = ZP - 2.5 * np.log10(upper_limit_flux)
+
+            if 'mag' in units:
+                flux = upper_limit_mag
+
+            elif 'mJy' in units:
+                flux = 1e3 * 10**(0.4 * (-upper_limit_mag + 8.90))
+
+            elif 'erg_s_cm2_A' in units:
+                wl = self.images[band].pivot_wavelength
+                factor = 2.998e18 / (wl**2)
+                flux = factor * 10**(0.4 * (-upper_limit_mag - 48.60))
+
+            if print_output: 
+                fmt = '.10f' if 'mJy' in units else '.10f' if 'mag' in units else '.10e' 
+                print(f"\tFlux upper limit (3 sigma): {format(flux, fmt)} {units}")
+
+            phot_table.data[band] = (flux,np.nan)
  
     return phot_table
     
@@ -243,98 +250,6 @@ def photometry(self,
 
 
 
-def surface_brightness_profile(self,regions,units='mJy_arcsec2',bands=None,threshold_quantile=0.9,n_background_regions=500, background_exclude_regions = [],
-        function=None, initial_parameters=None):             # nice to put also into big fov!):
-
-    radii = []
-    try:
-        for Reg in regions:
-            radii.append(Reg.galactocentric_radius)    
-    except AttributeError:
-        raise AttributeError("One or more regions do not have the 'galactocentric_radius' attribute.")
-          
-    fig, ax = plt.subplots()
-        
-    if bands is None: bands = self.images.keys()
-        
-    phot_list = self.photometry(regions,bands,units='mJy_arcsec2',
-                                    print_output=False,
-                                    threshold_quantile=threshold_quantile,
-                                    n_background_regions=n_background_regions,
-                                    background_exclude_regions=background_exclude_regions)
-        
-    for band in bands:
-        
-        flux = [phot_list[r].data[band][0] for r in range(len(regions))]
-        err = [phot_list[r].data[band][1] for r in range(len(regions))]
-            
-        ax.errorbar(
-                radii, flux, yerr=err,
-                fmt='o',
-                color=default_filter_colors[band],
-                markersize=6,
-                capsize=4,
-                capthick=1,
-                ecolor=default_filter_colors[band],
-                alpha=0.8,
-                linestyle='',
-                label=f"{band}" if function is None else None
-            )
-        
-        if function:
-
-            # Fit the model
-            popt, _ = curve_fit(function, radii, flux, p0=initial_parameters)
-                
-            r = np.linspace(0.8*min(radii),1.2*max(radii))
-            fun = function(r,*popt)
-            ax.plot(r,fun, c=default_filter_colors[band], label=f"{nice_filter_names[band]}: fit ($\Sigma_0$={popt[0]:.1e}, $R_d$={popt[1]:.2f} kpc)")
-
-
-    if 'mag' in units:
-        import matplotlib.ticker as ticker
-
-        def mJy_to_mag(y):
-            return -2.5 * np.log10(y / 1000 / 3631)
-
-        ax.set_yscale('log')
-        ax.set_ylabel("$\Sigma$ [mag/arcsec²]")
-
-        # Custom formatter for mag labels
-        def mag_formatter(y, pos):
-            try:
-                return f"{mJy_to_mag(y):.2f}" if y > 0 else ""
-            except:
-                return ""
-
-        ax.yaxis.set_major_formatter(ticker.FuncFormatter(mag_formatter))
-    
-    elif 'erg_s_cm2_A' in units:
-        pivot_wavelength = self.images[band].pivot_wavelength  
-        def mJy_to_erg(y):
-            return y * 1e-23 * (2.99e18  / pivot_wavelength**2)
-        ax.set_ylabel("$\Sigma$ [erg/s/cm²/Å/arcsec²]")
-        yticks = ax.get_yticks()
-        ax.set_yticklabels([f"{mJy_to_erg(y):.2e}" if y > 0 else "" for y in yticks])
-    
-    elif 'mJy' in units:
-        ax.set_ylabel("$\Sigma$ [mJy/arcsec²]")
-               
-    else: 
-        raise ValueError('Unrecognized units. Allowed units are: mag_arcsec2, erg_s_cm2_A_arcsec2, mJy_arcsec2')
-            
-    ax.set_xlabel('Galactocentric radius (kpc)')
-    ax.legend()
-
-    plt.show()
-
-           
- 
-
-
-
-
-
 
  
 
@@ -348,9 +263,7 @@ def surface_brightness_profile(self,regions,units='mJy_arcsec2',bands=None,thres
 
 
 
-from matplotlib.ticker import MaxNLocator
-from matplotlib.ticker import LogFormatter, NullFormatter, FuncFormatter
-from scipy.stats import sigmaclip
+
 
 def inspect_photometry(      
                self,
@@ -391,6 +304,7 @@ def inspect_photometry(
                 
 
     print(f"### PHOTOMETRY, BAND: {band} ###")
+    print(f"Exposure time {self.images[band].exptime} s")
 
     image = self.images[band].data
     valid_pixel_mask = np.isfinite(image) & (image != -999) #& (image != 0)  # remove NaN/inf 
@@ -681,7 +595,7 @@ def inspect_photometry(
         ax_hist.axvline(x=mean_background_flux-background_standard_dev,color='red',ls='--',lw=0.5)
         
         ax_hist.legend(loc='upper left', bbox_to_anchor=(0.0, 1.13), fontsize=12)
-        ax_hist.set_xlim(-5*background_standard_dev,5*background_standard_dev)
+        #ax_hist.set_xlim(mean_background_flux-5*background_standard_dev,mean_background_flux+5*background_standard_dev)
             
     
 
@@ -739,53 +653,75 @@ def inspect_photometry(
 
     print(f"Sky subtracted flux: {flux_sky_subtracted} {units_label}")
 
-    if flux_sky_subtracted < 0:
-        print(f"Negative flux: setting flux to 0") 
-        flux_sky_subtracted = 0
-
-    
-    total_flux_err = np.sqrt(background_standard_dev**2 + poisson_err**2)
-
-    print(f"Total Error {total_flux_err} {units_label}")
-                
-    if total_flux_err / flux_sky_subtracted < 0.01:
-        total_flux_err = 0.01 * flux_sky_subtracted
-
-
-    if 'arcsec2' in units: 
-        flux_sky_subtracted = flux_sky_subtracted / (n * self.images[band].area_pix_arcsec2)
-        total_flux_err = total_flux_err / (n * self.images[band].area_pix_arcsec2)
-
 
     # --- UNIT CONVERSION ---
     # So far we worked on counts/s, apart for Herschel
     ZP = self.images[band].ZP
     ZP_err = self.images[band].ZP_err
-    print(f"ZP {ZP} ± {ZP_err}")
+    print(f"ZP = {ZP}")
+    print(f"Calibration error in mag (ZP error) = {ZP_err}")
 
-    #convert all to mag
-    mag = ZP - 2.5*np.log10(flux_sky_subtracted)
-    mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)   #  Here I add calibration error!
 
-    print(f"Flux in AB magnitudes = {mag:.4f}  ± {mag_err:.4f}")
-    
-    if 'mag' in units:
-        flux_sky_subtracted = mag
-        total_flux_err = mag_err
+    # detection
+    if flux_sky_subtracted > 3 * background_standard_dev:
         
-    if 'mJy' in units:
-        flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
-        total_flux_err = 1e3 * 0.4*np.log(10)*10**(0.4*(-mag+8.90)) * mag_err
+        total_flux_err = np.sqrt(background_standard_dev**2 + poisson_err**2)
 
-    if 'erg_s_cm2_A' in units:
-        flux_sky_subtracted = 2.998e18 / self.images[band].pivot_wavelength**2 * 10**(0.4*(-mag-48.60))
-        total_flux_err = 2.998e18 / self.images[band].pivot_wavelength**2  * 0.4*np.log(10)*10**(0.4*(-mag-48.60)) * mag_err
+        print(f"Total Error {total_flux_err} {units_label}")
+                    
+        if total_flux_err / flux_sky_subtracted < 0.01:
+            total_flux_err = 0.01 * flux_sky_subtracted
+
+        if 'arcsec2' in units: 
+            flux_sky_subtracted = flux_sky_subtracted / (n * self.images[band].area_pix_arcsec2)
+            total_flux_err = total_flux_err / (n * self.images[band].area_pix_arcsec2)
 
 
-    fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
-    print(f"### Final value ### \n Flux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} {units}, SNR = {flux_sky_subtracted / total_flux_err:.2f}")
-    print('\n')
+        #convert all to mag
+        mag = ZP - 2.5*np.log10(flux_sky_subtracted)
+        mag_err = np.sqrt(ZP_err**2 + (2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2)   #  Here I add calibration error!
+
+        print(f"Background+Poisson error in mag = {np.sqrt((2.5/(np.log(10)*flux_sky_subtracted))**2 * total_flux_err**2):.4f}")
+        print(f"Flux in AB magnitudes = {mag:.4f}  ± {mag_err:.4f}")
+        print(f"SNR (not including calibration error) = {flux_sky_subtracted / total_flux_err:.2f}")
+
+        if 'mag' in units:
+            flux_sky_subtracted = mag
+            total_flux_err = mag_err
+            
+        if 'mJy' in units:
+            flux_sky_subtracted = 1e3 * 10**(0.4*(-mag+8.90))
+            total_flux_err = 1e3 * 0.4*np.log(10)*10**(0.4*(-mag+8.90)) * mag_err
+
+        if 'erg_s_cm2_A' in units:
+            flux_sky_subtracted = 2.998e18 / self.images[band].pivot_wavelength**2 * 10**(0.4*(-mag-48.60))
+            total_flux_err = 2.998e18 / self.images[band].pivot_wavelength**2  * 0.4*np.log(10)*10**(0.4*(-mag-48.60)) * mag_err
+
+
+        fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e'
+        print(f"### Final value ### \n Flux = {format(flux_sky_subtracted, fmt)} ± {format(total_flux_err, fmt)} {units}")
+        print('\n')
     
+    # upper limit
+    else:
+        upper_limit_flux = 3 * background_standard_dev  # UPPER LIMIT FLUX
+        upper_limit_mag = ZP - 2.5 * np.log10(upper_limit_flux)
+
+        if 'mag' in units:
+            flux = upper_limit_mag
+
+        elif 'mJy' in units:
+            flux = 1e3 * 10**(0.4 * (-upper_limit_mag + 8.90))
+
+        elif 'erg_s_cm2_A' in units:
+            wl = self.images[band].pivot_wavelength
+            factor = 2.998e18 / (wl**2)
+            flux = factor * 10**(0.4 * (-upper_limit_mag - 48.60))
+
+        fmt = '.5f' if 'mJy' in units else '.2f' if 'mag' in units else '.2e' 
+        print(f"Flux upper limit (3 sigma): {format(flux, fmt)} {units}")
+
+
     ax[0].text(
         0.00, 1.1,
         f"{nice_filter_names[band]}, region {region.id}\n"
@@ -815,5 +751,127 @@ def inspect_photometry(
         )
     )
 
+   
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def surface_brightness_profile(self,regions,units='mJy_arcsec2',bands=None,threshold_quantile=0.9,n_background_regions=500, background_exclude_regions = [],
+        function=None, initial_parameters=None):             # nice to put also into big fov!):
+
+    radii = []
+    try:
+        for Reg in regions:
+            radii.append(Reg.galactocentric_radius)    
+    except AttributeError:
+        raise AttributeError("One or more regions do not have the 'galactocentric_radius' attribute.")
+          
+    fig, ax = plt.subplots()
+        
+    if bands is None: bands = self.images.keys()
+        
+    phot_list = self.photometry(regions,bands,units='mJy_arcsec2',
+                                    print_output=False,
+                                    threshold_quantile=threshold_quantile,
+                                    n_background_regions=n_background_regions,
+                                    background_exclude_regions=background_exclude_regions)
+        
+    for band in bands:
+        
+        flux = [phot_list[r].data[band][0] for r in range(len(regions))]
+        err = [phot_list[r].data[band][1] for r in range(len(regions))]
+            
+        ax.errorbar(
+                radii, flux, yerr=err,
+                fmt='o',
+                color=default_filter_colors[band],
+                markersize=6,
+                capsize=4,
+                capthick=1,
+                ecolor=default_filter_colors[band],
+                alpha=0.8,
+                linestyle='',
+                label=f"{band}" if function is None else None
+            )
+        
+        if function:
+
+            # Fit the model
+            popt, _ = curve_fit(function, radii, flux, p0=initial_parameters)
+                
+            r = np.linspace(0.8*min(radii),1.2*max(radii))
+            fun = function(r,*popt)
+            ax.plot(r,fun, c=default_filter_colors[band], label=f"{nice_filter_names[band]}: fit ($\Sigma_0$={popt[0]:.1e}, $R_d$={popt[1]:.2f} kpc)")
+
+
+    if 'mag' in units:
+        
+        def mJy_to_mag(y):
+            return -2.5 * np.log10(y / 1000 / 3631)
+
+        ax.set_yscale('log')
+        ax.set_ylabel("$\Sigma$ [mag/arcsec²]")
+
+        # Custom formatter for mag labels
+        def mag_formatter(y, pos):
+            try:
+                return f"{mJy_to_mag(y):.2f}" if y > 0 else ""
+            except:
+                return ""
+
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(mag_formatter))
+    
+    elif 'erg_s_cm2_A' in units:
+        pivot_wavelength = self.images[band].pivot_wavelength  
+        def mJy_to_erg(y):
+            return y * 1e-23 * (2.99e18  / pivot_wavelength**2)
+        ax.set_ylabel("$\Sigma$ [erg/s/cm²/Å/arcsec²]")
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([f"{mJy_to_erg(y):.2e}" if y > 0 else "" for y in yticks])
+    
+    elif 'mJy' in units:
+        ax.set_ylabel("$\Sigma$ [mJy/arcsec²]")
+               
+    else: 
+        raise ValueError('Unrecognized units. Allowed units are: mag_arcsec2, erg_s_cm2_A_arcsec2, mJy_arcsec2')
+            
+    ax.set_xlabel('Galactocentric radius (kpc)')
+    ax.legend()
 
     plt.show()
+
+           
+ 
+
