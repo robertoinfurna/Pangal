@@ -17,6 +17,8 @@ from dynesty import plotting as dyplot
 from dynesty.utils import resample_equal
 import corner
 
+from PIL import Image
+
 from .photometry_table import PhotometryTable
 from .spectrum import Spectrum
 from .run import Run
@@ -1086,17 +1088,19 @@ class PFitter():
             spec_legend_pars=None,
             observed_spec_label=None,
             spec_legend_loc="upper right",
+            show_phot_legend=False,
             phot_legend_loc="upper right",
             spec_legend_fontsize=14,
             title_fontsize=14,
             label_fontsize=14,
             spec_legend_title=None,
             phot_legend_title=None,
+            title='',
             title_color='black',
             title_fontweight='normal',
-            
+
+            filename=None,
         ):
-        
 
         if phot:
             if bands:
@@ -1214,13 +1218,12 @@ class PFitter():
                     chi2 += - 2*np.log(cdf)
 
             
-            
-            #print('Photometric fitting:')
-            #print('chi1: ',chi2,'  chi2_reduced: ',chi2/len(bands),'  logL: ',logL_phot)
-
-            title = f'$A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["log_m_star"]:.2f},  $d_L = ${params["luminosity_distance"]:.0f} Mpc'
+            title += f'     $A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["log_m_star"]:.2f}' #$d_L = ${params["luminosity_distance"]:.0f} Mpc'
             title += f',    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_phot:.2f}'
             
+            if filename:
+                filename_phot = filename if not spec else filename + '_phot' 
+
             synth_spec.plot(
                 per_wavelength=True,
                 winf=winf_phot,
@@ -1241,7 +1244,7 @@ class PFitter():
                 phot=phot_loc,
                 synth_phot=bands,
                 spec_legend_pars=spec_legend_pars,
-                show_phot_legend=True,
+                show_phot_legend=show_phot_legend,
                 show_spec_legend=True,
                 spec_legend_loc=phot_legend_loc,
                 spec_legend_title=None,
@@ -1252,10 +1255,12 @@ class PFitter():
                 title_fontweight=title_fontweight,
                 title_loc='center',
                 title_color=title_color,
+                
+                filename = filename_phot if filename else None
                 )
             
         
-        ####################################
+
         
         if spec:
 
@@ -1324,8 +1329,54 @@ class PFitter():
 
             ax1.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc='center')
             
+
+
+            if filename is not None:
+                if phot:
+                    plt.savefig(filename+'_spec', dpi=300, bbox_inches='tight')
+                else:
+                    plt.savefig(filename, dpi=300, bbox_inches='tight')
+
             plt.show()
 
+        if phot and spec:
+            file1 = filename + '_phot.png'
+            file2 = filename + '_spec.png'
+
+            img1 = Image.open(file1)
+            img2 = Image.open(file2)
+
+            # target width
+            max_width = max(img1.width, img2.width)
+
+            def resize_to_width(img, width):
+                if img.width == width:
+                    return img
+                ratio = width / img.width
+                new_height = int(img.height * ratio)
+                return img.resize((width, new_height), Image.LANCZOS)
+
+            img1 = resize_to_width(img1, max_width)
+            img2 = resize_to_width(img2, max_width)
+
+            # create combined image
+            combined = Image.new(
+                "RGB",
+                (max_width, img1.height + img2.height),
+                color="white"
+            )
+
+            combined.paste(img1, (0, 0))
+            combined.paste(img2, (0, img1.height))
+
+            combined.save(filename + ".png")
+
+            # ---- remove old files ----
+            img1.close()
+            img2.close()
+
+            os.remove(file1)
+            os.remove(file2)
 
 
 

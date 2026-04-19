@@ -135,205 +135,225 @@ class Run:
             out[name] = (val, val, val)
 
         return out
+    
 
 
+    
     def cornerplot(
-        self,
-        parameters=None,
-        show_stats=True,
-        show_histograms=True,
-        cmap=None,
-        contour_color='k',
-        alpha=0.7,
-        mark_point=None,          # None, "median", "maxlogl"
-        mark_color="crimson",
-        mark_lw=2.0,
-    ):
-        if not hasattr(self, "result"):
-            raise ValueError("Run has no .result attribute. Did you run run_fit()?")
+            run,
+            figsize,
+            parameters=None,
+            show_stats=True,
+            show_histograms=True,
+            labels=None,
+            cmap=None,
+            contour_color='k',
+            alpha=0.7,
+            mark_point=None,
+            mark_color="crimson",
+            mark_lw=2.0,
+            filename=None,
+            label_fontsize=11,
+            x_label_pad=0.02,
+            y_label_pad=0.02,
+            title=None,
+            title_fontsize=10,
+        ):
+            self=run
+            if not hasattr(self, "result"):
+                raise ValueError("Run has no .result attribute. Did you run run_fit()?")
 
-        samples = self.result.samples
-        logwt   = self.result.logwt
-        logz    = self.result.logz
+            samples = self.result.samples
+            logwt   = self.result.logwt
+            logz    = self.result.logz
 
-        weights = np.exp(logwt - logz[-1])
-        equal_samples = resample_equal(samples, weights)
+            weights = np.exp(logwt - logz[-1])
+            equal_samples = resample_equal(samples, weights)
 
-        latex_labels = {
-            "age": r"$\mathrm{Age~[Myr]}$",
-            "tau_main": r"$\tau_\mathrm{main}\ \mathrm{[Myr]}$",
-            "TRUNCAGE": r"$Q_\mathrm{AGE}\ \mathrm{[Myr]}$",
-            "TRUNCTAU": r"$\tau_Q\ \mathrm{[Myr]}$",
-            "BURST": r"burst factor",
-            "METAL": r"metallicity [$Z_\odot$]", 
-            "fesc": r"$f_\mathrm{esc}$",
-            "ion_gas": r"$U_\mathrm{ion}$",
-            "age_gas": r"$\mathrm{Age_{gas}}$",
-            "av": r"$A_V$",
-            "av_ext": r"$A_{V,\mathrm{ext}}$",
-            "alpha": r"$\alpha$",
-            "log_m_star": r"$\log M_\star$",
-            "vel_sys": r"$v\ \mathrm{[km/s]}$",
-            "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
-            "redshift": r"redshift",
-            "luminosity_distance": r"luminosity distance",
-            "ln_spec_noise_scale": r"spectral noise scaling parameter"
-        }
-
-        # ---- select parameters ----
-        if parameters is None:
-            selected_pars = list(self.free_pars)
-            indices = list(range(len(self.free_pars)))
-        else:
-            missing = [p for p in parameters if p not in self.free_pars]
-            if missing:
-                raise ValueError(f"Requested parameters not in free_pars: {missing}")
-            selected_pars = list(parameters)
-            indices = [self.free_pars.index(p) for p in selected_pars]
-            equal_samples = equal_samples[:, indices]
-
-        labels = [latex_labels.get(p, p) for p in selected_pars]
-
-        # ---- make figure ----
-        plt.close("all")
-
-        if cmap is None:
-            # ----- Standard white corner style -----
-            fig = corner.corner(
-                equal_samples,
-                labels=labels,
-                plot_contours=True,
-                fill_contours=False,
-                color=contour_color,
-            )
-        
-        else:
-            # ----- Colored filled contours -----
-            fig = corner.corner(
-                equal_samples,
-                labels=labels,
-                plot_contours=True,
-                fill_contours=True,
-                contourf_kwargs={
-                    "cmap": cm.get_cmap(cmap),
-                    "colors": None,
-                    "alpha": alpha
-                },
-                contour_kwargs={"colors": contour_color},
-            )
-
-        n = len(selected_pars)
-
-        # ---- optional: hide histograms (diagonal) ----
-        diag_axes = [fig.axes[i*(n+1)] for i in range(n)]
-        if not show_histograms:
-            for ax in diag_axes:
-                ax.set_visible(False)
-
-        # ---- optional: stats ----
-        if show_stats and show_histograms:
-        
-            if mark_point is None:
-                vals = np.mean(equal_samples, axis=0)
-                errs = np.std(equal_samples, axis=0)
-                label = "mean"
-        
-            elif str(mark_point).lower() == "median":
-                vals = np.median(equal_samples, axis=0)
-                errs = np.std(equal_samples, axis=0)
-                label = "median"
-        
-            elif str(mark_point).lower() in ("maxlogl", "maxlikelihood", "map"):
-        
-                if not hasattr(self.result, "logl"):
-                    raise ValueError("No logl available for MAP.")
-        
-                idx_best = int(np.argmax(self.result.logl))
-                pt_full = samples[idx_best]
-                vals = pt_full[indices]
-                errs = None
-                label = "MAP"
-        
+            # ---- labels ----
+            if labels:
+                latex_labels = labels
             else:
-                vals = np.mean(equal_samples, axis=0)
-                errs = np.std(equal_samples, axis=0)
-                label = str(mark_point)
-        
-            # ---- Apply titles ----
-            for i, ax in enumerate(diag_axes):
-        
-                if errs is None:
-                    ax.set_title(f"{vals[i]:.3f}", fontsize=10, pad=12) #{label} = 
-                else:
-                    ax.set_title(f"{vals[i]:.3f} ± {errs[i]:.3f}", #{label} = 
-                                fontsize=10, pad=12)
+                latex_labels = {
+                    "age": r"$\mathrm{Age~[Myr]}$",
+                    "tau_main": r"$\tau_\mathrm{main}\ \mathrm{[Myr]}$",
+                    "TRUNCAGE": r"$Q_\mathrm{AGE}\ \mathrm{[Myr]}$",
+                    "TRUNCTAU": r"$\tau_Q\ \mathrm{[Myr]}$",
+                    "BURST": r"burst factor",
+                    "METAL": r"metallicity [$Z_\odot$]",
+                    "fesc": r"$f_\mathrm{esc}$",
+                    "ion_gas": r"$U_\mathrm{ion}$",
+                    "age_gas": r"$\mathrm{Age_{gas}}$",
+                    "av": r"$A_V$",
+                    "av_ext": r"$A_{V,\mathrm{ext}}$",
+                    "alpha": r"$\alpha$",
+                    "log_m_star": r"$\log M_\star$",
+                    "vel_sys": r"$v\ \mathrm{[km/s]}$",
+                    "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
+                    "redshift": r"redshift",
+                    "luminosity_distance": r"luminosity distance",
+                    "ln_spec_noise_scale": r"spectral noise scaling parameter",
+                    "R_GAL": r"$R_\text{gal}$",
+                    "V_DISC": r"$v_\text{disc}$",
+                }
 
-        
-        # =========================================================
-        # Add a cross at a "best" point (median or max-likelihood)
-        # =========================================================
-        if mark_point is not None:
-            mark_point = str(mark_point).lower()
-
-            if mark_point == "median":
-                pt = np.median(equal_samples, axis=0)
-
-            elif mark_point in ("maxlogl", "maxlikelihood", "map"):
-                # Prefer using the original samples + logl if available
-                if not hasattr(self.result, "logl"):
-                    raise ValueError(
-                        "mark_point='maxlogl' requested but result has no .logl attribute. "
-                        "Use mark_point='median' or store log-likelihoods in result.logl."
-                    )
-                idx_best = int(np.argmax(self.result.logl))
-                pt_full = samples[idx_best]      # full parameter set
-                pt = pt_full[indices]            # subset to selected parameters
-
+            # ---- parameter selection ----
+            if parameters is None:
+                selected_pars = list(self.free_pars)
+                indices = list(range(len(self.free_pars)))
             else:
-                raise ValueError("mark_point must be None, 'median', or 'maxlogl'.")
+                missing = [p for p in parameters if p not in self.free_pars]
+                if missing:
+                    raise ValueError(f"Requested parameters not in free_pars: {missing}")
+                selected_pars = list(parameters)
+                indices = [self.free_pars.index(p) for p in selected_pars]
+                equal_samples = equal_samples[:, indices]
 
-            # Overplot crosses on 2D panels (lower triangle)
-            # Axes are in row-major order; diag indices are i*(n+1).
-            for i in range(n):
-                for j in range(i):
-                    ax = fig.axes[i*n + j]  # row i, col j
-                    # Overplot crosshairs on 2D panels (lower triangle)
-                    for i in range(n):
-                        for j in range(i):
-                            ax = fig.axes[i*n + j]  # row i, col j
-                    
-                            # vertical line at x = pt[j]
-                            ax.axvline(
-                                pt[j],
-                                color=mark_color,
-                                linewidth=mark_lw,
-                                alpha=0.9,
-                                zorder=10,
-                            )
-                    
-                            # horizontal line at y = pt[i]
-                            ax.axhline(
-                                pt[i],
-                                color=mark_color,
-                                linewidth=mark_lw,
-                                alpha=0.9,
-                                zorder=10,
-                            )
-                            
-            # Optional: mark on diagonal histograms with a vertical line
-            if show_histograms:
-                for i, ax in enumerate(diag_axes):
-                    ax.axvline(pt[i], color=mark_color, linewidth=mark_lw)
-
-        plt.show()
-
-
-
-
-
-
+            plot_labels = [latex_labels.get(p, p) for p in selected_pars]
+            n = len(selected_pars)
 
             
+            # ---- create figure ----
+            plt.close("all")
+            fig = plt.figure(figsize=figsize)
+
+            # ---- corner plot ----
+            fig = corner.corner(
+                equal_samples,
+                labels=plot_labels,
+                plot_contours=True,
+                fill_contours=True if cmap else None,
+                contourf_kwargs={
+                        "cmap": cm.get_cmap(cmap),
+                        "colors": None,
+                        "alpha": alpha,
+                    } if cmap else None,
+                contour_kwargs={"colors": contour_color} if cmap else None,
+                color=contour_color if not cmap else None,
+                fig=fig,
+            )
+
+            axes = np.array(fig.axes).reshape((n, n))
+
+            # ---- hide upper triangle if needed ----
+            if not show_histograms:
+                for row in range(n):
+                    for col in range(n):
+                        if col >= row:
+                            axes[row, col].set_visible(False)
+
+            diag_axes = [axes[i, i] for i in range(n)]
+
+            # ---- stats ----
+            if show_stats and show_histograms:
+
+                if mark_point is None:
+                    vals = np.mean(equal_samples, axis=0)
+                    errs = np.std(equal_samples, axis=0)
+
+                elif str(mark_point).lower() == "median":
+                    vals = np.median(equal_samples, axis=0)
+                    errs = np.std(equal_samples, axis=0)
+
+                elif str(mark_point).lower() in ("maxlogl", "map"):
+                    idx_best = int(np.argmax(self.result.logl))
+                    pt_full = samples[idx_best]
+                    vals = pt_full[indices]
+                    errs = None
+
+                for i, ax in enumerate(diag_axes):
+                    if errs is None:
+                        ax.set_title(f"{vals[i]:.3f}", fontsize=10, pad=12)
+                    else:
+                        ax.set_title(f"{vals[i]:.3f} ± {errs[i]:.3f}", fontsize=10, pad=12)
+
+            # ---- crosshair ----
+            if mark_point is not None:
+                if str(mark_point).lower() == "median":
+                    pt = np.median(equal_samples, axis=0)
+                else:
+                    idx_best = int(np.argmax(self.result.logl))
+                    pt = samples[idx_best][indices]
+
+                for i in range(n):
+                    for j in range(i):
+                        ax = axes[i, j]
+                        ax.axvline(pt[j], color=mark_color, lw=mark_lw)
+                        ax.axhline(pt[i], color=mark_color, lw=mark_lw)
+
+                if show_histograms:
+                    for i, ax in enumerate(diag_axes):
+                        ax.axvline(pt[i], color=mark_color, lw=mark_lw)
+
+
+            for ax in fig.axes:
+                ax.tick_params(axis='x', labelrotation=0)
+                ax.tick_params(axis='y', labelrotation=90)
+
+            # remove default labels
+            for row in range(n):
+                for col in range(n):
+                    axes[row, col].set_xlabel("")
+                    axes[row, col].set_ylabel("")
+
+            left, bottom = 0.10, 0.10
+            right = left + ((n - 1) / n) * (1.0 - left)
+            top   = bottom + ((n - 1) / n) * (0.95 - bottom)
+
+            fig.subplots_adjust(left=left,bottom=bottom,right=right,top=top,hspace=0.05,wspace=0.05,)        
+            fig.canvas.draw()
+
+        
+            if title is not None:
+                # find first visible axis (top-left of your visible grid)
+                for ax in fig.axes:
+                    if ax.get_visible():
+                        target_ax = ax
+                        break
+            
+                pos = target_ax.get_position()
+            
+                fig.text(
+                    pos.x0,           # align with left edge of first axis
+                    pos.y1 + 0.02,    # slightly above it
+                    title,
+                    ha="left",
+                    va="bottom",
+                    fontsize=title_fontsize,
+                )
+
+        
+            # x labels
+            for col in range(n):
+                ax = axes[n-1, col]
+                if not ax.get_visible():
+                    continue
+
+                pos = ax.get_position()
+                fig.text((pos.x0 + pos.x1) / 2, pos.y0 - x_label_pad, plot_labels[col],ha='center',va='top',fontsize=label_fontsize,)
+
+            # y labels
+            for row in range(n):
+                ax = axes[row, 0]
+                if not ax.get_visible():
+                    continue
+
+                pos = ax.get_position()
+                fig.text(pos.x0 - y_label_pad,(pos.y0 + pos.y1) / 2,plot_labels[row],ha='right',va='center',rotation=90,fontsize=label_fontsize,)
+
+
+            # ---- save ----
+            if filename is not None:
+                if not str(filename).lower().endswith(".png"):
+                    filename = f"{filename}.png"
+                fig.savefig(filename, dpi=300, bbox_inches="tight")
+
+            plt.show()
+
+
+
+
+                
     def save(self, filename):
         """Save dynesty samples, priors, and run metadata to a compressed NPZ file."""
 

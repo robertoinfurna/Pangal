@@ -245,6 +245,8 @@ class Spectrum:
         title_color='black',
         title_fontweight='normal',
         title_loc='center',
+
+        filename=None,
     ):
 
 
@@ -354,8 +356,8 @@ class Spectrum:
                 else:
                     label = spec.header.get("ID", getattr(spec, "id", None))
 
-                if not label:
-                    label = "observed spectrum"
+                #if not label:
+                #    label = "observed spectrum"
 
 
 
@@ -600,6 +602,11 @@ class Spectrum:
                 ax.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc=title_loc)
 
         plt.tight_layout(rect=[0,0,0.85,1])
+
+        # Save if filename is provided
+        if filename is not None:
+            plt.savefig(filename, dpi=300, bbox_inches='tight')
+
         plt.show()
 
 
