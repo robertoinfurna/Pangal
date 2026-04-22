@@ -1158,33 +1158,33 @@ class PFitter():
         
         if phot:
 
-            ### UPPER LIMITS ###
-            # automatic upper limits
-            for b in bands:
-                if np.isnan(phot.data[b][1]):
-                    phot.data[b] = (0, phot.data[b][0])
-
             obs_phot = np.array([phot.data[b][0] for b in bands])
             obs_errors = np.array([phot.data[b][1] for b in bands])
             phot_units = phot.header["UNITS"]
 
-            # Manual upper limits
+            ### UPPER LIMITS ###
+
             mask_ul = np.array([
-                b in treat_as_upper_limits and not np.isnan(phot.data[b][0]) and phot.data[b][0] > 0
+                (np.isnan(phot.data[b][1])) or
+                (
+                    b in treat_as_upper_limits
+                    and not np.isnan(phot.data[b][1])
+                )
                 for b in bands
             ], dtype=bool)
+
             obs_errors[mask_ul] = obs_phot[mask_ul]
             obs_phot[mask_ul] = 0.0
 
                     
             # Just for plot
             phot_loc = copy.deepcopy(phot)
-            for b in treat_as_upper_limits:
-                appo = phot_loc.data[b][0] 
-                phot_loc.data[b] = (0,appo)
+            phot_loc.data = {b: phot_loc.data[b] for b in bands if b in phot_loc.data}
+            for b in phot_loc.data:
+                flux, err = phot_loc.data[b]
+                if (b in treat_as_upper_limits) or np.isnan(err):
+                    phot_loc.data[b] = (0, flux)
             
-            phot_units = phot.header["UNITS"]
-
             
             model_phot = synth_spec.get_phot(bands=bands,method='trapz',units='mJy' ) 
             model_phot_array = np.array([model_phot.data[b][0] for b in bands])

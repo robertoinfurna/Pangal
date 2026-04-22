@@ -221,6 +221,7 @@ class Run:
             fig = corner.corner(
                 equal_samples,
                 labels=plot_labels,
+                range=[0.99, 0.99],
                 plot_contours=True,
                 fill_contours=True if cmap else None,
                 contourf_kwargs={
