@@ -1095,6 +1095,7 @@ class PFitter():
             label_fontsize=14,
             spec_legend_title=None,
             phot_legend_title=None,
+            show_title=True,
             title='',
             title_color='black',
             title_fontweight='normal',
@@ -1217,7 +1218,6 @@ class PFitter():
                     logL_phot += np.log(cdf)
                     chi2 += - 2*np.log(cdf)
 
-            
             title += f'     $A_v =${params["av"]:.2f},  ${{A_v}}_\\text{{, extra}} =${params["av_ext"]:.2f},  $\\alpha_\\text{{Dale}} =${params["alpha"]:.2f},  $\log M_* = ${params["log_m_star"]:.2f}' #$d_L = ${params["luminosity_distance"]:.0f} Mpc'
             title += f',    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_phot:.2f}'
             
@@ -1231,7 +1231,7 @@ class PFitter():
                 ymin=ymin_phot,
                 ymax=ymax_phot,
         
-                figsize=(20,7),
+                figsize=figsize,
                 color=color,
         
                 redshift=None,
@@ -1245,12 +1245,10 @@ class PFitter():
                 synth_phot=bands,
                 spec_legend_pars=spec_legend_pars,
                 show_phot_legend=show_phot_legend,
-                show_spec_legend=True,
                 spec_legend_loc=phot_legend_loc,
                 spec_legend_title=None,
                 spec_legend_fontsize=spec_legend_fontsize,
-
-                title=title,
+                title=title if show_title else None,
                 title_fontsize=title_fontsize,
                 title_fontweight=title_fontweight,
                 title_loc='center',
@@ -1283,7 +1281,7 @@ class PFitter():
             fig, (ax1, ax2) = plt.subplots(
                 2, 1,
                 sharex=True,
-                figsize=(20, 7),
+                figsize=figsize,
                 gridspec_kw={"height_ratios": [3, 1], "hspace": 0}
             )
             
@@ -1306,7 +1304,8 @@ class PFitter():
             ax1.set_xlim(winf_spec,wsup_spec)
             
             ax1.set_ylabel("Flux (erg/s/cm$^2$/Å)", fontsize=label_fontsize)
-            ax1.legend(frameon=False)
+            if spec_legend_pars:
+                ax1.legend(frameon=False)
             
             # -----------------------
             # Bottom panel: residuals
@@ -1327,7 +1326,8 @@ class PFitter():
             title = f'$f_\\text{{esc}} =${params["fesc"]:.1f},  $\mathcal{{U}}_\\text{{ion}} =${params["ion_gas"]:.1f},  $\\text{{Age}}_\\text{{gas}} =${params["age_gas"]:.1f} Myr,  '
             title += f'    $\chi_2 = ${chi2:.2f},     $\log \mathcal{{L}} =${logL_spec:.2f}'
 
-            ax1.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc='center')
+            if show_title:
+                ax1.set_title(title,fontsize=title_fontsize,color=title_color,fontweight=title_fontweight,loc='center')
             
 
 
@@ -1339,44 +1339,45 @@ class PFitter():
 
             plt.show()
 
-        if phot and spec:
-            file1 = filename + '_phot.png'
-            file2 = filename + '_spec.png'
+        if filename:
+            if phot and spec:
+                file1 = filename + '_phot.png'
+                file2 = filename + '_spec.png'
 
-            img1 = Image.open(file1)
-            img2 = Image.open(file2)
+                img1 = Image.open(file1)
+                img2 = Image.open(file2)
 
-            # target width
-            max_width = max(img1.width, img2.width)
+                # target width
+                max_width = max(img1.width, img2.width)
 
-            def resize_to_width(img, width):
-                if img.width == width:
-                    return img
-                ratio = width / img.width
-                new_height = int(img.height * ratio)
-                return img.resize((width, new_height), Image.LANCZOS)
+                def resize_to_width(img, width):
+                    if img.width == width:
+                        return img
+                    ratio = width / img.width
+                    new_height = int(img.height * ratio)
+                    return img.resize((width, new_height), Image.LANCZOS)
 
-            img1 = resize_to_width(img1, max_width)
-            img2 = resize_to_width(img2, max_width)
+                img1 = resize_to_width(img1, max_width)
+                img2 = resize_to_width(img2, max_width)
 
-            # create combined image
-            combined = Image.new(
-                "RGB",
-                (max_width, img1.height + img2.height),
-                color="white"
-            )
+                # create combined image
+                combined = Image.new(
+                    "RGB",
+                    (max_width, img1.height + img2.height),
+                    color="white"
+                )
 
-            combined.paste(img1, (0, 0))
-            combined.paste(img2, (0, img1.height))
+                combined.paste(img1, (0, 0))
+                combined.paste(img2, (0, img1.height))
 
-            combined.save(filename + ".png")
+                combined.save(filename + ".png")
 
-            # ---- remove old files ----
-            img1.close()
-            img2.close()
+                # ---- remove old files ----
+                img1.close()
+                img2.close()
 
-            os.remove(file1)
-            os.remove(file2)
+                os.remove(file1)
+                os.remove(file2)
 
 
 

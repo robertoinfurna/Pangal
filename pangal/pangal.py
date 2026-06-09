@@ -250,15 +250,20 @@ class PanGal:
                 
 
             # https://www.cfht.hawaii.edu/Instruments/Imaging/MegaCam/specsinformation.html
+            # https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/community/unions/MegaPipe_CFIS_DR3.html
+            # https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/megapipe/docs/photo.html
             elif 'cfht' in file.lower():
             
                 print('Processing CFHT MegaCam file: ',file)
         
                 header = hdul[0].header
         
-                filter = hdul[0].header['FILTER'][0].lower()
+                f = hdul[0].header.get('FILTER')
+
+                filter = f[0].lower() if isinstance(f, str) and len(f) > 0 else 'u_3rdgen'
+                
                 band = 'cfht_megacam_'+filter
-                cfht_megacam_wavelengths = {'u': 3550, 'g': 4750, 'r': 6400, 'i': 7760, 'z': 9250}
+                cfht_megacam_wavelengths = {'u_3rdgen': 3676,'u': 3550, 'g': 4750, 'r': 6400, 'i': 7760, 'z': 9250}
                 pivot_wavelength = cfht_megacam_wavelengths[filter]
 
                 # native image are given in nanomaggy
@@ -330,7 +335,8 @@ class PanGal:
                 image[np.isnan(image)] = -999
         
             # 2MASS
-            elif any(x in file.lower() for x in ['2mass', '2masx']):
+            
+            elif any(x in file.lower() for x in ['2mass']): #'2masx'
             
                 print('Processing 2MASS: ',file)
         
@@ -629,26 +635,18 @@ class PanGal:
                     id='muse'
                 )
 
-                
+                cube_obj = self.cubes[cube_name]
+
+
+                # EXTRACT TOPHAT IMAGES
+
                 for band in [key for key in map_filter_names if key.startswith('muse')]:
                     print(f' Building {band} image')
 
                     filter = Filter(band)
             
-                    w_inf = max(wl[0],filter.wavelength_range[0])
-                    w_sup = filter.wavelength_range[1]
-                    channel_inf = np.digitize(w_inf, wl) - 1
-                    channel_sup = np.digitize(w_sup, wl) - 1
-                    bandwidth = w_sup - w_inf
-                    pivot_wavelength = filter.pivot_wavelength
-
-                    integrated_band = np.nansum(cube[channel_inf:channel_sup, :, :], axis=0)
-                    
-                    image = integrated_band * dw / bandwidth 
-
-                    ZP =  - 2.5 * np.log10(pivot_wavelength**2/2.998e18) - 48.60
-                    ZP_err = 0
-                    exptime = None
+                    wl_inf = max(wl[0],filter.wavelength_range[0])
+                    wl_sup = filter.wavelength_range[1]
 
                     image_name = f"{band}"  # e.g., muse_red
                     ii = 1
@@ -656,23 +654,12 @@ class PanGal:
                         image_name = f"{band}({ii})"
                         ii += 1
 
-                    self.images[image_name] = Image(
-                        data=image,
-                        wcs=wcs,
-                        dtheta_pix_deg=dtheta_pix_deg,
-                        area_pix_arcsec2=area_pix_arcsec2,
-                        pivot_wavelength=pivot_wavelength,
-                        ZP=ZP,
-                        ZP_err=ZP_err,
-                        exptime=exptime,
-                        header=header,
-                        filter=filter
-                        )
+                    self.images[image_name] = cube_obj.tophat_map(wl_inf,wl_sup)
                 
 
-                # --------------------------------------------------------
+        
+
                 # EXTRACT LINE MAPS
-                # --------------------------------------------------------
                 top_galaxy_lines = ["Ha","Hb","[O III] 5007","[S II] 6716","He II 4686"]
 
                 for line in top_galaxy_lines:
@@ -685,7 +672,7 @@ class PanGal:
                         image_name = f"{base_name}({ii})"
                         ii += 1
     
-                    self.images[image_name] = self.cubes.muse.line_map(line=line, width=10, continuum_offset_1=50, continuum_offset_2=50, z=self.z)
+                    self.images[image_name] = cube_obj.line_map(line=line, width=10, continuum_offset_1=50, continuum_offset_2=50, z=self.z)
                 
 
 

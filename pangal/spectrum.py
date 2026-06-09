@@ -236,7 +236,6 @@ class Spectrum:
 
         spec_legend_pars=None,
         show_phot_legend=True,
-        show_spec_legend=True,
         spec_legend_loc="upper left",
         spec_legend_title=None,
         spec_legend_fontsize=10,
@@ -529,7 +528,7 @@ class Spectrum:
                 ax.set_ylabel(custom_ylabel, fontsize=label_fontsize)
 
             # --- Spectra legend ---
-            if show_spec_legend:
+            if spec_legend_pars:
                 spec_legend = ax.legend(
                     spec_handles,
                     spec_labels,
