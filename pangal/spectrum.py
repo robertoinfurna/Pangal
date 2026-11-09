@@ -20,7 +20,7 @@ from matplotlib.lines import Line2D
 
 from .photometry_table import PhotometryTable
 from .filter import Filter, map_filter_names, nice_filter_names
-from .data.spectral_lines import spectral_lines, top_galaxy_lines, UBGVRI_filters, atmospheric_lines
+from .data.spectral_lines import spectral_lines, UBGVRI_filters, atmospheric_lines
 
 
 @dataclass
@@ -215,6 +215,7 @@ class Spectrum:
         # aestethics
         figsize=None,
         color=None,
+        synth_phot_color='navy',
         linestyle_1='-',
         linestyle_2='-',
         ecolor='green',
@@ -437,6 +438,9 @@ class Spectrum:
 
 
 
+
+
+
                 # --- Synthetic photometric points (larger, white-filled) ---
                 if synth_phot:
                     markers = itertools.cycle(['o', 's', '^', 'D', 'v', 'P', '*', 'X', '<', '>'])
@@ -453,8 +457,8 @@ class Spectrum:
                         h = ax.scatter(
                             wl_plot, flux_val/normalization,
                             s=100,               # bigger marker size
-                            facecolors='white',  # hollow center
-                            edgecolors=c,  # black edge
+                            facecolors='none',  # hollow center
+                            edgecolors=synth_phot_color,  # black edge
                             marker=marker,
                             zorder=3,
                             label=None           # optional: don't add to legend to avoid duplicates

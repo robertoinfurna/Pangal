@@ -582,6 +582,164 @@ class PFitter():
     # log_likelihood()        →   called thousands of times by the sampler
 
     # ADD run.spec!!!!
+    
+    
+    
+    
+    # HELPER FUNCTION, WRITTEN BY AI
+    def _evaluate_best_model(self, run, params):
+        """
+        Evaluate one posterior solution once and save only the arrays
+        needed later for plotting. No sampler or likelihood involved.
+        """
+
+        spec_keys = {
+            "burst_mass_fraction", "fesc", "ion_gas", "age_gas",
+            "av", "av_ext", "alpha", "log_m_star", "redshift",
+            "luminosity_distance", "vel_sys", "sigma_vel",
+            "sigma_gas", "spec_noise_scale",
+        }
+
+        spec_args = {
+            key: params[key]
+            for key in spec_keys
+            if key in params
+        }
+
+        model_args = {
+            key: value
+            for key, value in params.items()
+            if key not in spec_keys
+        }
+
+        # These arrays are required by synthetic_spectrum only for photometry.
+        trans_mask = {}
+        trans_arrays = {}
+        pivot_wls = {}
+
+        for band in run.bands:
+            filt = Filter(band)
+
+            wl_min, wl_max = filt.wavelength_range
+            mask = (
+                (self.model_wl >= wl_min)
+                & (self.model_wl <= wl_max)
+            )
+
+            trans_mask[band] = mask
+            trans_arrays[band] = filt.transmission_curve(
+                self.model_wl[mask]
+            )
+            pivot_wls[band] = filt.pivot_wavelength
+
+        # One and only evaluation of the synthetic model for this solution.
+        synth_spec = self.synthetic_spectrum(
+            **model_args,
+            **spec_args,
+            likelihood_call=False,
+            bands=run.bands,
+            trans_arrays=trans_arrays,
+            trans_mask=trans_mask,
+            pivot_wls=pivot_wls,
+            obs_spec=run.spec_crop,
+            polydeg=run.polydeg,
+        )
+
+        best_model = {
+            "params": dict(params),
+
+            # Full rest/observed-frame model, useful for the SED plot.
+            "model_wl": synth_spec.wl.copy(),
+            "model_flux": synth_spec.flux.copy(),
+
+            "spectrum": None,
+            "photometry": None,
+        }
+        
+    
+        # Save spectral arrays already evaluated on the observed grid.
+        if run.spec_crop is not None:
+
+            flux_obs = run.spec_crop.flux.copy()
+
+            flux_err = (
+                run.spec_crop.flux_err
+                * np.exp(params["spec_noise_scale"])
+            )
+
+            flux_model = (
+                synth_spec.model_spec_on_obs_grid.flux.copy()
+            )
+
+            residuals = (flux_obs - flux_model) / flux_err
+            chi2 = np.nansum(residuals**2)
+
+            logl = (
+                -0.5 * chi2
+                - np.nansum(
+                    np.log(np.sqrt(2 * np.pi) * flux_err)
+                )
+            )
+
+            best_model["spectrum"] = {
+                "wl": run.spec_crop.wl.copy(),
+                "flux_obs": flux_obs,
+                "flux_err": flux_err,
+                "flux_model": flux_model,
+                "residuals": residuals,
+                "chi2": chi2,
+                "logl": logl,
+            }
+
+        # Save synthetic and observed photometric points.
+        if run.phot is not None:
+
+            synth_phot = synth_spec.get_phot(
+                bands=run.bands,
+                method="trapz",
+                units="mJy",
+            )
+
+            flux_obs = np.array([
+                run.phot.data[band][0]
+                for band in run.bands
+            ])
+
+            flux_err = np.array([
+                run.phot.data[band][1]
+                for band in run.bands
+            ])
+
+            flux_model = np.array([
+                synth_phot.data[band][0]
+                for band in run.bands
+            ])
+
+            upper_limits = np.array([
+                (
+                    band in run.treat_as_upper_limits
+                    or np.isnan(run.phot.data[band][1])
+                )
+                for band in run.bands
+            ])
+
+            best_model["photometry"] = {
+                "bands": list(run.bands),
+                "pivot_wl": np.array([
+                    pivot_wls[band]
+                    for band in run.bands
+                ]),
+                "flux_obs": flux_obs,
+                "flux_err": flux_err,
+                "flux_model": flux_model,
+                "upper_limits": upper_limits,
+            }
+
+        return best_model
+    
+
+
+
 
     def run_fit(self,
                 spec=None,   # observed spectrum (a spectrum object)
@@ -593,7 +751,8 @@ class PFitter():
                 custom_priors=None,
                 polydeg=7,
                 nlive=500,
-                dlogz=0.01):
+                dlogz=0.01,
+                ):
 
         if phot is not None:
             if not isinstance(phot, PhotometryTable):
@@ -688,7 +847,6 @@ class PFitter():
             print('Fitting: ',p)
 
 
-
         # --- build likelihood and prior ---
         run.log_likelihood = self.make_log_likelihood(run, spec, phot, run.free_pars) #self.
         run.prior_transform = self.make_prior_transform(run, run.custom_priors)
@@ -700,7 +858,42 @@ class PFitter():
         run.sampler.run_nested(dlogz=dlogz, print_progress=True)
         run.result = run.sampler.results
 
+        print("Evaluating best model")
+        run.best_model_pars_MAP = run.best_model(method='MAP')
+        run.best_model_pars_ML = run.best_model(method='ML')
+        run.best_model_pars_median = run.best_model(method='median')
+
+
+        run.best_models = {
+            "MAP": self._evaluate_best_model(
+                run,
+                run.best_model_pars_MAP,
+            ),
+            "ML": self._evaluate_best_model(
+                run,
+                run.best_model_pars_ML,
+            ),
+            "median": self._evaluate_best_model(
+                run,
+                run.best_model_pars_median,
+            ),
+        }
+
         return run
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     def make_log_likelihood(self, run, spec, phot, free_pars,):
@@ -859,14 +1052,14 @@ class PFitter():
             'av':      {'type': 'uniform', 'low': 0.0, 'high': 1.0},
 
             # MATCHES sps_spec_fitter: Av_ext ~ Normal(coef * Av, sigma)
-            'av_ext':  {'type': 'gaussian_conditional', 'depends_on': 'av', 'coef': 1.17, 'sigma': 0.01,
+            'av_ext':  {'type': 'gaussian_conditional', 'depends_on': 'av', 'coef': 1.27, 'sigma': 0.01,
                         'low': 0.0, 'high': 1.0},
 
             'alpha':   {'type': 'uniform', 'low': self.dustem_alpha[0], 'high': self.dustem_alpha[-1]},
             'log_m_star':  {'type': 'uniform', 'low': 4.0, 'high': 12.0},
             'vel_sys': {'type': 'uniform', 'low': -500.0, 'high': 500.0},
             'sigma_vel': {'type': 'uniform', 'low': 1.0, 'high': 200.0},
-            'sigma_gas': {'type': 'uniform', 'low': 1.0, 'high': 500.0},
+            'sigma_gas': {'type': 'uniform', 'low': 1.0, 'high': 75.0},
             'luminosity_distance': {'type': 'uniform', 'low': 1, 'high': 1e4}, # in Mpc
             'redshift': {'type': 'uniform', 'low': 0, 'high': 6},
             'spec_noise_scale': {'type': 'uniform', 'low': -2, 'high': 2}
@@ -1054,8 +1247,7 @@ class PFitter():
 
 
 
-
-    def fit_diagnostic(
+    def test_model(
             self,
             params,
             spec=None,
@@ -1075,8 +1267,9 @@ class PFitter():
             ymax_phot=None,
 
             # aestethics
-            figsize=(10,10),
+            figsize=(12,6),
             color='crimson',
+            synth_phot_color='navy',
             show_errorbars=True,
                 
             # optionals
@@ -1233,6 +1426,7 @@ class PFitter():
         
                 figsize=figsize,
                 color=color,
+                synth_phot_color=synth_phot_color,
         
                 redshift=None,
                 show_top_spectral_lines=False,
@@ -1288,7 +1482,7 @@ class PFitter():
             # -----------------------
             # Top panel: spectrum
             # -----------------------
-            ax1.plot(wl, flux_obs, color="k", lw=1, label="Observed")      
+            ax1.plot(wl, flux_obs, color="k", lw=1, label=observed_spec_label)      
             ax1.plot(wl, flux_model, color=color, lw=1.2, label="Model")  
             
             # Optional error band (nice but optional)
@@ -1303,7 +1497,8 @@ class PFitter():
 
             ax1.set_xlim(winf_spec,wsup_spec)
             
-            ax1.set_ylabel("Flux (erg/s/cm$^2$/Å)", fontsize=label_fontsize)
+            
+            ax1.set_ylabel(r"Flux (erg/s/cm$^2$/Å)", fontsize=label_fontsize-1)
             if spec_legend_pars:
                 ax1.legend(frameon=False)
             
@@ -1314,7 +1509,8 @@ class PFitter():
             ax2.plot(wl, residuals, color="steelblue", lw=0.8)
             
             ax2.set_xlabel("Wavelength (Å)", fontsize=label_fontsize)
-            ax2.set_ylabel(r"$(F_{\rm obs}-F_{\rm model})/\sigma$", fontsize=label_fontsize)
+            #ax2.set_ylabel(r"$(F_{\rm obs}-F_{\rm model})/\sigma$", fontsize=label_fontsize)
+            ax2.set_ylabel(r"Residuals", fontsize=label_fontsize-1)
             
             # Optional: symmetric limits for clarity
             rmax = np.nanpercentile(np.abs(residuals), 99)

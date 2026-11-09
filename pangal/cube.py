@@ -13,19 +13,17 @@ from .data.spectral_lines import spectral_lines
 
 @dataclass
 class Cube:
-    cube: np.ndarray=None                              # cube in native units
-    var: np.ndarray=None                               # var in native units
-    units: float=None                                  # convert to erg/s/cm2/A
+    cube: np.ndarray=None                              # cube 
+    var: np.ndarray=None                               # var 
     wl: np.array=None                                   # wavelength array
     resolution: np.array=None                                   # resolution array
     dw: float=None                                     # spectral channel width                     
     wcs: WCS=None                                       # Astropy WCS object
     dtheta_pix_deg: float=None                          # Pixel scale (degrees/pixel)
     area_pix_arcsec2: float=None                        # Pixel area (arcsec²)
-    id: str='cube'                                      # id
-
     header: fits.Header = field(default_factory=fits.Header)  # FITS header 
-    
+    id: str = None
+
     @property
     def delta_lambda(self):
         """
@@ -33,8 +31,39 @@ class Cube:
         """
         return self.wl / self.resolution  
     
+
+
+    def tophat_map(self,wl_inf,wl_sup):
     
-    def line_map(self, line, width, continuum_offset_1, continuum_offset_2, z=0, pangal_object=None,):
+        channel_inf = np.digitize(wl_inf, self.wl) - 1
+        channel_sup = np.digitize(wl_sup, self.wl) - 1
+        bandwidth = wl_sup - wl_inf
+        pivot_wavelength = (wl_sup + wl_inf)/2
+
+        integrated_band = np.nansum(self.cube[channel_inf:channel_sup, :, :], axis=0)
+        
+        image = integrated_band * self.dw / bandwidth 
+
+        ZP =  - 2.5 * np.log10(pivot_wavelength**2/2.998e18) - 48.60
+        ZP_err = 0
+        exptime = None
+
+        image = Image(
+            data=image,
+            wcs=self.wcs,
+            dtheta_pix_deg=self.dtheta_pix_deg,
+            area_pix_arcsec2=self.area_pix_arcsec2,
+            pivot_wavelength=pivot_wavelength,
+            ZP=ZP,
+            ZP_err=ZP_err,
+            header=self.header,
+            )
+        
+        return image
+
+
+
+    def line_map(self, line, width, continuum_offset_1, continuum_offset_2, z=0,):
         """
         Extracts an emission line map from a datacube, subtracts continuum and applies extinction correction.
         
@@ -75,10 +104,10 @@ class Cube:
         continuum = (cont_cube_1 + cont_cube_2) / 2
     
         # Optional extinction correction
-        image_erg_s_cm2 = (line_cube - continuum) * self.dw * self.units  
+        image_erg_s_cm2 = (line_cube - continuum) * self.dw 
 
         image = Image(
-                image=image_erg_s_cm2,
+                data=image_erg_s_cm2,
                 wcs=self.wcs,
                 dtheta_pix_deg=self.dtheta_pix_deg,
                 area_pix_arcsec2=self.area_pix_arcsec2,
@@ -86,68 +115,71 @@ class Cube:
                 header=self.header
             )
     
-        if pangal_object:
-            # Safe naming: avoid overwriting
-            base_name = f"{self.id}_{line}"
-            image_name = base_name
-            i = 1
-            while image_name in pangal_object.images:
-                image_name = f"{base_name}({i})"
-                i += 1
-        
-            # Save
-            pangal_object.images[image_name] = image
-        
-
         return image
-            
+    
 
 
+    
     def extract_spectra(self, regions, pangal_object=None):
-        """
-        Extracts and stores spectra from defined spatial regions within data cube.
-
-        Parameters
-        ----------
-        regions : list
-            List of Region objects, each with a 'project' method 
-        pangal_object : Pangal
-            If provided, appends the line maps as images to the pangal_object.images list
-        Returns
-        -------
-        list of spectra objects
-        """
- 
         var = self.var
-        wl = self.wl
         resolution = self.resolution
         spectra_list = []
 
+        # Air -> vacuum
+        wl_vac = airtovac(self.wl)
+
         for region in regions:
-            # Generate a mask for the region using the WCS projection
             mask = region.project(self.cube[0, :, :], self.wcs).astype(bool)
             n_pixels = np.count_nonzero(mask)
 
-            # Sum flux and variance over all pixels in the region
-            flux = np.nansum(self.cube[:, mask], axis=1) / n_pixels * self.units
-            variance = np.nansum(var[:, mask], axis=1) / n_pixels**2 * self.units**2
+            flux = np.nansum(self.cube[:, mask], axis=1)
+            variance = np.nansum(var[:, mask], axis=1)
             error = np.sqrt(variance)
-            
-            spec = Spectrum(wl=wl,resolution=resolution,flux=flux,flux_err=error)
 
+            hdr = fits.Header()
+            hdr["SOURCE_ID"] = getattr(self, "id", "CUBE")
+            hdr["REGION_ID"] = getattr(region, "id", "UNKNOWN")
+            hdr["NPIXELS"]   = n_pixels
+            hdr["FUNITS"]    = self.header.get("FUNITS", "UNKNOWN")
+            hdr["WUNITS"]    = self.header.get("WUNITS", "UNKNOWN")
+            hdr["WAVESYS"]   = "VACUUM"
+
+            # copy so that the spectra don't share the same array
+            spec = Spectrum(wl=wl_vac.copy(), resolution=resolution,
+                            flux=flux, flux_err=error, header=hdr)
             spectra_list.append(spec)
 
-
             if pangal_object:
-                # Safe naming: avoid overwriting
-                base_name = f"{self.id}_spec_{region.id}"
+                base_name = f"{getattr(self, 'id', 'cube')}_spec_{getattr(region, 'id', 'region')}"
                 spec_name = base_name
                 i = 1
                 while spec_name in pangal_object.spectra:
                     spec_name = f"{base_name}({i})"
                     i += 1
-            
-                # Save
                 pangal_object.spectra[spec_name] = spec
 
         return spectra_list
+    
+
+    
+def vactoair(wl):
+    """Convert vacuum wavelengths to air wavelengths using the conversion
+    given by Morton (1991, ApJS, 77, 119).
+
+    """
+    wave2 = np.asarray(wl, dtype=float)**2
+    fact = 1. + 2.735182e-4 + 131.4182/wave2 + 2.76249e8/(wave2*wave2)
+    return wl/fact
+
+
+def airtovac(wl):
+    """Convert air wavelengths to vacuum wavelengths using the conversion
+    given by Morton (1991, ApJS, 77, 119).
+
+    """
+    sigma2 = np.asarray(1E4/wl, dtype=float)**2
+    
+    fact = 1. + 6.4328e-5 + 2.949281e-2/(146.-sigma2) + 2.5540e-4/(41.-sigma2)
+    fact[wl < 2000] = 1.0
+    
+    return wl*fact

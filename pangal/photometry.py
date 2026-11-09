@@ -41,6 +41,21 @@ from .plot import add_ra_dec_ticks, Point, Contours
 from .photometry_table import PhotometryTable, PhotometryCatalog
 
 
+def fractional_mask(region, image, wcs, k=10):
+    """Fraction of each pixel covered by the region, via k x k supersampling."""
+    ny, nx = image.shape
+    w = wcs.deepcopy()
+    if w.wcs.has_cd():
+        w.wcs.cd = w.wcs.cd / k
+    else:
+        w.wcs.cdelt = w.wcs.cdelt / k
+    w.wcs.crpix = (w.wcs.crpix - 0.5) * k + 0.5
+    w.wcs.set()
+    fine = region.project(np.zeros((ny * k, nx * k)), w).astype(float)
+    return fine.reshape(ny, k, nx, k).mean(axis=(1, 3))
+
+
+
 
 def photometry(self,              
                region,
@@ -98,6 +113,10 @@ def photometry(self,
         # Aperture
         mask = region.project(image, wcs)
         n = np.nansum(mask)
+        
+        if n == 0:                                   # region smaller than a pixel
+            mask = fractional_mask(region, image, wcs)
+            n = np.nansum(mask)
 
         # ---------------------------
         # BACKGROUND ESTIMATION
@@ -143,7 +162,7 @@ def photometry(self,
 
         else:  # Small field of view
 
-            masked_image = np.where(source_mask, image, np.nan)
+            masked_image = np.where(~source_mask & valid_pixel_mask, image, np.nan)
             flattened = masked_image[(~np.isnan(masked_image)) & (masked_image != -999)]
             bins = np.linspace(np.nanquantile(flattened, 0.005),
                                 np.nanquantile(flattened, 0.9))
@@ -243,11 +262,6 @@ def photometry(self,
  
     return phot_table
     
-
-
-
-
-
 
 
 

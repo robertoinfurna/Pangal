@@ -23,6 +23,8 @@ from .data.spectral_lines import spectral_lines, UBGVRI_filters, atmospheric_lin
 from .pfitter_utils import load_nebular_tables, load_dust_emission_models, model_grid_interpolator, load_spectrum_models_from_fits
 
 
+from PIL import Image
+
 """
 PFitter
    ├── run_fit(...)    → creates a new Run() instance
@@ -41,24 +43,43 @@ Run
 """
 
 class Run:
+
     def __init__(self):
 
+        # Fit configuration
         self.model_file = None
-        self.bands = None
+        self.model_pars = None
+        self.bands = []
         self.spectral_range = None
-        self.fix_pars = None
-        self.custom_priors = None
+        self.treat_as_upper_limits = []
+        self.fix_pars = {}
+        self.custom_priors = {}
         self.polydeg = None
         self.nlive = None
         self.dlogz = None
 
-        # Processed data
+        # Input and preprocessed data
         self.spec = None
+        self.spec_crop = None
         self.phot = None
 
-        # Likelihood, priors, and sampler
+        # Parameter bookkeeping
+        self.free_model_pars = []
+        self.free_pars = []
+
+        # Likelihood, priors, sampler, posterior
+        self.log_likelihood = None
+        self.prior_transform = None
+        self.sampler = None
         self.result = None
 
+        # Posterior point estimates
+        self.best_model_pars_MAP = None
+        self.best_model_pars_ML = None
+        self.best_model_pars_median = None
+
+        # Evaluated arrays used by Run.plot_retrieval()
+        self.best_models = {}
 
 
 
@@ -135,13 +156,449 @@ class Run:
             out[name] = (val, val, val)
 
         return out
-    
+        
+            
+        
+    def plot_retrieval(
+        self,
+        solution="MAP",
+
+        # spectral plotting window
+        winf_spec=None,
+        wsup_spec=None,
+
+        # photometric plotting window
+        winf_phot=1e2,
+        wsup_phot=1e7,
+        ymin_phot=None,
+        ymax_phot=None,
+
+        # aesthetics
+        figsize=(12, 6),
+        color="crimson",
+        synth_phot_color="navy",
+        show_errorbars=True,
+
+        observed_spec_label="Observed spectrum",
+        model_label="Best-fit model",
+        spec_legend_pars = None,
+        spec_legend_loc="upper right",
+        phot_legend_loc="upper right",
+        spec_legend_fontsize=14,
+        label_fontsize=14,
+        show_phot_legend=True,
+
+        show_title=True,
+        title=None,
+        title_fontsize=14,
+        title_color="black",
+        title_fontweight="normal",
+
+        filename=None,
+    ):
+        """
+        Plot an already-evaluated posterior solution stored in ``run``.
+        No PFitter instance is used and no model is recomputed.
+        """
+
+        if not hasattr(self, "best_models"):
+            raise ValueError(
+                "This Run object has no 'best_models'. "
+                "Run evaluate_best_model() at the end of run_fit()."
+            )
+
+        if solution not in self.best_models:
+            raise ValueError(
+                f"Unknown solution '{solution}'. "
+                f"Available: {list(self.best_models.keys())}"
+            )
+
+        best_model = self.best_models[solution]
+
+        params = best_model["params"]
+        spec_data = best_model["spectrum"]
+        phot_data = best_model["photometry"]
+
+        saved_figures = []
+
+        # ==========================================================
+        # Photometric SED
+        # ==========================================================
+        
+        # Rebuild a Spectrum object only for its .plot() method.
+        # No PFitter and no model evaluation are involved here.
+        model_header = fits.Header()
+        model_header["WUNITS"] = "A"
+        model_header["FUNITS"] = "erg/s/cm2/A"
+
+        # Parameter names used in synthetic_spectrum() FITS headers
+        header_key_map = {
+            "burst_mass_fraction": "BURSTF",
+            "fesc": "FESC",
+            "ion_gas": "IONGAS",
+            "age_gas": "AGEGAS",
+            "av": "AV",
+            "av_ext": "AVEXT",
+            "alpha": "ALPHA",
+            "log_m_star": "LOGMSTAR",
+            "redshift": "REDSHIFT",
+            "luminosity_distance": "DLMPC",
+            "vel_sys": "VELSYS",
+            "sigma_vel": "SIGMAVEL",
+            "sigma_gas": "SIGMAGAS",
+            "spec_noise_scale": "SPECNOI",
+        }
+        
+        for par_name, value in params.items():
+        
+            # Grid parameters such as TRUNCAGE, TRUNCTAU, V_DISC,
+            # R_GAL, and METAL retain their original names.
+            header_key = header_key_map.get(
+                par_name,
+                par_name[:8].upper(),
+            )
+
+            
+            model_header[header_key] = value
+
+        if phot_data is not None:
+            
+            synth_spec = Spectrum(
+                wl=best_model["model_wl"],
+                flux=best_model["model_flux"],
+                resolution=np.ones_like(best_model["model_wl"]),
+                header=model_header,
+            )
+        
+            # Rebuild photometry in the format expected by Spectrum.plot().
+            phot_header = fits.Header()
+            phot_header["UNITS"] = "mJy"
+        
+            phot_loc_data = {}
+        
+            for band, flux, err, is_ul in zip(
+                phot_data["bands"],
+                phot_data["flux_obs"],
+                phot_data["flux_err"],
+                phot_data["upper_limits"],
+            ):
+        
+                # Spectrum.plot convention for an upper limit: (0, limit)
+                if is_ul:
+                    phot_loc_data[band] = (0.0, flux)
+                else:
+                    phot_loc_data[band] = (flux, err)
+        
+            phot_loc = PhotometryTable(
+                data=phot_loc_data,
+                header=phot_header,
+            )
+
+            # Same photometric likelihood diagnostics as test_model()
+            obs_phot_like = phot_data["flux_obs"].copy()
+            obs_err_like = phot_data["flux_err"].copy()
+            model_phot_like = phot_data["flux_model"]
+            upper_limits = phot_data["upper_limits"]
+
+            obs_err_like[upper_limits] = obs_phot_like[upper_limits]
+            obs_phot_like[upper_limits] = 0.0
+
+            chi2_phot = 0.0
+            logl_phot = 0.0
+
+            for obs, err, mod in zip(
+                obs_phot_like,
+                obs_err_like,
+                model_phot_like,
+            ):
+
+                if obs > 0:
+                    resid = (obs - mod) / err
+                    chi2_phot += resid**2
+                    logl_phot += -0.5 * (
+                        resid**2
+                        + np.log(2 * np.pi * err**2)
+                    )
+
+                else:
+                    arg = (obs - mod) / (np.sqrt(2.0) * err)
+                    cdf = 0.5 * (1.0 + erf(arg))
+
+                    logl_phot += np.log(cdf)
+                    chi2_phot += -2.0 * np.log(cdf)
+
+            phot_title = "" if title is None else title
+
+            phot_title += (
+                rf"     $A_v={params['av']:.2f}$, "
+                rf"${{A_v}}_{{\rm extra}}={params['av_ext']:.2f}$, "
+                rf"$\alpha_{{\rm Dale}}={params['alpha']:.2f}$, "
+                rf"$\log M_\star={params['log_m_star']:.2f}$"
+            )
+
+            phot_title += (
+                rf",    $\chi^2={chi2_phot:.2f}$, "
+                rf"$\log \mathcal{{L}}={logl_phot:.2f}$"
+            )
+        
+            if filename is not None:
+                filename_phot = filename + "_phot.png"
+            else:
+                filename_phot = None
+
+            
+            synth_spec.plot(
+                per_wavelength=True,
+                winf=winf_phot,
+                wsup=wsup_phot,
+                ymin=ymin_phot,
+                ymax=ymax_phot,
+        
+                figsize=figsize,
+                color=color,
+                synth_phot_color=synth_phot_color,
+        
+                redshift=None,
+                show_top_spectral_lines=False,
+                show_all_spectral_lines=False,
+                show_atmospheric_lines=False,
+                show_filters=False,
+        
+                label_fontsize=label_fontsize,
+                phot=phot_loc,
+                synth_phot=phot_data["bands"],
+        
+                spec_legend_pars=spec_legend_pars,
+                show_phot_legend=show_phot_legend,
+                spec_legend_loc=phot_legend_loc,
+                spec_legend_title=None,
+                spec_legend_fontsize=spec_legend_fontsize,
+                
+                title=phot_title if show_title else None,
+                title_fontsize=title_fontsize,
+                title_fontweight=title_fontweight,
+                title_loc="center",
+                title_color=title_color,
+        
+                filename=filename_phot,
+            )
 
 
-    
+        
+        # ==========================================================
+        # Spectrum + residuals
+        # ==========================================================
+        if spec_data is not None:
+
+            wl = spec_data["wl"]
+            flux_obs = spec_data["flux_obs"]
+            flux_err = spec_data["flux_err"]
+            flux_model = spec_data["flux_model"]
+            residuals = spec_data["residuals"]
+            chi2 = spec_data["chi2"]
+            logl = spec_data["logl"]
+
+            fig_spec, (ax1, ax2) = plt.subplots(
+                2,
+                1,
+                sharex=True,
+                figsize=figsize,
+                gridspec_kw={
+                    "height_ratios": [3, 1],
+                    "hspace": 0.0,
+                },
+            )
+
+            ax1.plot(
+                wl,
+                flux_obs,
+                color="black",
+                lw=1.0,
+                label=observed_spec_label,
+            )
+
+            ax1.plot(
+                wl,
+                flux_model,
+                color=color,
+                lw=1.2,
+                label=model_label,
+            )
+
+            if show_errorbars:
+                ax1.fill_between(
+                    wl,
+                    flux_obs - flux_err,
+                    flux_obs + flux_err,
+                    color="black",
+                    alpha=0.18,
+                    lw=0,
+                )
+
+            ax1.set_ylabel(
+                r"Flux (erg s$^{-1}$ cm$^{-2}$ $\AA^{-1}$)",
+                fontsize=label_fontsize - 1,
+            )
+
+            ax1.legend(
+                frameon=False,
+                loc=spec_legend_loc,
+                fontsize=spec_legend_fontsize,
+            )
+
+            ax2.axhline(
+                0.0,
+                color="black",
+                lw=0.8,
+                ls="--",
+            )
+
+            ax2.plot(
+                wl,
+                residuals,
+                color="steelblue",
+                lw=0.8,
+            )
+
+            ax2.set_xlabel(
+                r"Wavelength ($\AA$)",
+                fontsize=label_fontsize,
+            )
+            ax2.set_ylabel(
+                "Residuals",
+                fontsize=label_fontsize - 1,
+            )
+
+            if winf_spec is None:
+                winf_spec = np.nanmin(wl)
+
+            if wsup_spec is None:
+                wsup_spec = np.nanmax(wl)
+
+            ax1.set_xlim(winf_spec, wsup_spec)
+
+            finite_residuals = residuals[np.isfinite(residuals)]
+
+            if len(finite_residuals) > 0:
+                rmax = np.nanpercentile(
+                    np.abs(finite_residuals),
+                    99,
+                )
+
+                if rmax > 0:
+                    ax2.set_ylim(-rmax, rmax)
+
+            title_spec = (
+                f"{solution}: "
+                rf"$f_{{\rm esc}}={params.get('fesc', np.nan):.2f}$, "
+                rf"$\mathcal{{U}}_{{\rm ion}}={params.get('ion_gas', np.nan):.2f}$, "
+                rf"${{\rm Age}}_{{\rm gas}}={params.get('age_gas', np.nan):.1f}$ Myr"
+                "\n"
+                rf"$\chi^2={chi2:.2f}$, "
+                rf"$\log \mathcal{{L}}={logl:.2f}$"
+            )
+
+            if title is not None:
+                title_spec = title
+
+            spec_pars_text = (
+                rf"$v_{{\rm sys}}={params['vel_sys']:.1f}\ "
+                rf"{{\rm km\,s^{{-1}}}}$,   "
+                rf"$\sigma_v={params['sigma_vel']:.1f}\ "
+                rf"{{\rm km\,s^{{-1}}}}$,   "
+                rf"$\mathcal{{U}}_{{\rm ion}}={params['ion_gas']:.2f}$,   "
+                rf"${{\rm Age}}_{{\rm gas}}={params['age_gas']:.1f}\ "
+                rf"{{\rm Myr}}$,   "
+                rf"$\sigma_{{\rm gas}}={params['sigma_gas']:.1f}\ "
+                rf"{{\rm km\,s^{{-1}}}}$"
+            )
+            
+            ax1.text(
+                0.5,
+                1.02,
+                spec_pars_text,
+                transform=ax1.transAxes,
+                ha="center",
+                va="bottom",
+                fontsize=title_fontsize,
+                color=title_color,
+                fontweight=title_fontweight,
+                clip_on=False,
+            )
+
+            ax1.tick_params(labelsize=label_fontsize - 2)
+            ax2.tick_params(labelsize=label_fontsize - 2)
+
+            fig_spec.tight_layout()
+
+            if filename is not None:
+            
+                spec_filename = filename + "_spec.png"
+            
+                fig_spec.savefig(
+                    spec_filename,
+                    format="png",
+                    dpi=300,
+                    bbox_inches="tight",
+                )
+            
+                saved_figures.append(spec_filename)
+
+
+        if (
+            filename is not None
+            and phot_data is not None
+            and spec_data is not None
+        ):
+
+            file_phot = filename + "_phot.png"
+            file_spec = filename + "_spec.png"
+
+            img_phot = Image.open(file_phot)
+            img_spec = Image.open(file_spec)
+
+            max_width = max(img_phot.width, img_spec.width)
+
+            def resize_to_width(img, width):
+                if img.width == width:
+                    return img
+
+                ratio = width / img.width
+                new_height = int(img.height * ratio)
+
+                return img.resize(
+                    (width, new_height),
+                    Image.LANCZOS,
+                )
+
+            img_phot = resize_to_width(img_phot, max_width)
+            img_spec = resize_to_width(img_spec, max_width)
+
+            combined = Image.new(
+                "RGB",
+                (max_width, img_phot.height + img_spec.height),
+                color="white",
+            )
+
+            combined.paste(img_phot, (0, 0))
+            combined.paste(img_spec, (0, img_phot.height))
+            combined.save(filename + ".png")
+
+            img_phot.close()
+            img_spec.close()
+
+            os.remove(file_phot)
+            os.remove(file_spec)
+
+            saved_figures = [filename + ".png"]
+
+            plt.show()
+
+
+            
+            
     def cornerplot(
-            run,
-            figsize,
+            self,
             parameters=None,
             show_stats=True,
             show_histograms=True,
@@ -158,8 +615,8 @@ class Run:
             y_label_pad=0.02,
             title=None,
             title_fontsize=10,
+            figsize=None,
         ):
-            self=run
             if not hasattr(self, "result"):
                 raise ValueError("Run has no .result attribute. Did you run run_fit()?")
 
@@ -190,11 +647,13 @@ class Run:
                     "log_m_star": r"$\log M_\star$",
                     "vel_sys": r"$v\ \mathrm{[km/s]}$",
                     "sigma_vel": r"$\sigma_v\ \mathrm{[km/s]}$",
+                    "sigma_gas": r"$\sigma_\text{gas}\ \mathrm{[km/s]}$",
                     "redshift": r"redshift",
                     "luminosity_distance": r"luminosity distance",
-                    "ln_spec_noise_scale": r"spectral noise scaling parameter",
+                    "spec_noise_scale": r"spectral noise scaling parameter",
                     "R_GAL": r"$R_\text{gal}$",
                     "V_DISC": r"$v_\text{disc}$",
+                    "burst_mass_fraction": r"$f_\text{burst}$",
                 }
 
             # ---- parameter selection ----
@@ -215,6 +674,7 @@ class Run:
             
             # ---- create figure ----
             plt.close("all")
+            if figsize is None: figsize = (2*n,2*n)
             fig = plt.figure(figsize=figsize)
 
             # ---- corner plot ----
@@ -252,6 +712,12 @@ class Run:
                     vals = np.mean(equal_samples, axis=0)
                     errs = np.std(equal_samples, axis=0)
 
+                elif isinstance(mark_point, dict):
+                    param_names = np.array(parameters)  # if parameters is already plotted order
+            
+                    vals = np.array([mark_point[name] for name in param_names])
+                    errs = None
+
                 elif str(mark_point).lower() == "median":
                     vals = np.median(equal_samples, axis=0)
                     errs = np.std(equal_samples, axis=0)
@@ -268,25 +734,64 @@ class Run:
                     else:
                         ax.set_title(f"{vals[i]:.3f} ± {errs[i]:.3f}", fontsize=10, pad=12)
 
+        
             # ---- crosshair ----
             if mark_point is not None:
-                if str(mark_point).lower() == "median":
-                    pt = np.median(equal_samples, axis=0)
+            
+                param_names = np.array(self.free_pars)[indices]
+            
+                # Allow single point or list of points
+                if isinstance(mark_point, list):
+                    mark_points = mark_point
                 else:
-                    idx_best = int(np.argmax(self.result.logl))
-                    pt = samples[idx_best][indices]
+                    mark_points = [mark_point]
+            
+                # Allow single color or list of colors
+                if isinstance(mark_color, list):
+                    mark_colors = mark_color
+                else:
+                    mark_colors = [mark_color] * len(mark_points)
+            
+                for mp, mc in zip(mark_points, mark_colors):
+            
+                    if isinstance(mp, dict):
+                        # parameter order must match plotted dimensions
+                        pt = np.array([mp[name] for name in param_names])
+            
+                    elif str(mp).lower() == "median":
+                        pt = np.median(equal_samples, axis=0)
+            
+                    elif str(mp).lower() == "ml":
+                        idx_best = np.argmax(self.result.logl)
+                        pt = samples[idx_best][indices]
+                    
+                    elif str(mp).lower() == "map":
+                        logpost = self.result.logl + np.log(weights + 1e-300)
+                        idx_best = np.argmax(logpost)
+                        pt = samples[idx_best][indices]
+            
+                    for i in range(n):
+                        for j in range(i):
+                            ax = axes[i, j]
+                            #ax.axvline(pt[j], color=mc, lw=mark_lw)
+                            #ax.axhline(pt[i], color=mc, lw=mark_lw)
 
-                for i in range(n):
-                    for j in range(i):
-                        ax = axes[i, j]
-                        ax.axvline(pt[j], color=mark_color, lw=mark_lw)
-                        ax.axhline(pt[i], color=mark_color, lw=mark_lw)
+                            ax.scatter(
+                                pt[j], pt[i],
+                                color=mc,
+                                s=400,          
+                                linewidths=3,
+                                marker="+",    # or ".", "+", "x", etc.
+                                zorder=100
+                            )
+                    
+                    if show_histograms:
+                        for i, ax in enumerate(diag_axes):
+                            ax.axvline(pt[i], color=mc, lw=mark_lw)
+            
+            
 
-                if show_histograms:
-                    for i, ax in enumerate(diag_axes):
-                        ax.axvline(pt[i], color=mark_color, lw=mark_lw)
-
-
+        
             for ax in fig.axes:
                 ax.tick_params(axis='x', labelrotation=0)
                 ax.tick_params(axis='y', labelrotation=90)
@@ -342,6 +847,15 @@ class Run:
                 pos = ax.get_position()
                 fig.text(pos.x0 - y_label_pad,(pos.y0 + pos.y1) / 2,plot_labels[row],ha='right',va='center',rotation=90,fontsize=label_fontsize,)
 
+            """
+            k = selected_pars.index("av")
+        
+            # bottom axis
+            axes[-1, k].set_xticks([0.0, 0.005, 0.010, 0.015])
+            axes[-1, k].set_xticklabels(["0", "0.005", "0.01", "0.015"])
+            axes[k, 0].set_yticks([0.005, 0.010, 0.015])
+            axes[k, 0].set_yticklabels(["0.005", "0.01", "0.015"])
+            """                       
 
             # ---- save ----
             if filename is not None:
@@ -354,11 +868,14 @@ class Run:
 
 
 
+
+
+
                 
     def save(self, filename):
         """Save dynesty samples, priors, and run metadata to a compressed NPZ file."""
 
-        if not hasattr(self, "result"):
+        if self.result is None:
             raise ValueError("No fit results available. Run run_fit() first.")
 
         # Convert custom priors to a fully serializable form
@@ -384,20 +901,9 @@ class Run:
             nlive=self.nlive,
             dlogz=self.dlogz,
             bands=self.bands,
-            treat_as_upper_limits=np.array(self.treat_as_upper_limits, dtype="U")
+            treat_as_upper_limits=np.array(self.treat_as_upper_limits, dtype="U"),
+            best_models=np.array(getattr(self, "best_models", {}),dtype=object,),
         )
-
-        if self.spec is not None:
-            save_dict.update(
-                dict(
-                    obs_spec_wl=self.spec.wl,
-                    obs_spec_flux=self.spec.flux,
-                    obs_spec_flux_err=self.spec.flux_err,
-                    obs_spec_res=self.spec.resolution,
-                    obs_spec_wl_units=self.spec.header["WUNITS"],
-                    obs_spec_flux_units=self.spec.header["FUNITS"],
-                )
-            )
 
         if self.spec is not None:
             save_dict.update(
@@ -426,8 +932,17 @@ class Run:
         print(f"Saved fit results to {filename}")
 
 
+
+
+
+
+
+
     def load(self, filename):
-        """Load dynesty samples, priors, and metadata from NPZ into this Run object."""
+        """
+        Load dynesty samples, metadata, input data, and pre-evaluated
+        best-fit model arrays from a compressed NPZ file.
+        """
 
         with np.load(filename, allow_pickle=True) as data:
 
@@ -437,98 +952,160 @@ class Run:
             class Result:
                 pass
 
-            r = Result()
-            r.samples = data["samples"]
-            r.logl    = data["logl"]
-            r.logwt   = data["logwt"]
-            r.logz    = data["logz"]
-            self.result = r
+            result = Result()
+            result.samples = data["samples"]
+            result.logl = data["logl"]
+            result.logwt = data["logwt"]
+            result.logz = data["logz"]
+
+            self.result = result
 
             # -------------------------------------------------
-            # Restore parameter info
+            # Restore parameter information
             # -------------------------------------------------
-            self.free_pars = list(data["free_pars"])
-            self.fix_pars  = dict(data["fix_pars"].tolist())
+            self.free_pars = data["free_pars"].tolist()
+            self.fix_pars = dict(data["fix_pars"].tolist())
 
             # -------------------------------------------------
-            # Restore priors
+            # Restore custom priors
             # -------------------------------------------------
-            if "custom_priors" in data and data["custom_priors"] is not None:
-                self.custom_priors = data["custom_priors"].tolist()
+            if "custom_priors" in data.files:
+                custom_priors = data["custom_priors"]
+
+                if custom_priors.ndim == 0:
+                    self.custom_priors = custom_priors.item()
+                else:
+                    self.custom_priors = custom_priors.tolist()
             else:
-                self.custom_priors = None
+                self.custom_priors = {}
 
             # -------------------------------------------------
             # Restore metadata
             # -------------------------------------------------
-            self.spectral_range = data["spectral_range"] if "spectral_range" in data else None
-            self.polydeg = int(data["polydeg"]) if "polydeg" in data else None
-            self.nlive   = int(data["nlive"]) if "nlive" in data else None
-            self.dlogz   = float(data["dlogz"]) if "dlogz" in data else None
-            self.bands   = data["bands"].tolist() if "bands" in data else None
-            self.treat_as_upper_limits = data["treat_as_upper_limits"].tolist() if "treat_as_upper_limits" in data else None
+            self.model_file = data["model_file"].item()
+
+            model_pars = data["model_pars"]
+            self.model_pars = (
+                model_pars.tolist()
+                if hasattr(model_pars, "tolist")
+                else model_pars
+            )
+
+            self.spectral_range = (
+                data["spectral_range"]
+                if "spectral_range" in data.files
+                else None
+            )
+
+            self.polydeg = (
+                int(data["polydeg"])
+                if "polydeg" in data.files
+                else None
+            )
+
+            self.nlive = (
+                int(data["nlive"])
+                if "nlive" in data.files
+                else None
+            )
+
+            self.dlogz = (
+                float(data["dlogz"])
+                if "dlogz" in data.files
+                else None
+            )
+
+            self.bands = (
+                data["bands"].tolist()
+                if "bands" in data.files
+                else []
+            )
+
+            self.treat_as_upper_limits = (
+                data["treat_as_upper_limits"].tolist()
+                if "treat_as_upper_limits" in data.files
+                else []
+            )
 
             # -------------------------------------------------
             # Restore observed photometry
             # -------------------------------------------------
             self.phot = None
-            if "phot_fluxes" in data:
+
+            if "phot_fluxes" in data.files:
+
                 phot_fluxes = data["phot_fluxes"]
                 phot_errors = data["phot_errors"]
-                bands = data["phot_band"].tolist()
+                phot_bands = data["phot_band"].tolist()
 
                 phot_dict = {
-                    b: (phot_fluxes[i], phot_errors[i])
-                    for i, b in enumerate(bands)
+                    band: (phot_fluxes[i], phot_errors[i])
+                    for i, band in enumerate(phot_bands)
                 }
 
-                hdr = fits.Header()
-                if "phot_units" in data:
-                    hdr["UNITS"] = data["phot_units"].item()
+                header = fits.Header()
 
-                self.phot = PhotometryTable(data=phot_dict, header=hdr)
+                if "phot_units" in data.files:
+                    header["UNITS"] = data["phot_units"].item()
+
+                self.phot = PhotometryTable(
+                    data=phot_dict,
+                    header=header,
+                )
 
             # -------------------------------------------------
             # Restore observed spectrum
             # -------------------------------------------------
             self.spec = None
-            if "obs_spec_wl" in data:
-                hdr = fits.Header()
-                hdr["WUNITS"] = data["obs_spec_wl_units"].item()
-                hdr["FUNITS"] = data["obs_spec_flux_units"].item()
+            self.spec_crop = None
+
+            if "obs_spec_wl" in data.files:
+
+                header = fits.Header()
+                header["WUNITS"] = data["obs_spec_wl_units"].item()
+                header["FUNITS"] = data["obs_spec_flux_units"].item()
 
                 self.spec = Spectrum(
                     wl=data["obs_spec_wl"],
                     flux=data["obs_spec_flux"],
                     flux_err=data["obs_spec_flux_err"],
                     resolution=data["obs_spec_res"],
-                    header=hdr,
+                    header=header,
                 )
 
             # -------------------------------------------------
-            # Restore cropped observed spectrum
+            # Reconstruct posterior point estimates
             # -------------------------------------------------
-            self.spec = None
-            if "obs_spec_wl" in data:
-                hdr = fits.Header()
-                hdr["WUNITS"] = data["obs_spec_wl_units"].item()
-                hdr["FUNITS"] = data["obs_spec_flux_units"].item()
+            self.best_model_pars_MAP = self.best_model(method="MAP")
+            self.best_model_pars_ML = self.best_model(method="ML")
+            self.best_model_pars_median = self.best_model(
+                method="median"
+            )
 
-                self.spec = Spectrum(
-                    wl=data["obs_spec_wl"],
-                    flux=data["obs_spec_flux"],
-                    flux_err=data["obs_spec_flux_err"],
-                    resolution=data["obs_spec_res"],
-                    header=hdr,
+            # -------------------------------------------------
+            # Restore pre-evaluated model arrays for plotting
+            # -------------------------------------------------
+            if "best_models" in data.files:
+                self.best_models = data["best_models"].item()
+            else:
+                # Compatibility with old saved retrievals.
+                self.best_models = {}
+
+            # Use stored parameter dictionaries when available.
+            if "MAP" in self.best_models:
+                self.best_model_pars_MAP = (
+                    self.best_models["MAP"]["params"]
                 )
 
-            # ---------------------------------------------------
-            # Restore pfitter
-            # ---------------------------------------------------
+            if "ML" in self.best_models:
+                self.best_model_pars_ML = (
+                    self.best_models["ML"]["params"]
+                )
 
-
-            self.model_file = data["model_file"].item()
-            self.model_pars = data["model_pars"]
+            if "median" in self.best_models:
+                self.best_model_pars_median = (
+                    self.best_models["median"]["params"]
+                )
 
         print(f"Loaded fit results from {filename}")
         return self

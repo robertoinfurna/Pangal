@@ -39,11 +39,11 @@ from regions import (
     CircleSkyRegion
 )
 
-from .filters import Filter, map_filter_names, nice_filter_names
+from .filter import Filter, map_filter_names, nice_filter_names
 
 @dataclass
 class Image:
-    image: np.ndarray=None                              # image in native units
+    data: np.ndarray=None                               # image in native units
     wcs: WCS=None                                       # Astropy WCS object
     dtheta_pix_deg: float=None                          # Pixel scale (degrees/pixel)
     area_pix_arcsec2: float=None                        # Pixel area (arcsec²)
@@ -56,15 +56,15 @@ class Image:
     
     @property
     def mag(self):
-        return self.ZP - 2.5 * np.log10(self.image)
+        return self.ZP - 2.5 * np.log10(self.data)
 
     @property
     def mag_arcsec2(self):
-        return self.ZP - 2.5 * np.log10(self.image / self.area_pix_arcsec2)
+        return self.ZP - 2.5 * np.log10(self.data / self.area_pix_arcsec2)
 
     @property
     def Jy(self):
-        return 10**(0.4*(-self.ZP+8.90)) * self.image
+        return 10**(0.4*(-self.ZP+8.90)) * self.data
         
     @property
     def Jy_arcsec2(self):
@@ -94,28 +94,13 @@ class Image:
     # This is problematic!
     @property
     def erg_s_cm2(self):
-        return self.image
+        return self.data
                                              
         #raise ValueError("No data available for integrated flux calculation.")
     
     @property
     def erg_s_cm2_arcsec2(self):
         return self.erg_s_cm2 / self.area_pix_arcsec2    
-
-
-    """
-    def plot(
-            units=None,
-            scale_lims,
-            colorbar, 
-            ...
-    ):                      
-    
-           
-    if units is None:
-    """
-
-
 
 
 
